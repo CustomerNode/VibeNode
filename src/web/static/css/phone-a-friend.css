@@ -1,0 +1,141 @@
+/* Phone a Friend (VibeNode Orgs), the quiet look: a phone mark, plain
+   popovers and toasts, one project row per friend. static/js/phone-a-friend.js */
+:root { --pf-live: 63, 185, 80; }
+[data-theme="light"] { --pf-live: 34, 140, 60; }
+
+.pf-mark { display: inline-flex; align-items: center; margin-left: 6px; color: rgb(var(--pf-live)); vertical-align: -1px; }
+.pf-head-mark { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 1px; padding: 3px 6px; margin-left: 6px;
+  border-radius: 6px; color: rgb(var(--pf-live)); }
+.pf-head-mark:hover { background: var(--bg-hover); }
+.pf-head-mark sup { font-size: 10px; margin-left: 1px; }
+
+.pf-pop { position: fixed; z-index: 10050; width: 300px; max-width: calc(100vw - 16px); padding: 12px;
+  background: var(--bg-elevated, var(--bg-sidebar)); color: var(--text-secondary); font-size: 13px;
+  border: 1px solid var(--border, rgba(127,127,127,.25)); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+.pf-pop h4 { margin: 0 0 8px; font-size: 13px; color: var(--text-heading); }
+.pf-lab { display: block; font-size: 11px; color: var(--text-faint); margin: 10px 0 4px; }
+.pf-seg { display: flex; gap: 4px; flex-wrap: wrap; }
+.pf-seg button { all: unset; cursor: pointer; padding: 4px 9px; border-radius: 7px; font-size: 12px; color: var(--text-muted);
+  border: 1px solid var(--border, rgba(127,127,127,.25)); }
+.pf-seg button.on { color: var(--text-heading); background: var(--bg-hover); border-color: var(--text-muted); }
+.pf-members { display: flex; flex-direction: column; gap: 2px; max-height: 180px; overflow: auto; }
+.pf-opt { all: unset; cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px; color: var(--text-secondary); }
+.pf-opt:hover, .pf-opt.on { background: var(--bg-hover); color: var(--text-heading); }
+.pf-tick { margin-left: auto; }
+.pf-av { width: 20px; height: 20px; border-radius: 50%; display: inline-grid; place-items: center; flex: none;
+  font-size: 10.5px; font-weight: 700; color: var(--text-heading); background: var(--bg-hover); }
+.pf-acts { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+.pf-go:not(.pm-btn) { all: unset; cursor: pointer; padding: 6px 13px; border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--text-heading);
+  border: 1px solid var(--text-muted); }
+.pf-go:not(.pm-btn):hover { background: var(--bg-hover); }
+.pf-go[disabled] { opacity: .5; cursor: default; }
+.pf-ghost { all: unset; cursor: pointer; font-size: 12px; color: var(--text-muted); padding: 4px 8px; border-radius: 7px; }
+.pf-ghost:hover { color: var(--text-heading); background: var(--bg-hover); }
+.pf-note { font-size: 12px; color: var(--accent-red, #f85149); min-height: 0; margin-top: 6px; }
+.pf-note:empty { display: none; }
+.pf-glist { display: flex; flex-direction: column; gap: 6px; }
+.pf-gl { display: flex; align-items: center; gap: 8px; }
+.pf-gl .pf-meta, .pf-mrow .pf-meta { flex: 1; text-align: right; color: var(--text-faint); font-size: 12px; }
+
+/* Toasts sit in the shared float stack (utils.js _floatEls). */
+.pf-toast { position: fixed; right: 20px; bottom: 20px; z-index: 10040; max-width: 360px; display: flex; align-items: center; gap: 8px;
+  padding: 9px 10px 9px 12px; font-size: 13px; color: var(--text-secondary); background: var(--bg-elevated, var(--bg-sidebar));
+  border: 1px solid var(--border, rgba(127,127,127,.25)); border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.35);
+  animation: pfIn .2s ease-out; transition: opacity .2s; }
+.pf-toast > svg { color: rgb(var(--pf-live)); flex: none; }
+.pf-toast b { color: var(--text-heading); font-weight: 600; }
+.pf-toast span { flex: 1; min-width: 0; }
+.pf-x { all: unset; cursor: pointer; color: var(--text-faint); padding: 0 4px; font-size: 15px; }
+@keyframes pfIn { from { transform: translateY(10px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* System → VibeNode Orgs */
+.pf-obody p { margin: 0 0 10px; }
+.pf-in { width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 7px 9px; border-radius: 8px; color: var(--text-heading);
+  background: var(--bg-body); border: 1px solid var(--border, rgba(127,127,127,.25)); }
+.pf-obody .pf-go { margin-top: 12px; }
+.pf-small { font-size: 12px; color: var(--text-faint); }
+.pf-oname { font-size: 15px; font-weight: 600; color: var(--text-heading); }
+.pf-mlist { margin: 10px 0; }
+.pf-mrow { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border, rgba(127,127,127,.15)); }
+.pf-prompt { white-space: pre-wrap; font: 11.5px/1.5 var(--font-mono, monospace); background: var(--bg-hover); border-radius: 8px; padding: 10px; margin: 10px 0 0; max-height: 180px; overflow: auto; }
+
+/* The call's note: shown on every view, either side edits it. */
+.pf-callnote { margin: 4px 0 8px 28px; font-size: 12.5px; color: var(--text-secondary); }
+.pf-ntext { white-space: pre-wrap; overflow-wrap: anywhere; }
+.pf-nempty { color: var(--text-faint); }
+.pf-nmeta { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+.pf-nby { font-size: 11px; color: var(--text-faint); margin-right: auto; }
+.pf-nin { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; font-size: 12.5px; padding: 6px 8px; border-radius: 7px;
+  color: var(--text-heading); background: var(--bg-body); border: 1px solid var(--border, rgba(127,127,127,.25)); }
+.pf-tnote { color: var(--text-muted); font-size: 12px; }
+
+.pf-lab-top { margin-top: 0; }
+
+
+/* Phone: the call, list and note popovers are a bottom sheet with finger-sized
+   targets; every text box is 16px so iOS never zooms in on focus. */
+.pf-scrim { position: fixed; inset: 0; z-index: 10049; background: rgba(0,0,0,.45); }
+.pf-pop.pf-sheet { left: 0; right: 0; bottom: 0; top: auto; width: auto; max-width: none; box-sizing: border-box;
+  max-height: 85vh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  padding: 18px 16px calc(18px + env(safe-area-inset-bottom)); border-radius: 18px 18px 0 0;
+  border-left: 0; border-right: 0; border-bottom: 0; font-size: 15px; animation: pfSheet .2s ease-out; }
+@keyframes pfSheet { from { transform: translateY(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+.pf-sheet h4 { font-size: 17px; margin-bottom: 12px; }
+.pf-sheet .pf-lab { font-size: 13px; margin: 14px 0 6px; }
+.pf-sheet .pf-opt { min-height: 48px; padding: 10px 12px; font-size: 16px; box-sizing: border-box; width: 100%; }
+.pf-sheet .pf-opt.on { background: var(--bg-hover); box-shadow: inset 0 0 0 1px var(--text-muted); }
+.pf-sheet .pf-av { width: 28px; height: 28px; font-size: 13px; }
+.pf-sheet .pf-seg { gap: 6px; }
+.pf-sheet .pf-seg button { flex: 1 1 auto; text-align: center; min-height: 44px; padding: 10px 12px; font-size: 15px; box-sizing: border-box; }
+.pf-sheet .pf-acts { flex-direction: column; align-items: stretch; gap: 6px; }
+.pf-sheet .pf-go { display: block; text-align: center; min-height: 50px; padding: 14px; font-size: 17px; box-sizing: border-box; }
+.pf-sheet .pf-ghost { text-align: center; padding: 12px; font-size: 15px; }
+.pf-sheet .pf-gl { min-height: 48px; }
+@media (max-width: 768px) {
+  .pf-nin, .pf-in, .pf-compose textarea { font-size: 16px; }
+  .pf-compose .pf-go { min-height: 44px; }
+  .pf-toast { left: 12px; right: 12px; max-width: none; }
+}
+
+/* The project selector marks a "phoned you" project with a phone. */
+.project-item-mark.project-item-phoned { color: rgb(var(--pf-live)); }
+.project-item-mark.project-item-phoned svg { display: block; }
+/* The sidebar's project row for a "phoned you" project: a phone, not the initial. */
+.sidebar #btn-project[data-phoned]::before { content: ''; border: 0; border-radius: 0; background: rgb(var(--pf-live));
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.5 2.1L8 9.8a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.7.7a2 2 0 0 1 1.7 2z'/%3E%3C/svg%3E") center / 15px 15px no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.5 2.1L8 9.8a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.7.7a2 2 0 0 1 1.7 2z'/%3E%3C/svg%3E") center / 15px 15px no-repeat; }
+
+/* A friend's message (or a suggestion) in the chat: a quiet caption above a
+   normal bubble (live-panel.js _phoneFriendLabel). */
+.msg.user .pf-from { font-family: var(--font-sans); font-size: 11.5px; color: var(--text-muted); margin: 0 4px 4px; text-align: right; }
+
+/* The call dialog on a computer: the app's own dialog and choice cards. */
+.pf-call .pf-call-sec { font-size: var(--fs-md, 13px); font-weight: 600; color: var(--text-secondary); margin: 14px 0 6px; }
+.pf-call .pm-body p { margin: 0; }
+.pf-call .add-mode-card { all: unset; box-sizing: border-box; display: flex; align-items: center; gap: 10px; width: 100%; cursor: pointer;
+  padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--r-lg); margin-bottom: 6px; transition: background .12s, border-color .15s; }
+.pf-call .add-mode-card:hover { background: var(--bg-hover); border-color: var(--border-hover); }
+.pf-call .add-mode-card.active { border-color: var(--accent); background: var(--bg-active); }
+.pf-call .add-mode-card.active .add-mode-title { color: var(--accent); }
+.pf-call .add-mode-title { font-size: var(--fs-lg, 14px); }
+.pf-call .add-mode-desc { font-size: 12px; }
+.pf-call .pf-members .pf-av { width: 26px; height: 26px; font-size: 12px; }
+.pf-call .pf-members .add-mode-info { flex: 1; }
+.pf-call .pf-tick { color: var(--accent); font-weight: 700; }
+.pf-call .pf-grid3, .pf-call .pf-grid4 { display: grid; gap: 6px; }
+.pf-call .pf-grid3 { grid-template-columns: repeat(3, 1fr); }
+.pf-call .pf-grid4 { grid-template-columns: repeat(4, 1fr); }
+.pf-call .pf-grid3 .add-mode-card, .pf-call .pf-grid4 .add-mode-card { margin: 0; align-items: flex-start; }
+.pf-call .pf-grid4 .add-mode-card { justify-content: center; text-align: center; padding: 9px 6px; }
+.pf-call .pf-grid4 .add-mode-title { font-size: 13px; margin: 0; }
+.pf-call textarea.pm-input { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; }
+.pf-call .pf-note { margin-top: 6px; }
+
+/* The Drive warning in the call dialog and sheet. */
+.pf-drive-warn { display: flex; gap: 8px; align-items: flex-start; margin: 8px 0 2px; padding: 9px 11px; border-radius: 8px;
+  font-size: 12.5px; line-height: 1.45; color: var(--text-secondary);
+  background: rgba(255, 149, 0, .10); border: 1px solid rgba(255, 149, 0, .40); }
+.pf-drive-warn[hidden] { display: none; }
+.pf-drive-warn svg { flex: none; margin-top: 2px; color: #ff9500; }
+.pf-drive-warn b { color: var(--text-heading); font-weight: 600; }
+.pf-sheet .pf-drive-warn { font-size: 14px; }

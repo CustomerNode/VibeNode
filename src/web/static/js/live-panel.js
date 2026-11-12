@@ -1,0 +1,4338 @@
+/* live-panel.js — live terminal panel, input bar state machine, GUI session management */
+
+// ═══════════════════════════════════════════════════════════════
+// Subsessions — live panel additions (spec §4.6.2)
+// ═══════════════════════════════════════════════════════════════
+//
+// Three additions, all rendered into #live-panel as siblings of
+// #live-log / #live-input-bar:
+//   1. Breadcrumb above #live-log when the active session is a
+//      subsession ("Main session ▸ This subsession").
+//   2. Inbox strip above #live-input-bar when the active session is a
+//      parent with inbox_dirty = true.
+//   3. Subsession toolbar buttons inside #live-input-bar's left group:
+//      "Report to Parent" + "Auto-report on idle" toggle.
+//
+// All three call _renderSubsessionAffordances(sid) which is idempotent
+// — safe to call from the live panel build path and from the
+// session_state WS handler when inbox_dirty changes.
+
+function _findSessionInList(sid) {
+  if (typeof allSessions === 'undefined' || !sid) return null;
+  return allSessions.find(s => s.id === sid) || null;
+}
+
+function _isSubsessionForUI(sess) {
+  return !!(sess && sess.parent_session_id);
+}
+
+function _renderSubsessionBreadcrumb(parentEl, sess) {
+  // "You are here" role banner at the very top of the live panel.  This is
+  // the primary signal that tells the user which kind of session they are
+  // typing into — the earlier faint breadcrumb was too subtle, which led
+  // to typing into the wrong session.  Renders for BOTH roles:
+  //   - subsession  → amber "SUBSESSION ▸ from: <parent>" banner
+  //   - parent w/ children → blue "MAIN SESSION · N subsessions" banner
+  // A plain session with no parent and no children gets no banner.
+  const old = parentEl.querySelector('.session-role-banner');
+  if (old) old.remove();
+  if (!sess) return;
+
+  const isSub = _isSubsessionForUI(sess);
+
+  // Count this session's live subsession children (parent role).
+  let childCount = 0;
+  if (typeof allSessions !== 'undefined' && Array.isArray(allSessions)) {
+    childCount = allSessions.filter(x => x && x.parent_session_id === sess.id).length;
+  }
+
+  // Nothing to show for an ordinary top-level session.
+  if (!isSub && childCount === 0) return;
+
+  const div = document.createElement('div');
+
+  if (isSub) {
+    const parent = _findSessionInList(sess.parent_session_id);
+    const parentExists = !!parent;
+    const parentName = parent
+      ? (parent.custom_title || parent.display_title || sess.parent_session_id.slice(0, 8))
+      : sess.parent_session_id.slice(0, 8);
+    div.className = 'session-role-banner role-subsession';
+    if (parentExists) {
+      div.innerHTML =
+        '<span class="role-badge role-badge-sub">SUBSESSION</span>'
+        + '<span class="role-banner-text">from '
+        + '<a href="#" class="subsession-bc-parent">' + escHtml(parentName) + '</a>'
+        + '</span>';
+      const link = div.querySelector('.subsession-bc-parent');
+      link.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        if (typeof openInGUI === 'function') openInGUI(sess.parent_session_id);
+      });
+    } else {
+      div.innerHTML =
+        '<span class="role-badge role-badge-sub">SUBSESSION</span>'
+        + '<span class="role-banner-text">parent <span class="deleted-parent">'
+        + escHtml(parentName) + '</span> (deleted)</span>';
+    }
+  } else {
+    // Parent role — has at least one subsession.
+    const noun = childCount === 1 ? 'subsession' : 'subsessions';
+    div.className = 'session-role-banner role-parent';
+    div.innerHTML =
+      '<span class="role-badge role-badge-main">MAIN SESSION</span>'
+      + '<span class="role-banner-text">' + childCount + ' ' + noun
+      + ' running in parallel</span>';
+  }
+
+  // Insert at the very top of #live-panel, above #live-log.
+  parentEl.insertBefore(div, parentEl.firstChild);
+}
+
+function _renderSubsessionInboxStrip(panelEl, sess) {
+  // Remove any existing strip first.
+  const old = panelEl.querySelector('.subsession-inbox-strip');
+  if (old) old.remove();
+  if (!sess || !sess.inbox_dirty) return;
+
+  const strip = document.createElement('div');
+  strip.className = 'subsession-inbox-strip';
+  strip.setAttribute('aria-live', 'polite');
+  // Show the undelivered count (spec §4.6.2: "N subsession reports …").
+  // The count is published by the inbox_updated WS handler into
+  // window.__subsessionInboxCounts; fall back to a count-less phrasing
+  // until it arrives.
+  const _stripCount = (window.__subsessionInboxCounts
+    && window.__subsessionInboxCounts[sess.id]) || 0;
+  const _stripLead = _stripCount
+    ? (_stripCount + ' subsession ' + (_stripCount === 1 ? 'report' : 'reports'))
+    : 'Subsession reports';
+  strip.innerHTML =
+    '<span class="subsession-inbox-strip-text">'
+    + escHtml(_stripLead) + ' will be included with your next message.'
+    + '</span>'
+    + '<button type="button" class="subsession-inbox-strip-action" '
+    + 'onclick="_subsessionPullUpdates(\'' + sess.id + '\')">Pull updates now</button>'
+    + '<button type="button" class="subsession-inbox-strip-action" '
+    + 'onclick="_subsessionDismissInboxStrip(\'' + sess.id + '\')">Dismiss</button>';
+
+  // Insert immediately above #live-input-bar.
+  const inputBar = panelEl.querySelector('#live-input-bar');
+  if (inputBar && inputBar.parentNode === panelEl) {
+    panelEl.insertBefore(strip, inputBar);
+  } else {
+    panelEl.appendChild(strip);
+  }
+}
+
+function _renderSubsessionToolbar(panelEl, sess) {
+  // The subsession toolbar additions live inside the live input bar
+  // (or its left group).  We render a small floating action bar above
+  // #live-input-bar with two affordances:
+  //   - Report to Parent
+  //   - Auto-report on idle (toggle)
+  const old = panelEl.querySelector('.subsession-actions-bar');
+  if (old) old.remove();
+  if (!_isSubsessionForUI(sess)) return;
+
+  // F1: the daemon is the source of truth for the toggle.  to_state_dict()
+  // only emits auto_report_on_idle when ON, so its presence == ON and its
+  // absence == OFF.  This fixes the "fresh browser shows OFF while the
+  // daemon is still auto-reporting" mismatch (localStorage was the only
+  // prior source).  localStorage remains a cache the toggle also writes.
+  const autoReportOn = !!sess.auto_report_on_idle;
+
+  // F3: when the parent is gone (pointer still set but the parent is no
+  // longer in the session list), the report channel is dead.  Disable the
+  // Report-to-Parent button rather than letting it 404 on click.
+  const parentGone = !!sess.parent_session_id
+    && !_findSessionInList(sess.parent_session_id);
+  const reportBtn = parentGone
+    ? '<button type="button" class="subsession-action-btn" disabled '
+      + 'title="Parent session no longer exists">Report to Parent (parent deleted)</button>'
+    : '<button type="button" class="subsession-action-btn" '
+      + 'onclick="_subsessionReportToParent(\'' + sess.id + '\')">Report to Parent</button>';
+
+  const bar = document.createElement('div');
+  bar.className = 'subsession-actions-bar';
+  bar.innerHTML =
+    reportBtn
+    + '<label class="subsession-autoreport-label">'
+    + '<input type="checkbox" ' + (autoReportOn ? 'checked' : '') + ' '
+    + 'onchange="_subsessionToggleAutoReport(\'' + sess.id + '\', this.checked)">'
+    + ' Auto-report on idle'
+    + '</label>';
+
+  const inputBar = panelEl.querySelector('#live-input-bar');
+  if (inputBar && inputBar.parentNode === panelEl) {
+    panelEl.insertBefore(bar, inputBar);
+  } else {
+    panelEl.appendChild(bar);
+  }
+}
+
+function _renderSubsessionAffordances(sid) {
+  const panelEl = document.getElementById('live-panel');
+  if (!panelEl) return;
+  const sess = _findSessionInList(sid);
+  if (!sess) return;
+  _renderSubsessionBreadcrumb(panelEl, sess);
+  _renderSubsessionInboxStrip(panelEl, sess);
+  _renderSubsessionToolbar(panelEl, sess);
+}
+
+// ── Pull updates: dispatch the dedicated REST endpoint (phase 6.5 P0-1).
+// The earlier attempt routed through the WS `send_message` event with an
+// empty string — but that handler rejects empty text before the inbox
+// drain branch ever runs (see src/web/routes/ws_events.py `if not text: ...`).
+// The fetch fallback to `/api/live/send` also targeted a route that does
+// not exist.  We now POST to /api/sessions/<parent>/pull-subsession-updates,
+// which is the explicit REST surface for spec §4.3.5's empty-text drain.
+async function _subsessionPullUpdates(parentSid) {
+  if (!parentSid) return;
+  const proj = localStorage.getItem('activeProject') || '';
+  const url = '/api/sessions/' + encodeURIComponent(parentSid)
+    + '/pull-subsession-updates'
+    + (proj ? '?project=' + encodeURIComponent(proj) : '');
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+  } catch (e) {
+    if (typeof showToast === 'function') {
+      showToast('Pull updates failed: network error', true);
+    }
+    return;
+  }
+  let data = null;
+  try { data = await resp.json(); } catch (_) {}
+  if (!resp.ok || !data || data.ok !== true) {
+    const err = (data && data.error) || ('HTTP ' + resp.status);
+    if (typeof showToast === 'function') {
+      showToast('Pull updates failed: ' + err, true);
+    }
+    return;
+  }
+  if (typeof showToast === 'function') {
+    if (data.pulled === false) {
+      showToast('No subsession reports waiting.');
+    } else if (data.queued) {
+      showToast('Pull queued — fires when the session goes idle.');
+    } else {
+      showToast('Pulling subsession updates…');
+    }
+  }
+  // The strip will disappear when the next session_state event arrives
+  // with inbox_dirty=false.
+}
+
+function _subsessionDismissInboxStrip(parentSid) {
+  // Hide the strip locally without delivering.  Reports remain on
+  // disk and the strip re-appears on the next inbox_updated event.
+  const panelEl = document.getElementById('live-panel');
+  if (panelEl) {
+    const strip = panelEl.querySelector('.subsession-inbox-strip');
+    if (strip) strip.remove();
+  }
+  // Also clear the in-memory flag on the local session record so the
+  // next render doesn't re-show the strip until a new report arrives.
+  const sess = _findSessionInList(parentSid);
+  if (sess) sess.inbox_dirty = false;
+}
+
+// ── Report to Parent: popover with a single text field. ──
+function _subsessionReportToParent(childSid) {
+  if (!childSid) return;
+
+  // Pre-fill with the last assistant message text.  F4: the authoritative
+  // source is the backend last-conclusion endpoint (a reverse-parse
+  // of the JSONL tail), fetched async after the modal opens.  The
+  // DOM scrape below is only a synchronous fallback used until the fetch
+  // resolves (or if it fails) — the rendered log can be virtualized or
+  // re-skinned, so it is not reliable on its own.
+  let prefill = '';
+  const log = document.getElementById('live-log');
+  if (log) {
+    const asstBubbles = log.querySelectorAll('.msg.assistant .msg-text, .msg.assistant');
+    for (let i = asstBubbles.length - 1; i >= 0; i--) {
+      const t = (asstBubbles[i].textContent || '').trim();
+      if (t) { prefill = t.slice(0, 800); break; }
+    }
+  }
+
+  // Build a small modal popover.
+  let modal = document.getElementById('subsession-report-modal');
+  if (modal) modal.remove();
+  modal = document.createElement('div');
+  modal.id = 'subsession-report-modal';
+  modal.className = 'subsession-report-modal';
+  modal.innerHTML =
+    '<div class="subsession-report-card">'
+    + '<div class="subsession-report-title">Report to Parent</div>'
+    + '<div class="subsession-report-help">'
+    + 'This summary will appear at the top of the parent\'s next message.'
+    + '</div>'
+    + '<textarea class="subsession-report-textarea" rows="6">'
+    + escHtml(prefill) + '</textarea>'
+    + '<div class="subsession-report-actions">'
+    + '<button type="button" class="subsession-report-cancel">Cancel</button>'
+    + '<button type="button" class="subsession-report-send">Send report</button>'
+    + '</div>'
+    + '</div>';
+  document.body.appendChild(modal);
+
+  // F4: fetch the authoritative last conclusion and replace the prefill
+  // unless the user has already started editing.  Only overwrites when the
+  // textarea still holds the untouched fallback (or is empty).
+  (async function _fillFromBackend() {
+    try {
+      const proj = localStorage.getItem('activeProject') || '';
+      const url = '/api/sessions/' + encodeURIComponent(childSid)
+        + '/last-conclusion' + (proj ? '?project=' + encodeURIComponent(proj) : '');
+      const resp = await fetch(url);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const text = (data && data.text || '').trim();
+      if (!text) return;
+      const ta = modal.querySelector('.subsession-report-textarea');
+      // Don't clobber edits: only replace the synchronous fallback.
+      if (ta && (ta.value.trim() === '' || ta.value.trim() === prefill.trim())) {
+        ta.value = text.slice(0, 4000);
+      }
+    } catch (_) { /* keep the DOM-scrape fallback */ }
+  })();
+
+  modal.querySelector('.subsession-report-cancel').addEventListener('click', function() {
+    modal.remove();
+  });
+  modal.querySelector('.subsession-report-send').addEventListener('click', async function() {
+    const ta = modal.querySelector('.subsession-report-textarea');
+    const summary = (ta.value || '').trim();
+    if (!summary) {
+      if (typeof showToast === 'function') showToast('Summary cannot be empty', true);
+      return;
+    }
+    const proj = localStorage.getItem('activeProject') || '';
+    const url = '/api/sessions/' + encodeURIComponent(childSid)
+      + '/report-to-parent'
+      + (proj ? '?project=' + encodeURIComponent(proj) : '');
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({summary: summary}),
+      });
+    } catch (e) {
+      if (typeof showToast === 'function') showToast('Report failed: network error', true);
+      return;
+    }
+    let data = null;
+    try { data = await resp.json(); } catch (_) {}
+    if (!resp.ok || !data || data.ok !== true) {
+      const err = (data && data.error) || ('HTTP ' + resp.status);
+      if (typeof showToast === 'function') showToast('Report failed: ' + err, true);
+      return;
+    }
+    modal.remove();
+    if (typeof showToast === 'function') {
+      showToast('Reported to parent (' + (data.undelivered_count || 1) + ' pending)');
+    }
+  });
+}
+
+async function _subsessionToggleAutoReport(childSid, on) {
+  if (!childSid) return;
+  const key = 'vn.subsession.autoreport.' + childSid;
+  if (on) localStorage.setItem(key, '1');
+  else localStorage.removeItem(key);
+  // Phase 6.5 P1-4: also tell the daemon so it can fire auto-reports
+  // on IDLE transitions.  localStorage alone only persists the UI
+  // checkbox state — the actual auto-report behavior lives in the
+  // daemon's _emit_state hook.
+  try {
+    const proj = localStorage.getItem('activeProject') || '';
+    const url = '/api/sessions/' + encodeURIComponent(childSid)
+      + '/auto-report-toggle'
+      + (proj ? '?project=' + encodeURIComponent(proj) : '');
+    await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({on: !!on}),
+    });
+  } catch (e) {
+    // The localStorage cache survives even if the daemon call fails;
+    // a subsequent toggle will retry.  Don't surface to the user.
+  }
+}
+
+// Listen for inbox_updated WS events from the report-to-parent endpoint
+// and re-render the affordances for the currently-active session.
+if (typeof window !== 'undefined') {
+  window.addEventListener('DOMContentLoaded', function() {
+    if (typeof socket !== 'undefined' && socket && typeof socket.on === 'function') {
+      socket.on('inbox_updated', function(payload) {
+        if (!payload || !payload.parent_session_id) return;
+        // Update the local session record so the sidebar badge and live
+        // panel strip pick up the new state without a full reload.
+        const sess = _findSessionInList(payload.parent_session_id);
+        if (sess) sess.inbox_dirty = true;
+        if (!window.__subsessionInboxCounts) window.__subsessionInboxCounts = {};
+        window.__subsessionInboxCounts[payload.parent_session_id] =
+          payload.undelivered_count || 0;
+        if (typeof filterSessions === 'function') filterSessions();
+        if (typeof liveSessionId !== 'undefined'
+          && liveSessionId === payload.parent_session_id) {
+          _renderSubsessionAffordances(liveSessionId);
+        }
+      });
+    }
+  });
+}
+
+
+// ── Draft persistence: preserve unsent text across session/view switches AND page reloads ──
+const _LS_DRAFTS_KEY = 'vibenode_drafts';
+
+function _loadDraftsFromStorage() {
+  try {
+    const raw = localStorage.getItem(_LS_DRAFTS_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (_) { return {}; }
+}
+
+function _persistDraftsToStorage(drafts) {
+  try { localStorage.setItem(_LS_DRAFTS_KEY, JSON.stringify(drafts)); } catch (_) {}
+}
+
+const _drafts = _loadDraftsFromStorage();  // { sessionId: string }
+
+function _saveDraft(sessionId, text) {
+  if (!sessionId) return;
+  if (text) {
+    _drafts[sessionId] = text;
+  } else {
+    delete _drafts[sessionId];
+  }
+  _persistDraftsToStorage(_drafts);
+}
+
+function _getDraft(sessionId) {
+  return _drafts[sessionId] || '';
+}
+
+function _clearDraft(sessionId) {
+  delete _drafts[sessionId];
+  _persistDraftsToStorage(_drafts);
+}
+
+// ── A line a local script posted through the message hook ──────────────────
+// POST /api/hook/message wraps it as
+//   ⟦VN-EVENT source="…" kind="…"⟧ body ⟦VN-EVENT-NOTE⟧note for the agent⟦/VN-EVENT⟧
+// Returns {source, kind, body}, or null for ordinary text. Not anchored to the
+// start: the daemon may put an inbox block in front of a message.
+function _parseVnEvent(text) {
+  if (!text || String(text).indexOf('⟦VN-EVENT') === -1) return null;
+  const m = String(text).match(/⟦VN-EVENT([^⟧]*)⟧\s*([\s\S]*?)\s*(?:⟦VN-EVENT-NOTE⟧[\s\S]*?)?⟦\/VN-EVENT⟧/);
+  if (!m) return null;
+  const attr = function (name) {
+    const a = m[1].match(new RegExp(name + '="([^"]*)"'));
+    return a ? a[1] : '';
+  };
+  return {source: attr('source') || 'Script', kind: attr('kind') || 'event', body: m[2]};
+}
+
+// What a queued message shows as while it waits: a hook line reads
+// "Source: text", never its raw markers.
+function _queueDisplayText(text) {
+  const ev = _parseVnEvent(text);
+  return ev ? ev.source + ': ' + ev.body : text;
+}
+
+// ── Strip "Sent from <device> at ..." footer from message text for display ──
+function _stripVnMeta(text) {
+  // Remove the server-injected headless-mobile preamble (⟦VN-MOBILE⟧…⟦/VN-MOBILE⟧)
+  // so it never shows in the user's own bubble — it's context for the agent only.
+  text = text.replace(/⟦VN-(?:MOBILE|NOTE)⟧[\s\S]*?⟦\/VN-(?:MOBILE|NOTE)⟧\s*/g, '');
+  // Any device word: "Mobile", "PC", and older stamps such as "Q".
+  const m = text.match(/\n{1,2}Sent from \S+ at (\d{4}-\d{2}-\d{2} \d{1,2}:\d{2} [AP]M)(\s*\(transcribed from voice[^)]*\))?\s*$/);
+  if (!m) return {clean: text, sentAt: null, voice: false};
+  return {clean: text.replace(m[0], ''), sentAt: m[1], voice: !!m[2]};
+}
+
+function _formatSentAt(str) {
+  if (!str) return '';
+  // Already human-readable like "2026-04-11 2:30 PM", just extract the time part
+  const timePart = str.match(/(\d{1,2}:\d{2} [AP]M)$/);
+  return timePart ? timePart[1] : str;
+}
+
+function _saveDraftFromDOM() {
+  if (!liveSessionId) return;
+  const ta = document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
+  if (ta && ta.value.trim()) {
+    _saveDraft(liveSessionId, ta.value);
+  } else {
+    _clearDraft(liveSessionId);
+  }
+}
+
+// Save drafts before page unload (server restart, refresh, tab close)
+window.addEventListener('beforeunload', _saveDraftFromDOM);
+
+function _updateLastMessageTimes() {
+  const log = document.getElementById('live-log');
+  if (!log) return;
+  // Clear existing
+  log.querySelectorAll('.show-time').forEach(el => el.classList.remove('show-time'));
+  // Find last user and last assistant
+  const users = log.querySelectorAll('.msg.user');
+  const assts = log.querySelectorAll('.msg.assistant');
+  if (users.length) users[users.length - 1].classList.add('show-time');
+  if (assts.length) assts[assts.length - 1].classList.add('show-time');
+}
+
+function _formatMsgTime(tsStr) {
+  // Backend sends Unix seconds (time.time()), JS Date expects milliseconds
+  const val = typeof tsStr === 'number' && tsStr < 1e12 ? tsStr * 1000 : tsStr;
+  const d = new Date(val);
+  if (isNaN(d)) return '';
+  let h = d.getHours();
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12 || 12;
+  return h + ':' + String(d.getMinutes()).padStart(2, '0') + ' ' + ampm;
+}
+
+let liveLineCount = 0;
+let _liveSending = false;
+// Legacy mirror of the scroll state machine, kept because many call sites here
+// and in socket.js still guard raw `scrollTop = scrollHeight` with it.
+// ThreadScroll (thread-scroll.js) OWNS this value and maps READING -> false;
+// do NOT assign to it from anywhere else or the machine and the DOM disagree.
+//
+// There is deliberately no `_autoScrollTopAlignTs` here anymore. That 150ms
+// blind spot existed only because intent was inferred from `scroll` events,
+// which a programmatic top-align fires indistinguishably from a user scroll.
+// ThreadScroll derives intent from input events (wheel/touch/keydown) instead,
+// so programmatic scrolls are structurally invisible to it and no time-based
+// guard is needed. See thread-scroll.js §A.
+let liveAutoScroll = true;
+// Monotonic counter used to tag optimistic user bubbles so they can be
+// matched/replaced when the server echoes the entry back — without any
+// text-based comparison that would eat legitimate duplicate messages.
+let _optimisticMsgId = 0;
+
+// Server-side pagination for long chat threads.
+// Server sends only the requested page; "Load older" fetches older pages
+// from the server via get_session_log with a `before` parameter.
+const LIVE_PAGE_SIZE = 100;
+let _liveEntryStash = [];       // legacy — kept for compat but no longer primary
+let _liveRenderedFrom = 0;      // server-side offset of oldest rendered entry
+
+function _createLoadMoreButton() {
+  const wrap = document.createElement('div');
+  wrap.className = 'live-load-more';
+  const remaining = _liveRenderedFrom;
+  wrap.innerHTML =
+    '<button class="live-load-more-btn" id="live-load-more-btn" onclick="liveLoadMore()">' +
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><polyline points="18 15 12 9 6 15"/></svg> ' +
+    'Load older messages' +
+    '<span style="color:var(--text-faint);margin-left:4px;">(' + remaining + ' more)</span>' +
+    '</button>';
+  return wrap;
+}
+
+function liveLoadMore() {
+  if (_liveRenderedFrom <= 0 || !liveSessionId) return;
+
+  // Disable the button to prevent double-clicks while loading
+  const btn = document.getElementById('live-load-more-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+
+  // Request older entries from server — the session_log handler's
+  // prepend path will insert them into the DOM.
+  const _lmSid = liveSessionId;
+  const _lmBefore = _liveRenderedFrom;
+  socket.emit('get_session_log', {
+    session_id: _lmSid,
+    since: 0,
+    limit: LIVE_PAGE_SIZE,
+    before: _lmBefore,
+    project: localStorage.getItem('activeProject') || ''
+  });
+
+  // Stuck watchdog: if the prepend response doesn't arrive within 8s,
+  // re-enable the button so the user can retry. Never cycles the socket
+  // (dropping in-flight session_entry pushes mid-stream is worse than a
+  // stuck button).
+  if (window._loadMoreStuckTimer) clearTimeout(window._loadMoreStuckTimer);
+  window._loadMoreStuckSid = _lmSid;
+  window._loadMoreStuckBefore = _lmBefore;
+  window._loadMoreStuckTimer = setTimeout(function() {
+    if (window._loadMoreStuckSid !== _lmSid) return;
+    if (liveSessionId !== _lmSid) return;
+    if (_liveRenderedFrom < _lmBefore) return;   // response already arrived and prepended
+    console.warn('[load-more-watchdog] No prepend response after 8s for', _lmSid,
+      '— re-enabling button');
+    const btn2 = document.getElementById('live-load-more-btn');
+    if (btn2) { btn2.disabled = false; btn2.textContent = 'Load older messages'; }
+    window._loadMoreStuckTimer = null;
+  }, 8000);
+}
+// Per-session queue — server-backed local cache (synced via queue_updated events)
+const _sessionQueues = {};
+let _queueViewIndex = 0;
+
+// Migrate any old localStorage queues to server on first load
+(function _migrateOldQueues() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('_sessionQueues') || '{}');
+    let migrated = false;
+    for (const k in raw) {
+      const arr = Array.isArray(raw[k]) ? raw[k] : (raw[k] ? [raw[k]] : []);
+      if (arr.length) {
+        _sessionQueues[k] = arr;
+        // Push to server once socket is connected
+        setTimeout(() => {
+          if (typeof socket !== 'undefined' && socket.connected) {
+            arr.forEach(text => socket.emit('queue_message', {session_id: k, text: text}));
+          }
+        }, 2000);
+        migrated = true;
+      }
+    }
+    if (migrated) localStorage.removeItem('_sessionQueues');
+  } catch(e) {}
+})();
+
+// Read-only local cache accessors (data comes from server via queue_updated events)
+function _getQueueList(sid) { return (sid && _sessionQueues[sid]) || []; }
+function _getQueue(sid) { const q = _getQueueList(sid); return q.length ? q[0] : ''; }
+
+// Server-backed queue mutations — emit to server, cache updated via queue_updated event
+function _addQueue(sid, text) {
+  if (!sid || !text) return;
+  // Optimistic local update for instant UI feedback
+  if (!_sessionQueues[sid]) _sessionQueues[sid] = [];
+  _sessionQueues[sid].push(text);
+  _queueViewIndex = _sessionQueues[sid].length - 1;
+  // Send to server (authoritative)
+  socket.emit('queue_message', {session_id: sid, text: text});
+}
+function _removeQueueAt(sid, idx) {
+  if (!sid || !_sessionQueues[sid]) return;
+  // Optimistic local update
+  _sessionQueues[sid].splice(idx, 1);
+  if (!_sessionQueues[sid].length) delete _sessionQueues[sid];
+  else if (_queueViewIndex >= _sessionQueues[sid].length) _queueViewIndex = _sessionQueues[sid].length - 1;
+  // Send to server
+  socket.emit('remove_queue_item', {session_id: sid, index: idx});
+}
+function _setQueue(sid, text) {
+  if (!sid) return;
+  // Clear then add — server-backed
+  socket.emit('clear_queue', {session_id: sid});
+  if (text) {
+    _sessionQueues[sid] = [text];
+    _queueViewIndex = 0;
+    socket.emit('queue_message', {session_id: sid, text: text});
+  } else {
+    delete _sessionQueues[sid];
+    _queueViewIndex = 0;
+  }
+}
+// _shiftQueue is no longer used — server auto-dispatches from queue on idle
+
+/** Render (or clear) the queue banner in the dedicated #live-queue-area div. */
+function _renderQueueBanner() {
+  const area = document.getElementById('live-queue-area');
+  if (!area) return;
+  const sid = liveSessionId;
+  const list = _getQueueList(sid);
+  if (!list.length) { area.innerHTML = ''; return; }
+  const idx = Math.min(_queueViewIndex, list.length - 1);
+  _queueViewIndex = idx;
+  const total = list.length;
+  const text = list[idx];
+
+  let navHtml = '';
+  if (total > 1) {
+    navHtml =
+      '<button class="live-queue-nav-btn" onclick="liveQueueNav(-1)" title="Previous"' + (idx === 0 ? ' disabled' : '') + '>' +
+      '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg></button>' +
+      '<span style="font-size:10px;color:var(--text-faint);min-width:28px;text-align:center;">' + (idx+1) + '/' + total + '</span>' +
+      '<button class="live-queue-nav-btn" onclick="liveQueueNav(1)" title="Next"' + (idx === total-1 ? ' disabled' : '') + '>' +
+      '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg></button>';
+  }
+
+  area.innerHTML =
+    '<div class="live-queue-banner">' +
+    '<div class="live-queue-banner-header">' +
+    '<span class="live-queue-banner-label">' +
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' +
+    'Queued' + (total > 1 ? ' (' + total + ')' : '') + '<span class="live-queue-suffix"> \u2014 will send when idle</span></span>' +
+    '<span style="display:flex;align-items:center;gap:4px;">' +
+    navHtml +
+    '<button class="live-queue-cancel-btn" onclick="liveEditQueue()" title="Edit this command">' +
+    '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:2px;"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>' +
+    'Edit</button>' +
+    '<button class="live-queue-cancel-btn" onclick="liveClearQueue()" title="Remove this command" style="color:var(--result-err,#c44);border-color:rgba(204,68,68,0.25);">' +
+    '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:middle;margin-right:2px;"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>' +
+    'Remove</button>' +
+    '</span>' +
+    '</div>' +
+    '<div class="live-queue-banner-text">' + escHtml(_queueDisplayText(text)) + '</div>' +
+    '</div>';
+}
+
+function liveQueueNav(dir) {
+  const list = _getQueueList(liveSessionId);
+  if (!list.length) return;
+  _queueViewIndex = Math.max(0, Math.min(list.length - 1, _queueViewIndex + dir));
+  _renderQueueBanner();
+}
+
+// ---------------------------------------------------------------------------
+// Output shelf — file cards for output files created during the session
+// ---------------------------------------------------------------------------
+const _OUTPUT_EXTS = new Set([
+  'xlsx','xlsm','xls','docx','doc','pptx','ppt','pdf',
+  'png','jpg','jpeg','gif','svg','bmp',
+  'csv','json','zip','html','txt'
+]);
+const _outputShelfPaths = new Set();
+
+// One clean line icon per file family, drawn in the text colour.  (These used
+// to be a mix of emoji and symbols in six different colours, e.g. a red
+// lozenge for .html, which looked like a stray character next to the name.)
+function _outputFileIcon(ext) {
+  ext = (ext || '').toLowerCase();
+  const page = '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>';
+  let inner;
+  if (['xlsx','xlsm','xls','csv'].includes(ext)) inner = '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 10h16M4 15h16M10 4v16"/>';
+  else if (['png','jpg','jpeg','gif','svg','bmp'].includes(ext)) inner = '<rect x="4" y="4" width="16" height="16" rx="2"/><circle cx="9" cy="9.5" r="1.5"/><path d="m20 15-4-4-8 8"/>';
+  else if (['pptx','ppt'].includes(ext)) inner = '<rect x="3" y="5" width="18" height="12" rx="2"/><path d="M12 17v3M8 20h8"/>';
+  else if (ext === 'zip') inner = '<path d="M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8"/><rect x="2" y="4" width="20" height="4" rx="1"/><path d="M10 12h4"/>';
+  else if (['html','json'].includes(ext)) inner = page + '<path d="m10.5 13-2 2 2 2M13.5 13l2 2-2 2"/>';
+  else inner = page + '<path d="M9 13h6M9 17h4"/>';
+  return '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + inner + '</svg>';
+}
+
+function _tryAddOutputCard(entry) {
+  if (!entry) return;
+  // Strategy 1: Direct file tool (Write, Edit, etc.)
+  if (entry.kind === 'tool_use') {
+    const name = (entry.name || '').toLowerCase();
+    if (['write','edit','multiedit','notebookedit'].includes(name)) {
+      let filePath = entry.desc || '';
+      if (!filePath) return;
+      filePath = filePath.replace(/\s*\(write \d+ chars\)\s*$/, '');
+      filePath = filePath.replace(/^file_path:\s*/, '');
+      filePath = filePath.trim();
+      _addOutputCardForPath(filePath);
+      return;
+    }
+    // Strategy 1b: Bash commands that reference output files (e.g. python scripts saving xlsx)
+    if (name === 'bash') {
+      const desc = entry.desc || '';
+      _scanTextForOutputPaths(desc);
+      return;
+    }
+  }
+
+  // Strategy 2: Scan tool_result and asst text for file paths with output extensions
+  // Catches files created via Bash/python scripts (xlsx, docx, pptx, etc.)
+  if (entry.kind === 'tool_result' || entry.kind === 'asst') {
+    _scanTextForOutputPaths(entry.text || '');
+    return;
+  }
+}
+
+function _scanTextForOutputPaths(text) {
+  if (!text) return;
+  // Match Windows paths ending in known extensions (handles both \ and / separators)
+  // Also match paths inside quotes: r'C:\...\file.xlsx' or "C:\...\file.xlsx"
+  const pathPattern = /([A-Za-z]:[\\\/][^\s"'<>|*?\n]+\.(?:xlsx|xlsm|xls|docx|doc|pptx|ppt|pdf|png|jpg|jpeg|gif|svg|csv|json|html))\b/gi;
+  let match;
+  while ((match = pathPattern.exec(text)) !== null) {
+    let p = match[1];
+    // Clean up common wrapper chars
+    p = p.replace(/^['"]|['"]$/g, '');
+    _addOutputCardForPath(p);
+  }
+}
+
+function _addOutputCardForPath(filePath) {
+  if (!filePath) return;
+  filePath = filePath.trim();
+  // Check extension against allowlist
+  const dot = filePath.lastIndexOf('.');
+  if (dot < 0) return;
+  const ext = filePath.slice(dot + 1).toLowerCase();
+  if (!_OUTPUT_EXTS.has(ext)) return;
+  // Dedup
+  if (_outputShelfPaths.has(filePath)) return;
+  _outputShelfPaths.add(filePath);
+  const logEl = document.getElementById('live-log');
+  if (!logEl) return;
+  // Build card inline in conversation
+  const card = document.createElement('div');
+  card.className = 'live-output-card-inline';
+  const basename = filePath.split(/[/\\]/).pop() || filePath;
+  card.title = filePath;
+  card.innerHTML =
+    '<span class="live-output-card-icon">' + _outputFileIcon(ext) + '</span>' +
+    '<span class="live-output-card-name">' + escHtml(basename) + '</span>' +
+    '<span class="live-output-card-size" data-path="' + escHtml(filePath) + '"></span>' +
+    '<button class="live-output-card-open" title="Open file" onclick="event.stopPropagation();_openOutputFile(\'' + escHtml(filePath.replace(/\\/g,'\\\\').replace(/'/g,"\\'")) + '\')">' +
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>' +
+    '</button>' +
+    '<button class="live-output-card-dl" title="Save to..." onclick="event.stopPropagation();_downloadOutputFile(\'' + escHtml(filePath.replace(/\\/g,'\\\\').replace(/'/g,"\\'")) + '\')">' +
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
+    '</button>';
+  logEl.appendChild(card);   // no auto-scroll: new content never moves the view
+  // [classic] Classic scroll restores the original line (thread-scroll-classic.js).
+  if (window.vnClassicScroll && vnClassicScroll()) { if (liveAutoScroll) logEl.scrollTop = logEl.scrollHeight; }
+  // Fetch file size asynchronously
+  fetch('/api/file-info?path=' + encodeURIComponent(filePath))
+    .then(r => r.json())
+    .then(info => {
+      const sizeEl = card.querySelector('.live-output-card-size');
+      if (sizeEl && info.size) sizeEl.textContent = info.size;
+    })
+    .catch(() => {});
+}
+
+function _openOutputFile(filePath) {
+  fetch('/api/open-file', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path: filePath})
+  }).then(r => r.json()).then(d => {
+    if (d.error) showToast(d.error, true);
+  }).catch(() => showToast('Failed to open file', true));
+}
+
+function _downloadOutputFile(filePath) {
+  // Open folder picker so user can choose where to save
+  if (typeof _fdShowPicker === 'function' && typeof _fdOnPickerDone !== 'undefined') {
+    _fdOnPickerDone = function(targetDir) {
+      fetch('/api/copy-file-to', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({source: filePath, target_dir: targetDir})
+      }).then(r => r.json()).then(d => {
+        if (d.ok) showToast('Saved to ' + d.path);
+        else showToast(d.error || 'Save failed', true);
+      }).catch(() => showToast('Save failed', true));
+    };
+    _fdShowPicker(null);  // null = no file upload, just pick a folder
+  } else {
+    // Fallback: save to Downloads directly
+    fetch('/api/download-to-downloads', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: filePath})
+    }).then(r => r.json()).then(d => {
+      if (d.ok) showToast('Copied to Downloads: ' + d.filename);
+      else showToast(d.error || 'Download failed', true);
+    }).catch(() => showToast('Download failed', true));
+  }
+}
+
+function _clearOutputShelf() {
+  _outputShelfPaths.clear();
+  const shelf = document.getElementById('live-output-shelf');
+  if (shelf) shelf.innerHTML = '';
+}
+
+let liveBarState = null;   // 'ended' | 'question:<questionText>' | 'idle' | 'working'
+let _guiFocusPending = false;
+let _liveWorkingStart = null;  // timestamp when working state began
+let _liveWorkingTimer = null;  // interval for elapsed time updates
+let _liveRetryTimer = null;    // interval that ticks the auto-retry countdown text
+
+// Format a seconds count for the auto-retry countdown.  Backoff can reach the
+// 30-minute cap, so render minutes/hours rather than a giant seconds value:
+// '45s', '12m 30s', '1h 5m'.
+function _fmtRetrySecs(s) {
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60), sec = s % 60;
+  if (m < 60) return sec ? (m + 'm ' + sec + 's') : (m + 'm');
+  const h = Math.floor(m / 60), mm = m % 60;
+  return mm ? (h + 'h ' + mm + 'm') : (h + 'h');
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// USAGE-LIMIT CTA
+// ═══════════════════════════════════════════════════════════════════════
+//
+// THE PROBLEM THIS SOLVES.  Hitting a plan quota used to be a dead end with a
+// nasty circular dependency: the limit stops the session, and the ONLY way to
+// change models was the badge's live `set_model` control request, which
+// requires a running CLI.  So you could not switch off the limited model
+// without running a turn, and you could not run a turn because you were
+// limited.  Meanwhile the daemon classified the quota message as a transient
+// error and burned its bounded retry budget re-hitting the same wall.
+//
+// The fix is three-part; this is the UI third:
+//   * daemon `_classify_result_error` → "usage_limit" (no backoff armed)
+//   * daemon `set_session_model` → resumes a STOPPED session with `--model`
+//   * this banner → one click picks a model AND resumes the interrupted turn
+//
+// `_liveRetryTimer` is deliberately REUSED for this banner's countdown rather
+// than adding a second interval: the two banners are mutually exclusive (see
+// the precedence comment in updateLiveInputBar), the bar teardown already
+// clears `_liveRetryTimer` on every rebuild, and a second timer variable would
+// be one more thing to forget to clear.
+
+// Which families to offer for each limited family, best alternative first, so
+// the two chips we surface are the ones a user would most plausibly want.
+// Each chip is the NEWEST model of its family in /api/models, so a new Opus or
+// Sonnet shows up here with no code change; the ids are only the fallback
+// until that list has loaded. Kept deliberately short: this is a "get
+// unblocked now" affordance, not a model browser. "More…" opens the full
+// selector for anything else.
+const _LIMIT_ALT_LADDER = {
+  // Limited on a top-tier model → step down to something with its own quota.
+  fable:  ['claude-opus-5-5', 'claude-sonnet-5'],
+  opus:   ['claude-sonnet-5', 'claude-haiku-4-5'],
+  // Limited on a mid model → offer both a step up and a step down.
+  sonnet: ['claude-opus-5-5', 'claude-haiku-4-5'],
+  haiku:  ['claude-sonnet-5', 'claude-opus-5-5'],
+};
+const _LIMIT_ALT_DEFAULT = ['claude-sonnet-5', 'claude-haiku-4-5'];
+
+/** [major, minor] of a claude id ('claude-opus-5-5[1m]' -> [5, 5]), or null.
+ *  A date snapshot suffix is ignored. Mirrors SessionManager._model_version. */
+function _modelVersionKey(id) {
+  const base = String(id || '').replace(/\[[^\]]*\]/g, '').replace(/-\d{8}$/, '');
+  const m = /^claude-[a-z]+-(\d+)(?:-(\d+))?$/.exec(base);
+  return m ? [Number(m[1]), Number(m[2] || 0)] : null;
+}
+
+/** The newest model of `family` in the loaded /api/models list, or ''. */
+function _newestModelOfFamily(family) {
+  const models = Array.isArray(window._statusModels) ? window._statusModels : [];
+  let best = '', bestKey = null;
+  for (const mm of models) {
+    const id = String((mm && mm.id) || '');
+    if (id.indexOf('claude-' + family + '-') !== 0) continue;
+    const k = _modelVersionKey(id);
+    if (!k) continue;
+    if (!bestKey || k[0] > bestKey[0] || (k[0] === bestKey[0] && k[1] > bestKey[1])) {
+      best = id;
+      bestKey = k;
+    }
+  }
+  return best;
+}
+
+/**
+ * Pick up to two alternative model ids to offer for a limited model.
+ * Never offers the limited model's own family — that is the whole point.
+ *
+ * @param {string} limitedModel - the model id that hit the quota
+ * @returns {string[]} up to two model ids
+ */
+function _limitAlternatives(limitedModel) {
+  const m = /^claude-([a-z]+)/.exec(limitedModel || '');
+  const family = m ? m[1] : '';
+  const ladder = _LIMIT_ALT_LADDER[family] || _LIMIT_ALT_DEFAULT;
+  // The model list is shared with the status panel; the next render of the
+  // bar uses it once it has loaded.
+  if (!Array.isArray(window._statusModels) && typeof _loadStatusModels === 'function') {
+    _loadStatusModels();
+  }
+  const out = [];
+  for (const fallback of ladder) {
+    const fam = (/^claude-([a-z]+)/.exec(fallback) || [])[1] || '';
+    // Defensive: never suggest the family we just ran out of, even if the
+    // ladder above is later edited into an inconsistent state.
+    if (!fam || fam === family) continue;
+    const id = _newestModelOfFamily(fam) || fallback;
+    if (out.indexOf(id) < 0) out.push(id);
+  }
+  return out.slice(0, 2);
+}
+
+/**
+ * Build the usage-limit CTA banner, or '' when the session is not limited.
+ *
+ * Returns a full banner element (same visual language as the retry/error
+ * banners it replaces) with one chip per alternative model plus an escape
+ * hatch into the full model selector.
+ *
+ * @param {string} id       - session id the banner belongs to
+ * @param {object|null} st  - entry from window._sessionLimitState
+ * @returns {string} HTML, or '' if not limited
+ */
+function _buildUsageLimitBanner(id, st) {
+  if (!st || !st.limited_model) return '';
+  const _label = (typeof _modelLabel === 'function') ? _modelLabel : (x => x);
+  // Reset time is optional — the CLI does not always give a machine-readable
+  // instant. Render the countdown only when we genuinely know it, rather than
+  // inventing a number the user would (correctly) stop trusting.
+  let _resetStr = '';
+  if (st.limit_reset_at > 0) {
+    const secs = Math.max(0, Math.ceil(st.limit_reset_at - Date.now() / 1000));
+    _resetStr = ' \u00b7 resets in <strong id="live-limit-countdown" style="color:var(--text);">' +
+      _fmtRetrySecs(secs) + '</strong>';
+  }
+  // The daemon continues the turn by itself (_schedule_limit_resume), riding
+  // the auto-retry countdown: right after switching to the newest Opus when a
+  // Fable model ran out (`limit_switch_to`), else once the limit resets. Say
+  // which, and offer Cancel, so it is a visible choice next to the chips.
+  const _rs = (window._sessionRetryState && window._sessionRetryState[id]) || null;
+  let _autoStr = '';
+  let _cancelBtn = '';
+  if (_rs && _rs.retry_at > 0) {
+    const asecs = Math.max(0, Math.ceil(_rs.retry_at - Date.now() / 1000));
+    const _countdown = '<strong id="live-retry-countdown" style="color:var(--text);">' +
+      _fmtRetrySecs(asecs) + '</strong>';
+    // A bare family alias ("opus": the CLI picks its newest) reads as the
+    // family; _modelLabel maps legacy aliases to old versions ("Opus 4.6").
+    const _sw = String(st.limit_switch_to || '').replace(/\[[^\]]*\]/g, '');
+    const _swLabel = /^claude-/.test(_sw) ? _label(_sw) : _sw.charAt(0).toUpperCase() + _sw.slice(1);
+    _autoStr = _sw
+      ? ' \u00b7 switching to <strong style="color:var(--text);">' + escHtml(_swLabel) +
+        '</strong> in ' + _countdown
+      : ' \u00b7 continues automatically in ' + _countdown;
+    _cancelBtn = '<button class="live-mini-btn" onclick="liveCancelRetry()" ' +
+      'style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border-subtle);' +
+      'background:transparent;color:var(--text-muted);cursor:pointer;white-space:nowrap;">Cancel</button>';
+  }
+  const chips = _limitAlternatives(st.limited_model).map(mid =>
+    '<button class="live-mini-btn" onclick="liveSwitchModelAndResume(\'' +
+    String(mid).replace(/['"\\]/g, '') + '\')" ' +
+    'style="font-size:11px;padding:3px 10px;border-radius:6px;' +
+    'border:1px solid var(--border-subtle);background:var(--bg-elevated,var(--bg-card));' +
+    'color:var(--text);cursor:pointer;white-space:nowrap;">' +
+    escHtml(_label(mid)) + '</button>'
+  ).join('');
+  return '<div class="live-retry-banner limit" style="display:flex;align-items:center;' +
+    'flex-wrap:wrap;gap:8px;margin-bottom:8px;padding:8px 12px;background:var(--bg-card);' +
+    'border:1px solid var(--warn-border,#8a6d3b);border-radius:8px;">' +
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--warn,#d9a441)" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' +
+    '<span style="font-size:12px;color:var(--text-muted);flex:1;min-width:180px;">' +
+    '<strong style="color:var(--text);">' + escHtml(_label(st.limited_model)) +
+    '</strong> usage limit reached' + _resetStr + _autoStr + '</span>' +
+    _cancelBtn +
+    '<span style="font-size:11px;color:var(--text-faint);">Switch to:</span>' +
+    chips +
+    '<button class="live-mini-btn" onclick="_openSessionModelSelector(true)" ' +
+    'style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border-subtle);' +
+    'background:transparent;color:var(--text-muted);cursor:pointer;white-space:nowrap;">More\u2026</button>' +
+    '</div>';
+}
+
+/**
+ * Tick the usage-limit banner's "resets in …" text in place.
+ *
+ * Mutates only the `#live-limit-countdown` text node — never re-renders the
+ * bar — so it cannot destroy a textarea the user is typing into. Self-clears
+ * once the element or the limit state is gone, and swaps to "resetting…" at
+ * zero rather than sitting on a stale "0s".
+ */
+function _startLimitCountdown() {
+  if (_liveRetryTimer) { clearInterval(_liveRetryTimer); }
+  _liveRetryTimer = setInterval(() => {
+    const ls = (window._sessionLimitState && window._sessionLimitState[liveSessionId]) || null;
+    const el = document.getElementById('live-limit-countdown');
+    // The "continues automatically in …" countdown shares this tick.  It can
+    // be the only one on screen when the CLI gave no reset time.
+    const rs = (window._sessionRetryState && window._sessionRetryState[liveSessionId]) || null;
+    const ael = document.getElementById('live-retry-countdown');
+    if (!ls || (!el && !ael)) {
+      if (_liveRetryTimer) { clearInterval(_liveRetryTimer); _liveRetryTimer = null; }
+      return;
+    }
+    if (el) {
+      const secs = Math.max(0, Math.ceil(ls.limit_reset_at - Date.now() / 1000));
+      el.textContent = secs > 0 ? _fmtRetrySecs(secs) : 'any moment';
+    }
+    if (rs && ael) {
+      const asecs = Math.max(0, Math.ceil(rs.retry_at - Date.now() / 1000));
+      ael.textContent = asecs > 0 ? _fmtRetrySecs(asecs) : 'now…';
+    }
+  }, 1000);
+}
+
+/**
+ * One-click escape from a usage limit: switch the live session to `model` and
+ * resume the turn the limit interrupted.
+ *
+ * The daemon's `set_session_model` handles BOTH shapes transparently — a live
+ * session gets a `set_model` control request, a stopped/dormant one is resumed
+ * with `--model` — so this does not need to branch on session state. It only
+ * has to know whether to re-fire the interrupted turn afterwards.
+ *
+ * HONESTY CONTRACT (inherited from _applyLiveSessionModel): nothing in the UI
+ * claims success until the daemon confirms via `session_model_result`. On
+ * failure or timeout the user gets an explicit error and the banner stays put.
+ */
+function liveSwitchModelAndResume(model) {
+  const sid = (typeof liveSessionId !== 'undefined') ? liveSessionId : null;
+  if (!sid || !model) return;
+  if (typeof socket === 'undefined') {
+    if (typeof showToast === 'function') showToast('Not connected — model NOT changed', true);
+    return;
+  }
+  // Disable every chip in the banner so a double-click can't fire two
+  // switches (the second would race the first's resume).
+  document.querySelectorAll('.live-retry-banner.limit .live-mini-btn')
+    .forEach(b => { b.disabled = true; b.style.opacity = '0.5'; });
+
+  let settled = false;
+  const finish = () => {
+    settled = true;
+    clearTimeout(timer);
+    socket.off('session_model_result', onResult);
+    socket.off('session_model_changed', onChanged);
+  };
+  // 30s: covers the daemon's 15s CLI control-request timeout plus IPC and a
+  // slow mobile link (see the same constant in _applyLiveSessionModel).
+  const timer = setTimeout(() => {
+    if (settled) return;
+    finish();
+    document.querySelectorAll('.live-retry-banner.limit .live-mini-btn')
+      .forEach(b => { b.disabled = false; b.style.opacity = ''; });
+    if (typeof showToast === 'function') showToast('No confirmation from the server — if the model badge updates, the switch went through; otherwise try again', true);
+  }, 30000);
+
+  // CONFIRMATION FALLBACK — same rationale as _applyLiveSessionModel: the
+  // reply is socket-scoped and can be lost across a mobile reconnect, while
+  // the daemon's `session_model_changed` broadcast (which carries the same
+  // `resumed` / `turn_resumed` hints) reaches this client regardless.
+  const _base = m => String(m || '').replace(/\[[^\]]*\]/g, '').replace(/-\d{8}$/, '');
+  function onChanged(data) {
+    if (settled || !data || data.session_id !== sid || !data.model) return;
+    if (_base(data.model) !== _base(model)) return;
+    onResult({ ok: true, session_id: sid, model: data.model,
+               resumed: !!data.resumed, turn_resumed: !!data.turn_resumed });
+  }
+
+  function onResult(data) {
+    if (settled || !data || data.session_id !== sid) return;
+    finish();
+    if (!data.ok) {
+      document.querySelectorAll('.live-retry-banner.limit .live-mini-btn')
+        .forEach(b => { b.disabled = false; b.style.opacity = ''; });
+      if (typeof showToast === 'function') {
+        showToast('Model switch FAILED: ' + (data.error || 'unknown error'), true);
+      }
+      return;
+    }
+    // Confirmed. Route through the store's single write path, then the single
+    // badge renderer — never write model text to the DOM directly here.
+    if (typeof SessionModel !== 'undefined') SessionModel.ingestConfirmed(sid, data.model);
+    // Record it as this session's desired model too, so the wake path
+    // (liveSubmitContinue) carries it if the session sleeps again before the
+    // switch is reflected in daemon-confirmed state.
+    if (typeof SessionModel !== 'undefined' && SessionModel.setDesired) {
+      SessionModel.setDesired(sid, data.model, '');
+    }
+    if (typeof _renderSessionModelBadge === 'function') _renderSessionModelBadge(sid);
+    // The limit no longer applies on the new model — retract the CTA locally
+    // so the bar repaints immediately instead of waiting for the next state
+    // push. The daemon clears the same fields server-side.
+    if (window._sessionLimitState) delete window._sessionLimitState[sid];
+    if (window._sessionError) delete window._sessionError[sid];
+    const _name = (typeof _modelLabel === 'function') ? _modelLabel(data.model) : data.model;
+    // Resume the interrupted turn.
+    //
+    // `resumed: true` means the session was NOT live, so the daemon restarted
+    // it with --model and — because we asked for resume_turn — carried the
+    // interrupted prompt into that same start. It is already working; firing
+    // retry_now at a STARTING session would just be rejected.
+    //
+    // A LIVE switch, by contrast, leaves the session idle with the failed turn
+    // still unfinished, so that one needs an explicit nudge. retry_now is the
+    // same mechanism the Retry button uses, and it is safe here because the
+    // switch confirmed synchronously and the session is known idle.
+    // Already working: the daemon's own usage-limit countdown fired and
+    // resumed the turn while this switch was in flight, and a retry_now now
+    // would only be refused with a "not idle" error.
+    const _alreadyWorking = (typeof sessionKinds !== 'undefined') && sessionKinds[sid] === 'working';
+    if (!data.resumed && !_alreadyWorking && typeof liveRetryNow === 'function') {
+      if (typeof showToast === 'function') showToast('Switched to ' + _name + ' — resuming');
+      liveRetryNow();
+    } else {
+      if (typeof showToast === 'function') {
+        showToast('Switched to ' + _name +
+          (data.turn_resumed ? ' — resuming your request' : ''));
+      }
+      liveBarState = null;
+      updateLiveInputBar();
+    }
+  }
+
+  socket.on('session_model_result', onResult);
+  socket.on('session_model_changed', onChanged);
+  // resume_turn: this CTA's whole promise is "switch AND carry on", so the
+  // daemon re-runs the interrupted turn as part of the same operation.
+  socket.emit('set_session_model', {
+    session_id: sid, model: model, resume_turn: true,
+  });
+}
+
+function guiOpenAdd(id) {
+  guiOpenSessions.add(id);
+  localStorage.setItem('guiOpenSessions', JSON.stringify([...guiOpenSessions]));
+}
+function guiOpenDelete(id) {
+  guiOpenSessions.delete(id);
+  localStorage.setItem('guiOpenSessions', JSON.stringify([...guiOpenSessions]));
+}
+
+async function openInGUI(id) {
+  // All projects view: open the session in its own project (all-projects.js).
+  if (window.VNAllProjects && VNAllProjects.on()) await VNAllProjects.beforeOpen(id);
+  // Opening a session is what "reading" it means — drop the unread dot before
+  // the kanban/compose early-returns below so every view marks it read.
+  if (typeof clearSessionUnread === 'function') clearSessionUnread(id);
+
+  // Opening a session is intentionally sort-neutral: clicking a row (in any
+  // view) must not bubble it to the top of the sidebar.  The order is driven
+  // by state and real activity only.  Sessions move when you actually work in
+  // them (send a message / start them), not when you open them to look.
+
+  // In kanban mode, render session inside the kanban board with kanban titlebar
+  if (typeof viewMode !== 'undefined' && viewMode === 'kanban' && typeof _openSessionInKanban === 'function') {
+    _openSessionInKanban(id);
+    return;
+  }
+  // In compose mode, render session inside the compose board with compose titlebar
+  if (typeof viewMode !== 'undefined' && viewMode === 'compose' && typeof _openSessionInCompose === 'function') {
+    _openSessionInCompose(id);
+    return;
+  }
+  _guiFocusPending = true;
+  closeAllGrpDropdowns();
+  if (typeof _ensureMainBodyVisible === 'function') _ensureMainBodyVisible();
+  activeId = id;
+  localStorage.setItem('activeSessionId', id || '');
+  // Track most-recent session per project so view/project switches can restore it
+  const _proj = localStorage.getItem('activeProject');
+  if (_proj && id) {
+    localStorage.setItem('projectSession_' + _proj, id);
+    localStorage.setItem('pvs_' + _proj + '_sessions', id);
+  }
+  _pushChatUrl(id);
+  if (runningIds.has(id)) guiOpenAdd(id);
+  if (liveSessionId && liveSessionId !== id) { _savePendingInputAsDraft(); stopLivePanel(); }
+  filterSessions();
+
+  // Show title from sidebar data immediately (no mismatch)
+  const cached = allSessions.find(x => x.id === id);
+  const initTitle = cached ? cached.display_title : 'Loading\u2026';
+  setToolbarSession(id, initTitle, !(cached && cached.custom_title), (cached && cached.custom_title) || '');
+  document.getElementById('main-body').innerHTML = _chatSkeleton();
+  const _lpProj = localStorage.getItem('activeProject') || '';
+  const _lpProjQ = _lpProj ? '&project=' + encodeURIComponent(_lpProj) : '';
+  const resp = await fetch('/api/session/' + id + '?meta_only=1' + _lpProjQ);
+
+  // The person clicked something else while this was loading: leave it, or
+  // a slow reply drew this session over the one they picked.  A remap of
+  // this very session meanwhile (temp id -> CLI id) is still this session.
+  if (activeId !== id) {
+    const _re = window._idRemaps && window._idRemaps[id];
+    if (_re && _re === activeId) id = _re;
+    else return;
+  }
+
+  // New session with no .jsonl yet — re-show the new session input
+  if (!resp.ok) {
+    // Sent from this tab a moment ago and still starting (the engine has not
+    // registered it yet): show its live panel, which fills in as it starts,
+    // instead of "Session not found".
+    if (guiOpenSessions.has(id) && runningIds.has(id)) {
+      startLivePanel(id);
+      return;
+    }
+    if ((guiOpenSessions.has(id) || (typeof _isUnsentNewSession === 'function' && _isUnsentNewSession(id))) && !runningIds.has(id)) {
+      // Re-create the new session chat view — preserve auto-name from sidebar if available
+      const _ct = cached && cached.custom_title ? cached.custom_title : (cached && cached.display_title && cached.display_title !== 'New Session' ? cached.display_title : '');
+      setToolbarSession(id, _ct || 'New Session', !_ct, _ct || '');
+      document.getElementById('main-body').innerHTML =
+        '<div class="live-panel" id="live-panel">' +
+        '<div class="conversation live-log" id="live-log">' +
+        '<div class="empty-state" style="padding:60px 0;text-align:center;">' +
+        '<svg class="vibenode-mark" width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>' +
+        '<div class="vibenode-greeting">What are we building today?</div>' +
+        (typeof _renderTemplateGrid === 'function' ? _renderTemplateGrid(id) : '') +
+        '</div></div>' +
+        '<div class="live-output-shelf" id="live-output-shelf"></div>' +
+        '<div id="live-queue-area"></div>' +
+        '<div class="live-input-bar" id="live-input-bar"></div></div>';
+      liveSessionId = id;
+      liveBarState = null;
+      _optimisticMsgId = 0;
+      const bar = document.getElementById('live-input-bar');
+      if (bar) {
+        bar.innerHTML =
+          '<textarea id="live-input-ta" class="live-textarea" rows="3" placeholder="Describe what you want Claude to do\u2026" autofocus' +
+          ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + id + '\')}"' +
+          ' onblur="if(_wasKeyboardDismissBlur()){_newSessionSubmit(\'' + id + '\')}">' +
+          '</textarea>' +
+          '<div class="live-bar-row">' +
+          (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('', true, '', id) : '<div class="bar-left-group"></div>') +
+          '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
+          '<button class="live-send-btn" id="live-voice-btn"></button>' +
+          '</div>';
+        setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => _newSessionSubmit(id));
+        // Focus SYNCHRONOUSLY — a setTimeout here breaks the user-gesture chain
+        // on mobile browsers, so the on-screen keyboard doesn't come up. Keep
+        // the setTimeout only for the non-critical setup (auto-resize + input
+        // listener) to preserve the previous desktop timing.
+        // Mobile: skip both focus calls — opening a session should show the
+        // session, not pop the on-screen keyboard over it. The user will tap
+        // the composer themselves when they want to type. Matches the mobile
+        // gate on _wantAutofocus in updateLiveInputBar() below.
+        const _wantFocusHere = !_isMobileViewport();
+        const _taSync = document.getElementById('live-input-ta');
+        // What was typed before clicking away (saved by openInGUI /
+        // addNewAgent through _savePendingInputAsDraft) comes back with it.
+        if (_taSync && typeof _getDraft === 'function') {
+          const _d = _getDraft(id);
+          if (_d) { _taSync.value = _d; if (typeof _hideTemplateGrid === 'function') _hideTemplateGrid(); }
+        }
+        if (_taSync && _wantFocusHere) _taSync.focus();
+        setTimeout(() => { const ta = document.getElementById('live-input-ta'); if (ta) { if (_wantFocusHere) ta.focus(); _initAutoResize(ta); ta.addEventListener('input', function() { if (typeof _hideTemplateGrid === 'function') _hideTemplateGrid(); }); } }, 50);
+      }
+      return;
+    }
+    // Truly not found — show error
+    document.getElementById('main-body').innerHTML = '<div style="padding:40px;color:var(--text-faint);text-align:center;">Session not found</div>';
+    return;
+  }
+
+  const s = await resp.json();
+  // Prefer server title, but fall back to cached sidebar title if server returns empty/generic
+  const _serverTitle = s.custom_title || s.display_title;
+  const _cachedFallback = cached && cached.custom_title ? cached.custom_title : (cached && cached.display_title && cached.display_title !== 'New Session' ? cached.display_title : '');
+  const _finalTitle = (_serverTitle && _serverTitle !== 'New Session') ? _serverTitle : (_cachedFallback || _serverTitle);
+  const _finalCustom = s.custom_title || _cachedFallback || '';
+  setToolbarSession(id, _finalTitle, !_finalCustom, _finalCustom);
+
+  startLivePanel(id);
+}
+
+function startLivePanel(id, opts) {
+  stopLivePanel();
+  liveSessionId = id;
+  // Catch-all mark-as-read: startLivePanel is the single funnel every view
+  // (sidebar, kanban, compose, URL restore) passes through to mount a session,
+  // so clearing here covers entry points that bypass openInGUI/selectSession.
+  if (typeof clearSessionUnread === 'function') clearSessionUnread(id);
+  // Mobile visual channel: point the preview nav button at the newly-active
+  // session (hides it if that session has no previews yet).
+  if (window.MobilePreview) { try { MobilePreview.onSessionActivated(id); } catch (e) {} }
+  liveLineCount = 0;
+  // (liveAutoScroll is reset by ThreadScroll.attach() further down — the state
+  // machine owns it, so don't set it here.)
+  if (!(opts && opts.skipLog)) _optimisticMsgId = 0;
+  // Clear any pending invoke from a different session
+  if (window._pendingInvoke) {
+    window._pendingInvoke = null;
+    if (typeof _removeInvokeVisual === 'function') _removeInvokeVisual();
+  }
+  // Queue is restored from per-session localStorage — no reset here
+  // Restore working_since from the map (set by state_snapshot/session_state)
+  if (window._workingSinceMap && window._workingSinceMap[id]) {
+    _liveWorkingStart = window._workingSinceMap[id];
+  }
+  liveBarState = null;  // force fresh render
+
+  const skipLog = opts && opts.skipLog;
+  const skelHtml = skipLog ? '' : _chatSkeleton().replace('<div class="conversation">', '').replace(/<\/div>$/, '');
+  const panelHtml =
+    '<div class="live-panel" id="live-panel">' +
+    '<div class="conversation live-log" id="live-log">' + skelHtml + '</div>' +
+    '<div class="live-output-shelf" id="live-output-shelf"></div>' +
+    '<div id="live-queue-area"></div>' +
+    '<div class="live-input-bar" id="live-input-bar"></div></div>';
+
+  // In kanban mode, write to the kanban session body if it exists
+  const kanbanSessionBody = document.querySelector('.kanban-session-body');
+  if (kanbanSessionBody) {
+    kanbanSessionBody.innerHTML = panelHtml;
+  } else {
+    document.getElementById('main-body').innerHTML = panelHtml;
+  }
+
+  _clearOutputShelf();
+  const logEl = document.getElementById('live-log');
+  // Bind the scroll/collapse state machine to this log. Resets to LIVE, so
+  // READING never leaks across a session switch (the old global boolean did).
+  if (window.ThreadScroll) ThreadScroll.attach(logEl, id);
+  if (window.WorkTrail) WorkTrail.attach(logEl, id);
+
+  // Initialize sticky user message bar on the live log container
+  if (typeof initStickyUserMessages === 'function') initStickyUserMessages(logEl);
+
+  const btnClose = document.getElementById('btn-close');
+  if (btnClose) btnClose.disabled = false;
+
+  // Reset client-side pagination stash for new panel
+  _liveEntryStash = [];
+  _liveRenderedFrom = 0;
+
+  // Request the log via WebSocket (skip for brand-new sessions — optimistic bubble is enough)
+  if (!skipLog) {
+    performance.mark('switch-' + id);
+    socket.emit('get_session_log', {session_id: id, since: 0, limit: LIVE_PAGE_SIZE, project: localStorage.getItem('activeProject') || ''});
+
+    // Skeleton-stuck watchdog: three stages, each only fires if the user
+    // still sees a stuck skeleton for this exact session.
+    //   Stage 1 (8s):  re-emit get_session_log — cures a dropped emit.
+    //   Stage 2 (16s): probe /api/ping over HTTP. If HTTP is fine but the
+    //                  WebSocket produced nothing, the socket is a proven
+    //                  zombie — cycle it once. 60s hard rate-limit.
+    //   Stage 3 (28s): if we're STILL stuck 12s after the cycle, Socket.IO's
+    //                  own state is wedged (this happens on iOS Safari after
+    //                  bfcache-thaw when event.persisted is falsely false).
+    //                  A full page reload is guaranteed to fix any wedged
+    //                  Socket.IO/engine.io state — it's exactly what the
+    //                  user's "turn off and back on" workaround does.
+    //                  Rate-limited via _skeletonReloadAt to at most one
+    //                  reload per 120s, and guarded by a live restart-overlay
+    //                  so it never fights an in-app restart flow.
+    //
+    // Every stage requires the skeleton to still be visible for THIS session.
+    // The 60s cycle limit + 120s reload limit + user-visible-only trigger
+    // together mean no periodic loop can chain-storm — a storm needs a
+    // background periodic tick, which none of these stages have.
+    if (window._skeletonStuckTimer) clearTimeout(window._skeletonStuckTimer);
+    window._skeletonStuckSid = id;
+    window._skeletonStuckStage = 1;
+    window._skeletonStuckTimer = setTimeout(function _sk1() {
+      if (window._skeletonStuckSid !== id) return;
+      if (liveSessionId !== id) return;
+      if (liveLineCount > 0) return;   // response arrived and rendered
+      console.warn('[skeleton-watchdog] No session_log after 8s for', id, '— re-emitting');
+      socket.emit('get_session_log', {session_id: id, since: 0, limit: LIVE_PAGE_SIZE, project: localStorage.getItem('activeProject') || ''});
+      // Stage 2: if still stuck 8s later, probe HTTP to decide whether to cycle.
+      window._skeletonStuckStage = 2;
+      window._skeletonStuckTimer = setTimeout(function _sk2() {
+        if (window._skeletonStuckSid !== id) return;
+        if (liveSessionId !== id) return;
+        if (liveLineCount > 0) return;
+        // HTTP proof that the server is actually responsive.
+        fetch('/api/ping', { cache: 'no-store' }).then(function(r) {
+          if (!r.ok) return;   // server itself down — healthchecks own it
+          // Server is fine but our WebSocket produced nothing. Zombie confirmed.
+          var lastCycle = window._skeletonZombieCycleAt || 0;
+          if (Date.now() - lastCycle < 60000) {
+            console.warn('[skeleton-watchdog] Zombie detected for', id, 'but cycle rate-limited (60s)');
+          } else {
+            window._skeletonZombieCycleAt = Date.now();
+            console.warn('[skeleton-watchdog] Server responsive but socket silent — cycling once');
+            try { socket.disconnect(); socket.connect(); } catch (_e) {}
+            // The socket.js connect handler re-fetches get_session_log on
+            // reconnect, so no explicit re-emit needed here.
+          }
+          // Stage 3: if the cycle also fails to unstick us within 12s,
+          // Socket.IO state is wedged (typical after iOS Safari bfcache).
+          // A full page reload is guaranteed to fix any wedged engine.io
+          // state — it's what "turn off and back on" does. Rate-limited.
+          window._skeletonStuckStage = 3;
+          window._skeletonStuckTimer = setTimeout(function _sk3() {
+            if (window._skeletonStuckSid !== id) return;
+            if (liveSessionId !== id) return;
+            if (liveLineCount > 0) return;
+            // Don't fight an in-app restart's own overlay/reload.
+            if (document.getElementById('restart-overlay')) return;
+            var lastReload = 0;
+            try { lastReload = parseInt(sessionStorage.getItem('vn_skel_reload_at') || '0', 10); } catch (_e) {}
+            if (Date.now() - lastReload < 120000) {
+              console.warn('[skeleton-watchdog] Would reload but rate-limited (120s)');
+              return;
+            }
+            try { sessionStorage.setItem('vn_skel_reload_at', String(Date.now())); } catch (_e) {}
+            console.warn('[skeleton-watchdog] Cycle did not recover — reloading page');
+            try { window.location.reload(); } catch (_e) {}
+          }, 12000);
+        }).catch(function() { /* HTTP itself down — healthchecks own it */ });
+      }, 8000);
+    }, 8000);
+  }
+
+
+  // Render input bar immediately and schedule re-renders in case
+  // state events arrived before the DOM was ready.
+  // BUT: skip re-render if user has already started typing.
+  liveBarState = null;
+  updateLiveInputBar();
+  _renderQueueBanner();
+
+  // ── Subsessions affordances (spec §4.6.2) ──
+  // Breadcrumb, inbox strip, and Report-to-Parent toolbar are rendered
+  // into #live-panel and refreshed whenever the local session record
+  // changes.  Idempotent: calling on a non-subsession + non-dirty
+  // parent just removes any stale elements.
+  if (typeof _renderSubsessionAffordances === 'function') {
+    try { _renderSubsessionAffordances(id); } catch (_) {}
+  }
+
+  // Eagerly fetch this session's state from the daemon so we don't
+  // show "sleeping" while waiting for the full state_snapshot.
+  if (!runningIds.has(id) && !sessionKinds[id]) {
+    // Local lookup: `_lpProj` used to be read here but is declared inside a
+    // different function, so this branch threw a ReferenceError and aborted
+    // the rest of startLivePanel for any session whose state had not loaded.
+    const _lpProj = localStorage.getItem('activeProject') || '';
+    fetch('/api/session/' + id + '?meta_only=1' + (_lpProj ? '&project=' + encodeURIComponent(_lpProj) : ''))
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (!d || liveSessionId !== id) return;
+        // Check daemon state directly
+        socket.emit('request_state_snapshot', { project: localStorage.getItem('activeProject') || '' });
+      }).catch(() => {});
+  }
+
+  setTimeout(() => {
+    const ta = document.getElementById('live-input-ta');
+    if (ta && ta.value.trim()) return; // user is typing, don't clobber
+    updateLiveInputBar();
+    _renderQueueBanner();
+  }, 500);
+  setTimeout(() => {
+    const ta = document.getElementById('live-input-ta');
+    if (ta && ta.value.trim()) return;
+    updateLiveInputBar();
+    _renderQueueBanner();
+  }, 2000);
+}
+
+function stopLivePanel() {
+  _saveDraftFromDOM();
+  if (typeof _stopActiveVoice === 'function') _stopActiveVoice();
+  liveSessionId = null;
+  liveBarState = null;
+  _clearOutputShelf();
+  const btnClose = document.getElementById('btn-close');
+  if (btnClose) btnClose.disabled = true;
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  WARNING — DO NOT CALL _autoSendPendingInput() FROM SESSION SWITCHES  ║
+// ║                                                                        ║
+// ║  This function SENDS text (starts sessions, emits socket events).      ║
+// ║  It must NEVER be called when the user switches between sessions.      ║
+// ║                                                                        ║
+// ║  Session switches must use _savePendingInputAsDraft() instead, which   ║
+// ║  saves the text to localStorage for when the user switches back.       ║
+// ║                                                                        ║
+// ║  THE BUG THIS PREVENTS:                                                ║
+// ║  User types "hello" → clicks different session → _autoSendPendingInput ║
+// ║  fires → "hello" gets submitted → unwanted session starts → user       ║
+// ║  switches again → cascade of unwanted sessions with random text.       ║
+// ║  The regression test in                                                ║
+// ║  test_auto_send_and_text_preserve.py enforces this.                    ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+//
+// CURRENTLY UNUSED — kept for reference. All session-switch paths now call
+// _savePendingInputAsDraft() instead. Explicit submit paths (Enter key,
+// send button) use liveSubmitIdle/liveSubmitContinue/liveSubmitWaiting
+// which handle their own socket.emit calls directly.
+function _autoSendPendingInput() {
+  if (!liveSessionId) return;
+  const id = liveSessionId;
+
+  const inputTa = document.getElementById('live-input-ta');
+  const queueTa = document.getElementById('live-queue-ta');
+
+  if (inputTa && inputTa.value.trim()) {
+    const text = inputTa.value.trim();
+    inputTa.value = '';
+    _clearDraft(id);
+    // Explicit send/resume supersedes any earlier sleep intent.
+    clearUserStopped(id);
+    const kind = sessionKinds[id];
+    const isRunning = runningIds.has(id);
+
+    if (!isRunning && guiOpenSessions.has(id) && !kind) {
+      // New session that hasn't been submitted yet — start it
+      runningIds.add(id);
+      sessionKinds[id] = 'working';
+      const startOpts = { session_id: id, prompt: text, cwd: _currentProjectDir(), name: '', remote_tailnet: window.VN_IS_TAILNET || undefined };
+      // Resolve via the single owner so this path honors a per-session choice
+      // instead of always falling back to the system default.
+      const _lpModel = (typeof SessionModel !== 'undefined')
+        ? SessionModel.effectivePending(id)
+        : (typeof defaultModel !== 'undefined' ? defaultModel : '');
+      const _lpThinking = (typeof SessionModel !== 'undefined')
+        ? SessionModel.getDesiredThinking(id)
+        : (typeof defaultThinking !== 'undefined' ? defaultThinking : '');
+      if (_lpModel) startOpts.model = _lpModel;
+      if (_lpThinking) startOpts.thinking_level = _lpThinking;
+      socket.emit('start_session', startOpts);
+      // Set placeholder title from message text
+      const s = allSessions.find(x => x.id === id);
+      const _ph = /\[\[invoke\]\]/.test(text) ? 'Invoke Workforce' : text.split('\n')[0].slice(0, 65) + (text.length > 65 ? '\u2026' : '');
+      if (s) s.display_title = _ph;
+      filterSessions();
+    } else if (!isRunning) {
+      // Ended session — resume with the typed text
+      const _endedThinking = (typeof SessionModel !== 'undefined' && SessionModel.resumeThinking)
+        ? SessionModel.resumeThinking(id) : '';
+      socket.emit('start_session', { session_id: id, prompt: text, cwd: _currentProjectDir(), resume: true,
+        thinking_level: _endedThinking || undefined });
+      runningIds.add(id);
+      guiOpenAdd(id);
+    } else if (kind === 'question' && waitingData[id]) {
+      // Permission/question response
+      const actionMap = {yes: 'y', no: 'n', always: 'a', 'almost always': 'aa', 'almost-always': 'aa', 'almostalways': 'aa', allow: 'y', deny: 'n'};
+      const action = actionMap[text.toLowerCase()] || text;
+      socket.emit('permission_response', {session_id: id, action: action});
+      delete waitingData[id];
+      sessionKinds[id] = 'working';
+    } else if (kind === 'idle' || kind === 'question') {
+      // Idle or question without waitingData — send as a message
+      socket.emit('send_message', {session_id: id, text: text});
+      sessionKinds[id] = 'working';
+    }
+  } else if (queueTa && queueTa.value.trim()) {
+    // Working state — queue the typed text
+    const text = queueTa.value.trim();
+    queueTa.value = '';
+    _addQueue(id, text);
+  }
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  _savePendingInputAsDraft — THE CORRECT function for session switches  ║
+// ║                                                                        ║
+// ║  Called from: selectSession(), deselectSession(), openInGUI()           ║
+// ║  Does: saves typed text to localStorage as a draft                     ║
+// ║  Does NOT: send text, start sessions, emit socket events               ║
+// ║  Restored by: updateLiveInputBar() → _getDraft() on line ~1400        ║
+// ║                                                                        ║
+// ║  If you need to change session-switch behavior, modify THIS function.  ║
+// ║  Do NOT replace it with _autoSendPendingInput(). See warning above.    ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+function _savePendingInputAsDraft() {
+  if (!liveSessionId) return;
+  const id = liveSessionId;
+  const inputTa = document.getElementById('live-input-ta');
+  const queueTa = document.getElementById('live-queue-ta');
+  const text = (inputTa && inputTa.value) || (queueTa && queueTa.value) || '';
+  _saveDraft(id, text);
+}
+
+// Character limits before a chat message body is truncated behind a
+// "show more" button. Assistant messages truncate sooner than user messages.
+const _MSG_TRUNCATE_LIMIT = { asst: 600, user: 800 };
+
+/**
+ * Opening (or closing) a tool/result/permission detail is a reading signal —
+ * you clicked to read something, so the thread must stop scrolling out from
+ * under you. Drops the scroll state machine to READING.
+ */
+function _noteDetailToggle() {
+  if (window.ThreadScroll) ThreadScroll.noteUserExpand();
+}
+
+/**
+ * Cut `text` to about `limit` chars. Slicing at exactly LIMIT lands mid-word
+ * (e.g. "Review" cut to "Re"), which reads as corrupted text rather than a
+ * deliberate preview, so walk back up to 120 chars to the nearest whitespace /
+ * newline. With no whitespace in that window (dense text, a URL), hard-slice.
+ */
+function _truncateAtWord(text, limit) {
+  if (text.length <= limit) return { text, truncated: false };
+  const hard = text.slice(0, limit);
+  const minSoft = Math.max(0, limit - 120);
+  const softCut = Math.max(hard.lastIndexOf('\n'), hard.lastIndexOf(' '));
+  return { text: (softCut >= minSoft) ? text.slice(0, softCut) : hard, truncated: true };
+}
+
+// A ```handoff fence, matched the way mdParse matches fences (both fences at
+// the start of a line, closing run at least as long as the opening one).
+const _HANDOFF_FENCE_RE = /^[ \t]*(`{3,}|~{3,})handoff[ \t]*\n[\s\S]*?\n?^[ \t]*\1[`~]*[ \t]*$/gm;
+
+/**
+ * Truncate an assistant message without ever cutting a ```handoff card: the
+ * prose is cut to `limit` (cards don't count), and every card is kept whole,
+ * in order, after the cut.
+ */
+function _truncateKeepingCards(text, limit) {
+  const cards = [];
+  const prose = [];
+  let last = 0;
+  _HANDOFF_FENCE_RE.lastIndex = 0;
+  let m;
+  while ((m = _HANDOFF_FENCE_RE.exec(text)) !== null) {
+    prose.push(text.slice(last, m.index));
+    cards.push(m[0]);
+    last = m.index + m[0].length;
+  }
+  if (!cards.length) return _truncateAtWord(text, limit);
+  prose.push(text.slice(last));
+  const proseLen = prose.reduce((n, p) => n + p.trim().length, 0);
+  if (proseLen <= limit) return { text, truncated: false };
+  // Keep segments in order until the prose budget runs out; cards are free.
+  let out = '';
+  let budget = limit;
+  for (let i = 0; i < prose.length; i++) {
+    if (budget > 0) {
+      const cut = _truncateAtWord(prose[i], budget);
+      out += cut.text;
+      budget -= cut.truncated ? budget : prose[i].length;
+    }
+    if (i < cards.length) out += (out && !out.endsWith('\n') ? '\n' : '') + cards[i] + '\n';
+  }
+  return { text: out, truncated: true };
+}
+
+/**
+ * Populate (or re-populate) a chat message's `.msg-body`, managing truncation
+ * and the "show more" control.
+ *
+ * @param {HTMLElement} div       the `.msg` wrapper element
+ * @param {string}      kind      'asst' or 'user'
+ * @param {string}      fullText  the complete message text
+ * @param {boolean}     expanded  when true (assistant only), render the full
+ *                                text with no "show more" button and tag the
+ *                                element `msg-recent-expanded` so a later
+ *                                assistant message can re-collapse it.
+ *
+ * Used both at initial render and by _collapseRecentAsst() when a newer
+ * assistant message supersedes a previously auto-expanded one.
+ */
+function _fillMsgBody(div, kind, fullText, expanded) {
+  const isAsst = kind === 'asst';
+  const bodyEl = div.querySelector('.msg-body');
+  if (!bodyEl) return;
+
+  // Reset any state left from a prior render (matters on re-collapse).
+  const staleBtn = div.querySelector(':scope > .live-expand-btn');
+  if (staleBtn) staleBtn.remove();
+  div.classList.remove('msg-recent-expanded');
+  // Stash the full text so the message can be re-collapsed later without
+  // re-fetching it (property, not dataset — avoids serializing into the DOM).
+  div._vnFullText = fullText;
+
+  // Mobile visual channel: pull any [[VN-PREVIEW …]] markers out of assistant
+  // text BEFORE truncation/markdown, so they render as tappable preview cards
+  // (not raw JSON) and can never be sliced mid-marker by truncation.
+  let renderFull = fullText;
+  let _pv = null;
+  if (isAsst && window.MobilePreview && liveSessionId) {
+    try {
+      _pv = MobilePreview.extractForRender(liveSessionId, fullText);
+      renderFull = _pv.clean;
+    } catch (e) { renderFull = fullText; _pv = null; }
+  }
+
+  const LIMIT = _MSG_TRUNCATE_LIMIT[kind] != null ? _MSG_TRUNCATE_LIMIT[kind] : 600;
+  // A ```handoff card is never cut: slicing at LIMIT would cut the card's
+  // fence in half and show it as raw JSON in a collapsed message. Only the prose around cards counts toward LIMIT and is cut;
+  // the cards are always kept whole after it.
+  const { text: displayText, truncated: truncate } = expanded
+    ? { text: renderFull, truncated: false }
+    : (isAsst ? _truncateKeepingCards(renderFull, LIMIT) : _truncateAtWord(renderFull, LIMIT));
+
+  if (isAsst) {
+    bodyEl.innerHTML = mdParse(displayText);
+    if (typeof addSmartCopyButtons === 'function') addSmartCopyButtons(bodyEl, displayText);
+  } else {
+    bodyEl.innerHTML = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(displayText) + '</pre>';
+  }
+
+  // Render the extracted previews as cards under the message body.
+  if (isAsst && _pv && _pv.found && _pv.found.length) {
+    try { MobilePreview.appendCards(div, _pv.found, liveSessionId); } catch (e) { /* non-fatal */ }
+  }
+
+  // Tag the most-recent, auto-expanded assistant message so a later assistant
+  // message knows which element to collapse back to truncated form.
+  if (expanded && isAsst && fullText.length > LIMIT) {
+    div.classList.add('msg-recent-expanded');
+  }
+
+  if (truncate) {
+    const btn = document.createElement('button');
+    btn.className = 'live-expand-btn';
+    btn.textContent = '… show more';
+    btn.onclick = () => {
+      // Expanding is an explicit reading signal: stop moving the viewport.
+      // (A manually expanded message is also never auto-collapsed — it carries
+      // no `msg-recent-expanded` tag, so _collapseRecentAsst can't target it.)
+      if (window.ThreadScroll) ThreadScroll.noteUserExpand();
+      if (isAsst) {
+        bodyEl.innerHTML = mdParse(renderFull);
+        if (typeof addSmartCopyButtons === 'function') addSmartCopyButtons(bodyEl, renderFull);
+        // Preview cards live outside .msg-body; re-append after full expand.
+        if (_pv && _pv.found && _pv.found.length) {
+          try { MobilePreview.appendCards(div, _pv.found, liveSessionId); } catch (e) { /* non-fatal */ }
+        }
+      } else {
+        bodyEl.innerHTML = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(fullText) + '</pre>';
+      }
+      btn.remove();
+    };
+    div.appendChild(btn);
+  }
+}
+
+/**
+ * Revert the previously auto-expanded most-recent assistant message back to its
+ * normal truncated "show more" form. Called when a newer assistant message
+ * arrives so that only the single most-recent AI message stays fully expanded.
+ * Messages the user manually expanded (via "show more") are NOT tagged
+ * `msg-recent-expanded`, so they are never collapsed by this.
+ *
+ * Routed through ThreadScroll.requestCollapse() rather than collapsing inline,
+ * which enforces two things this used to violate:
+ *   1. Auto-collapse only happens in the LIVE state (in FOLLOW/READING the
+ *      user's expanded content is left alone).
+ *   2. A message intersecting the viewport is NEVER collapsed, in any state —
+ *      it is queued and collapsed once it scrolls off. This is the actual fix
+ *      for "I was reading a message and it shrank": reading a tall new message
+ *      means scrolling DOWN, which no scroll-position heuristic can distinguish
+ *      from following along, so state alone was never enough to prevent it.
+ * When a queued collapse does fire above the viewport, requestCollapse anchors
+ * scrollTop against the height delta so the reader's position holds.
+ *
+ * @param {HTMLElement} logEl  the live-log container to search within
+ */
+function _collapseRecentAsst(logEl) {
+  if (!logEl) return;
+  // querySelectorAll, not querySelector: a deferred collapse keeps its
+  // `msg-recent-expanded` tag until it actually runs, so while the user is
+  // reading (or in FOLLOW) several tagged messages can pile up. Collapsing only
+  // the first would leave the rest permanently expanded once we returned to
+  // LIVE. Called before the new entry is appended, so everything tagged here is
+  // by definition superseded.
+  const stale = logEl.querySelectorAll('.msg.assistant.msg-recent-expanded');
+  for (const prev of stale) {
+    const fullText = prev._vnFullText;
+    if (typeof fullText !== 'string') { prev.classList.remove('msg-recent-expanded'); continue; }
+    const doCollapse = () => _fillMsgBody(prev, 'asst', fullText, false);
+    if (window.ThreadScroll) ThreadScroll.requestCollapse(prev, doCollapse);
+    else doCollapse();
+  }
+}
+
+// Small gap (px) left above a top-aligned AI message so its first line isn't
+// jammed against the very top edge of the log viewport.
+const _MSG_SCROLL_TOP_PAD = 8;
+
+/**
+ * Is `el` the newest conversation message in the log? True when no user or
+ * assistant `.msg` element follows it in DOM order. Trailing non-message nodes
+ * (output cards, buttons) are ignored — they don't represent newer chat turns.
+ *
+ * Used to decide whether a fallback top-align is safe: if the user just sent a
+ * message (an optimistic user bubble was appended below the last AI message),
+ * the AI message is no longer last, so we must scroll to bottom instead.
+ *
+ * @param {HTMLElement} logEl  the live-log container (messages are its children)
+ * @param {HTMLElement} el     the candidate message element
+ * @returns {boolean}
+ */
+function _isLastMessageEl(logEl, el) {
+  let sib = el.nextElementSibling;
+  while (sib) {
+    if (sib.classList && sib.classList.contains('msg')) return false;
+    sib = sib.nextElementSibling;
+  }
+  return true;
+}
+
+/**
+ * Position the live log after a FULL render (session open, reconnect re-fetch).
+ *
+ * New content never moves the view by default (thread-scroll.js, D), so the
+ * per-entry, streaming and state-change settle-scrolls do not call this. Do not add them back; a resize-only correction is
+ * ThreadScroll.holdBottom(). The one other caller is ThreadScroll's own
+ * `_follow()`, used only when the user turned on the "Live scroll" preference.
+ *
+ * Default behavior is scroll-to-bottom. When the
+ * most-recent assistant message is rendered fully expanded AND is taller than
+ * the viewport, instead top-align it so the user starts reading from its first
+ * line and scrolls down as they read. If the message fits entirely within the
+ * viewport (there is extra space), scroll-to-bottom already shows all of it
+ * from the top, so we keep the simpler bottom behavior.
+ *
+ * @param {HTMLElement}  logEl  the live-log scroll container
+ * @param {HTMLElement?} msgEl  the just-rendered AI message to top-align. When
+ *                              omitted, the last assistant message in the log
+ *                              is used (so settle-scrolls that don't have the
+ *                              element still top-align the most-recent AI msg).
+ */
+function _autoScrollLiveLog(logEl, msgEl) {
+  if (!logEl) return;
+
+  // READING means the user owns the viewport — do not move it for any reason.
+  if (window.ThreadScroll && !ThreadScroll.mayAutoScroll()) return;
+
+  // While a response is actively streaming, always follow the tail — the
+  // partial streaming bubble is what the user is watching, not the previous
+  // completed message.
+  if (logEl.querySelector('.msg.assistant.streaming-bubble')) {
+    logEl.scrollTop = logEl.scrollHeight;
+    return;
+  }
+
+  // Fall back to the last assistant message in the log so callers that only
+  // have the log element (settle-scrolls fired on state transitions) still
+  // top-align the most-recent AI message. The offsetHeight gate below is the
+  // real decider — a short message that fits the viewport still scrolls to
+  // bottom regardless of which target is chosen.
+  //
+  // CRITICAL: only top-align the fallback target when it is the *last* message
+  // in the log. If anything newer follows it (e.g. the user just sent a message
+  // and an optimistic user bubble was appended below), we must scroll to bottom
+  // so that newest content is visible — top-aligning the older AI message would
+  // hide the user's own message. The explicit-element path (msgEl passed by the
+  // entry renderer) skips this check because the caller already knows it just
+  // rendered the newest entry.
+  let target = msgEl;
+  if (!target) {
+    const asstMsgs = logEl.querySelectorAll('.msg.assistant:not(.streaming-bubble)');
+    const lastAsst = asstMsgs.length ? asstMsgs[asstMsgs.length - 1] : null;
+    // Only adopt it as the top-align target if it is still the newest message
+    // in the log. _isLastMessageEl ignores trailing non-message nodes (output
+    // cards, buttons) but treats a newer user/assistant bubble as disqualifying.
+    if (lastAsst && _isLastMessageEl(logEl, lastAsst)) target = lastAsst;
+  }
+
+  if (target && target.offsetHeight > logEl.clientHeight) {
+    // Message is taller than the viewport — position its first line near the
+    // top edge. Compute the message's top relative to the log's scroll origin
+    // via getBoundingClientRect so it's correct regardless of offsetParent.
+    const top = target.getBoundingClientRect().top
+              - logEl.getBoundingClientRect().top
+              + logEl.scrollTop
+              - _MSG_SCROLL_TOP_PAD;
+    // No blind-spot guard needed: ThreadScroll reads intent from input events,
+    // so this programmatic scroll cannot be mistaken for a manual scroll-up.
+    logEl.scrollTop = Math.max(0, top);
+  } else {
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+}
+
+// ── PERF FIX #5: cap the rendered `.msg` DOM in #live-log ─────────────
+//
+// Long-lived sessions (hours on one thread) grow #live-log unbounded — every
+// session_entry push does logEl.appendChild(...) with no eviction, and
+// several helpers (_updateLastMessageTimes, _collapseRecentAsst,
+// _autoScrollLiveLog, sticky-user-msg.js, thread-scroll.js MutationObserver)
+// run querySelectorAll('.msg…') on every append. Append cost scales with
+// rendered DOM size and eventually produces visible jank.
+//
+// The cap is 400 `.msg` children (~40 viewports of history on a laptop);
+// beyond that, the oldest .msg nodes are trimmed on each append. Trim is
+// skipped when the user is scrolled up viewing older content
+// (ThreadScroll.atBottom() === false). Trimmed entries remain reachable via
+// the existing "Load older" pagination (get_session_log with a `before`
+// cursor). Streaming/optimistic bubbles are protected from trim.
+//
+// NOTE: this changes only DOM state. `liveLineCount` is a server-side
+// entry offset (used to fetch older pages) and is deliberately NOT
+// decremented on trim — the entries still exist server-side.
+window._LIVE_LOG_DOM_CAP = 400;
+
+/**
+ * Trim #live-log down to ~_LIVE_LOG_DOM_CAP direct-child `.msg` nodes when
+ * it exceeds the cap, but only when the user is currently at the bottom of
+ * the log. Called synchronously from the session_entry append path and the
+ * session_log prepend path in socket.js. Cheap O(1) amortized when cap is
+ * engaged (typically 1 excess node per real-time push).
+ *
+ * Never removes:
+ *   - `.msg.assistant.streaming-bubble` (partial content still arriving)
+ *   - `.msg.user.optimistic-bubble`     (server echo pending)
+ *   - `.live-load-more`, `.vn-jump-wrap`, `.vn-thread-sentinel`
+ *     (implicitly — they don't have `.msg` class)
+ *
+ * @param {HTMLElement} logEl  the #live-log container
+ * @returns {number}  count of nodes actually trimmed (0 if no-op)
+ */
+function _trimLiveLogIfOversized(logEl) {
+  if (!logEl) return 0;
+  // Reader is looking at older content — do not rip nodes out under the
+  // cursor. Trim resumes automatically the next time an append fires
+  // while the user is back at the bottom.
+  if (window.ThreadScroll && !window.ThreadScroll.atBottom()) return 0;
+  const cap = window._LIVE_LOG_DOM_CAP || 400;
+  const msgs = logEl.querySelectorAll(':scope > .msg');
+  const excess = msgs.length - cap;
+  if (excess <= 0) return 0;
+  let removed = 0;
+  for (let i = 0; i < msgs.length && removed < excess; i++) {
+    const n = msgs[i];
+    if (!n) continue;
+    if (n.classList.contains('streaming-bubble')) continue;
+    if (n.classList.contains('optimistic-bubble')) continue;
+    n.remove();
+    removed++;
+  }
+  return removed;
+}
+
+// ── Smart termination: the "sent back" card ─────────────────────────────
+// Entry: {kind:'sent_back', name:<reason chip>, desc:<one plain sentence>,
+// text:<what the session was told>} (src/shared/transcripts.py sent_back_entry).
+// Every caller appends the returned element synchronously, so by the
+// microtask the message it tried to stop on is its previous sibling; its body
+// moves into the card and the empty bubble is removed, so the thread shows
+// the card instead of the message.
+// Browser copy of src/shared/transcripts.sent_back_entry, for entries an older
+// engine or web server still sends as kind 'user'.  Keep the chips and
+// sentences in step with the Python one.
+const _SENT_BACK_PREFIX = 'Stop hook feedback:';
+function _sentBackFromText(raw) {
+  let reason = String(raw || '').trim().slice(_SENT_BACK_PREFIX.length).trim();
+  let body = reason;
+  if (/^smart termination:/i.test(body)) {
+    body = body.replace(/^smart termination:\s*/i, '');
+    let told = body;
+    ['\n\n# Ending a turn', '\n\nEnd your final message with this block'].forEach(cut => {
+      const i = told.indexOf(cut); if (i !== -1) told = told.slice(0, i);
+    });
+    if (told.toLowerCase().startsWith('your handoff card was sent back.')) told = told.slice('your handoff card was sent back.'.length);
+    told = told.trim();
+    reason = told.charAt(0).toUpperCase() + told.slice(1);
+  }
+  const low = body.toLowerCase();
+  const firstPara = body.split('\n\n')[0];
+  const quotedIn = (txt, re) => { const out = []; let m; re.lastIndex = 0;
+    while ((m = re.exec(txt)) !== null) { if (out.indexOf(m[1]) === -1 && out.length < 4) out.push(m[1]); } return out; };
+  const andList = arr => {
+    const q = arr.map(w => '"' + w + '"');
+    return q.length === 1 ? q[0] : q.slice(0, -1).join(', ') + ' and ' + q[q.length - 1];
+  };
+  const group = /not allowed in a "(\w+)" card, ([^:]+):([^\n]*)/i.exec(body);
+  let name, desc;
+  if (low.indexOf('text outside the') !== -1 && low.indexOf('handoff') !== -1) {
+    name = 'Text outside the response'; desc = 'It wrote text around its termination response. Everything goes inside it.';
+  } else if (low.indexOf('end every turn with one') !== -1) {
+    name = 'No response'; desc = 'It ended without a termination response.';
+  } else if (group) {
+    const g = group[2].trim();
+    name = g.charAt(0).toUpperCase() + g.slice(1);
+    const words = quotedIn(group[3], /"([^"\n]{1,60})" \(/g);
+    desc = words.length ? 'It wrote ' + andList(words) + ' in a "' + group[1].split('_').join(' ') + '" response.'
+                        : 'Its response broke a rule: ' + g + '.';
+  } else if (low.indexOf('labels the user may not know') !== -1) {
+    const words = quotedIn(body, /"([^"\n]{1,60})" \(/g);
+    name = 'Unexplained labels';
+    desc = words.length ? 'It used ' + andList(words) + ' without saying what they are.'
+                        : 'It used labels from earlier in the session without saying what they are.';
+  } else if (low.indexOf('against what actually happened') !== -1) {
+    name = 'Claim not backed'; desc = 'Its response claimed something this session did not actually do.';
+  } else if (low.indexOf('format:') !== -1) {
+    name = 'Incomplete response'; desc = 'Its response was missing required parts.';
+  } else if (low.indexOf('think again') !== -1 || low.indexOf('unfinished work') !== -1) {
+    const words = quotedIn(firstPara, /"([^"\n]{1,60})"/g);
+    name = 'Unfinished work';
+    desc = words.length ? 'It said ' + andList(words) + '. That is work it can do itself, so it was sent back to finish it.'
+                        : 'It tried to stop with work left that it can do itself, so it was sent back to finish it.';
+  } else if (low.indexOf('labels') !== -1) {
+    const words = quotedIn(firstPara, /"([^"\n]{1,60})"/g);
+    name = 'Unexplained labels';
+    desc = words.length ? 'It used ' + andList(words) + ' without saying what they are.'
+                        : 'It used labels from earlier in the session without saying what they are.';
+  } else if (low.indexOf('nothing is needed') !== -1 || low.indexOf('says nothing') !== -1) {
+    name = 'Missing handoff';
+    desc = 'It said nothing was needed from you, without saying why, what happens next, or when you will hear back.';
+  } else if (low.indexOf('handoff') !== -1) {
+    name = 'Missing handoff';
+    desc = 'Its last message did not say what it is working on, where it stands, and what it needs from you.';
+  } else {
+    name = 'Sent back';
+    desc = firstPara.split('\n')[0].slice(0, 200);
+  }
+  return { kind: 'sent_back', name: name, desc: desc, text: reason.slice(0, 4000) };
+}
+
+// Names an engine or web server older than the rename still sends.
+const _SENT_BACK_OLD_NAMES = {
+  'Incomplete card': ['Incomplete response', 'Its response was missing required parts.'],
+  'No card': ['No response', 'It ended without a termination response.'],
+  'Text outside the card': ['Text outside the response', 'It wrote text around its termination response. Everything goes inside it.'],
+};
+function _renderSentBackCard(div, e) {
+  const old = _SENT_BACK_OLD_NAMES[e.name];
+  if (old) e = Object.assign({}, e, { name: old[0], desc: old[1] });
+  else if (e.desc) e = Object.assign({}, e, { desc: e.desc.replace(/\bIts card\b/, 'Its response').replace(/" card\.$/, '" response.') });
+  const chip = e.name || 'Sent back';
+  // One line on the rail, shaped like the steps line. The details stay behind a tap.
+  const backSvg = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/></svg>';
+  div.className = 'live-entry vn-sent-back';
+  div.innerHTML =
+    '<button type="button" class="vn-sb-head vn-sb-toggle" aria-expanded="false">' +
+      '<span><span class="vn-sb-icon" style="display:inline-grid">' + backSvg + '</span></span>' +
+      '<span class="vn-sb-main">Invalid termination response <span class="vn-sb-why">\u00b7 ' + escHtml(chip.toLowerCase()) + '</span></span>' +
+      '<span class="vn-sb-after">' + (chip === 'Unfinished work' ? 'kept working' : 'rewrote it') + '</span>' +
+      '<span class="vn-sb-chev">\u203a</span>' +
+    '</button>' +
+    '<div class="vn-sb-clip"><div><div class="vn-sb-body">' +
+      (e.desc ? '<div class="vn-sb-sum">' + escHtml(e.desc) + '</div>' : '') +
+      '<div class="vn-sb-h vn-sb-tried-h" hidden>It tried to end on</div>' +
+      '<div class="vn-sb-tried" hidden></div>' +
+      '<div class="vn-sb-h">It was told</div>' +
+      '<div class="vn-sb-told"></div>' +
+    '</div></div></div>';
+  div.querySelector('.vn-sb-told').textContent = e.text || '';
+  const toggle = div.querySelector('.vn-sb-toggle');
+  toggle.onclick = () => {
+    const open = div.classList.toggle('open');
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (typeof _noteDetailToggle === 'function') _noteDetailToggle();
+  };
+  queueMicrotask(() => {
+    // Walk back over the thread's own chrome. Live, the card is appended after
+    // thread-scroll's jump button and sentinel (and the verdict strip), so its
+    // previous sibling is never the message; stopping there left the rejected
+    // card drawn above the send-back. Stop at the first real entry.
+    let prev = div.previousElementSibling;
+    while (prev && !prev.classList.contains('msg') && !prev.classList.contains('live-entry')) {
+      prev = prev.previousElementSibling;
+    }
+    if (!prev || !prev.classList.contains('msg') || !prev.classList.contains('assistant')
+        || prev.classList.contains('streaming-bubble')) return;
+    const body = prev.querySelector('.msg-body');
+    if (!body) return;
+    const slot = div.querySelector('.vn-sb-tried');
+    slot.appendChild(body);
+    slot.hidden = false;
+    div.querySelector('.vn-sb-tried-h').hidden = false;
+    prev.remove();
+  });
+}
+
+// ── Automated session messages ──
+// Browser twin of src/shared/transcripts.automated_source: the server marks an
+// entry with `auto` (who sent it); the text rules below also catch entries
+// from a Session Engine or web server that predates the mark.
+function _automatedSource(e, text) {
+  if (e && typeof e.auto === 'string' && e.auto) return e.auto;
+  const t = String(text || '').replace(/^\s+/, '');
+  if (t.startsWith('<task-notification>')) return 'Background job finished';
+  if (t.startsWith('[VibeNode watchdog]')) return 'VibeNode watchdog';
+  if (t.startsWith('[VibeNode')) return 'VibeNode';
+  if (/^continue from where you left off\.?$/i.test(t.trim())) return 'Automatic continue';
+  if (t.startsWith('Your response above was cut off')) return 'Automatic continue';
+  if (t.startsWith('Your response above was stopped by a safety classifier')) return 'Safety notice';
+  if (t.startsWith('Another Claude session sent a message') || t.startsWith('<cross-session-message')) return 'Message from another session';
+  if (t.startsWith('Base directory for this skill')) return 'Skill loaded';
+  return '';
+}
+
+function _automatedSummary(text) {
+  const t = String(text || '');
+  const m = t.match(/<summary>([\s\S]*?)<\/summary>/);
+  if (m) return m[1].trim();
+  return t.replace(/^\[VibeNode watchdog\]\s*/, '').trim();
+}
+
+function _renderAutomatedMsg(div, source, text, timestamp) {
+  div.className = 'live-entry vn-auto-msg';
+  if (timestamp) div.dataset.ts = String(timestamp);
+  const ts = timestamp ? _formatMsgTime(timestamp) : '';
+  const icon = '<svg class="vn-auto-ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 4v4M9 13h.01M15 13h.01M9 17h6"/></svg>';
+  div.innerHTML =
+    '<button type="button" class="vn-auto-bar" aria-expanded="false">' +
+      '<span class="vn-auto-tag">Automated session message</span>' + icon +
+      '<span class="vn-auto-src"></span>' +
+      (ts ? '<span class="vn-auto-time">' + ts + '</span>' : '') +
+      '<svg class="vn-auto-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="m6 9 6 6 6-6"/></svg>' +
+    '</button>' +
+    '<div class="vn-auto-body"></div>';
+  div.querySelector('.vn-auto-src').textContent = source;
+  div.querySelector('.vn-auto-body').textContent = _automatedSummary(text);
+  // The job's own words ("[+120s] preflight ok"): the Working summary's live
+  // feed reads them (last-card.js _syncLive).
+  const ev = String(text || '').match(/<event>([\s\S]*?)<\/event>/);
+  div.dataset.event = (ev ? ev[1] : _automatedSummary(text)).trim().slice(0, 300);
+  const bar = div.querySelector('.vn-auto-bar');
+  bar.onclick = () => {
+    if (typeof _noteDetailToggle === 'function') _noteDetailToggle();
+    const open = div.classList.toggle('open');
+    bar.setAttribute('aria-expanded', open ? 'true' : 'false');
+  };
+}
+
+// The stop marker: a hairline across the thread with "Stopped by you" and the
+// time in the middle.
+// Keeps the live-interrupted class: work-trail.js reads it as a real stop.
+function _stoppedDivider(div, e) {
+  const ts = e && e.timestamp ? _formatMsgTime(e.timestamp) : '';
+  div.className = 'live-entry live-interrupted vn-stopped';
+  div.innerHTML =
+    '<span class="vn-stopped-l">' +
+      '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>' +
+      'Stopped by you' + (ts ? '<span class="vn-stopped-t">' + escHtml(ts) + '</span>' : '') +
+    '</span>';
+  return div;
+}
+
+// A Phone a Friend label at the start of a message (src/web/orgs/phone.py
+// writes "[Name via Phone a Friend]", "[Name via Phone a Friend, sent by you]";
+// src/web/orgs/mirror.py writes "[Suggested to Name]"). Returns the caption
+// and the message without the label, or null.
+function _phoneFriendLabel(text) {
+  const m = /^\[([^\]\n]{1,80}?) via Phone a Friend(, sent by you)?\]\s*/.exec(text || '');
+  if (m) return { caption: m[1] + ' · via Phone a Friend' + (m[2] ? ', sent by you' : ''), body: text.slice(m[0].length) };
+  const s = /^\[Suggested to ([^\]\n]{1,80})\]\s*/.exec(text || '');
+  if (s) return { caption: 'Suggested to ' + s[1], body: text.slice(s[0].length) };
+  return null;
+}
+window._phoneFriendLabel = _phoneFriendLabel;
+
+function renderLiveEntry(e, opts) {
+  const div = document.createElement('div');
+  if (!e) return div;
+
+  // A send-back delivered as a plain user entry, by a Session Engine or web
+  // server older than the 'sent_back' kind: still a card, never "me".
+  if (e.kind === 'user' && typeof e.text === 'string'
+      && e.text.trim().startsWith(_SENT_BACK_PREFIX)) {
+    _renderSentBackCard(div, _sentBackFromText(e.text));
+    return div;
+  }
+
+  if (e.kind === 'user' || e.kind === 'asst') {
+    const role = e.kind === 'user' ? 'user' : 'assistant';
+    let text = e.text || '';
+    let vnSentAt = null;
+    let vnIsVoice = false;
+    if (e.kind === 'user') {
+      const vnMeta = _stripVnMeta(text);
+      text = vnMeta.clean;
+      vnSentAt = vnMeta.sentAt;
+      vnIsVoice = vnMeta.voice;
+    }
+
+    // A message the owner did not type (a background job's notice, the
+    // watchdog, the automatic Continue, a check-in the session scheduled):
+    // a quiet full-width banner, never "me".
+    const autoSrc = e.kind === 'user' ? _automatedSource(e, text) : '';
+    if (autoSrc) {
+      _renderAutomatedMsg(div, autoSrc, text, e.timestamp);
+      return div;
+    }
+
+    // A line a local script posted through the message hook: drawn under its
+    // source, not as "me", because the user did not type it.
+    const vnEvent = e.kind === 'user' ? _parseVnEvent(text) : null;
+    if (vnEvent) {
+      div.className = 'msg user vn-event-msg';
+      const evTs = e.timestamp ? _formatMsgTime(e.timestamp) : '';
+      div.innerHTML = '<div class="msg-role">' + escHtml(vnEvent.source) + (evTs ? ' <span class="msg-time">' + evTs + '</span>' : '') + '</div>' +
+        '<div class="msg-body msg-content"></div>';
+      _fillMsgBody(div, 'user', vnEvent.body, false);
+      return div;
+    }
+
+    // Render [[invoke]] blocks as gradient pills instead of full markdown
+    if (e.kind === 'user' && typeof _renderInvokePills === 'function') {
+      const invokeResult = _renderInvokePills(text);
+      if (invokeResult) {
+        div.className = 'msg user';
+        const roleLabel = 'me';
+        const ts = e.timestamp ? _formatMsgTime(e.timestamp) : '';
+        let body = invokeResult.pillHtml;
+        if (invokeResult.remainder) {
+          body += '<pre style="white-space:pre-wrap;margin:8px 0 0;">' + escHtml(invokeResult.remainder) + '</pre>';
+        }
+        div.innerHTML = '<div class="msg-role">' + roleLabel + (ts ? ' <span class="msg-time">' + ts + '</span>' : '') + '</div>' +
+          '<div class="msg-body msg-content">' + body + '</div>';
+        return div;
+      }
+    }
+
+    // Render bracketed messages like [Request interrupted by user] as centered pills
+    if (e.kind === 'user' && /^\[.+\]$/.test(text.trim())) {
+      if (/interrupted by user/i.test(text)) return _stoppedDivider(div, e);
+      div.className = 'live-entry live-interrupted';
+      div.innerHTML =
+        '<div class="live-interrupted-pill">' +
+        '<span>' + escHtml(text.trim().slice(1, -1)) + '</span>' +
+        '</div>';
+      return div;
+    }
+
+    // Phone a Friend: a friend's message arrives labelled "[Sam via Phone a
+    // Friend]" (and a suggestion, in the friend's copy, "[Suggested to Dana]").
+    // Drawn as a quiet caption over a normal bubble, not as bracket text.
+    let _pfCaption = '';
+    if (e.kind === 'user') {
+      const _pf = _phoneFriendLabel(text);
+      if (_pf) { _pfCaption = _pf.caption; text = _pf.body; }
+    }
+
+    div.className = 'msg ' + role;
+    // Whose message this is: a summary's buttons answer only this session
+    // (last-card.js _send).
+    if (typeof liveSessionId !== 'undefined' && liveSessionId) div.dataset.sid = liveSessionId;
+    // The last-message card's live timing counts from when this was written.
+    if (e.timestamp) div.dataset.ts = String(e.timestamp);
+    const roleLabel = e.kind === 'user' ? 'me' : 'claude';
+    const ts = e.timestamp ? _formatMsgTime(e.timestamp) : '';
+    // Scaffold: role line + an empty body that _fillMsgBody() populates below.
+    div.innerHTML = '<div class="msg-role">' + roleLabel + (ts ? ' <span class="msg-time">' + ts + '</span>' : '') + '</div>' +
+      (_pfCaption ? '<div class="pf-from">' + escHtml(_pfCaption) + '</div>' : '') +
+      '<div class="msg-body msg-content"></div>';
+
+    // The caller can force the most-recent assistant message to render fully
+    // expanded (no truncation, no "show more"). Only honored for assistant
+    // messages \u2014 user messages always keep their truncation behavior.
+    const _forceExpand = !!(opts && opts.forceExpand) && e.kind === 'asst';
+    _fillMsgBody(div, e.kind, text, _forceExpand);
+
+    // Add VN metadata footer for user messages
+    if (e.kind === 'user' && vnSentAt) {
+      const footer = document.createElement('div');
+      footer.className = 'vn-msg-footer';
+      footer.innerHTML = _vnMsgFooterHtml(vnIsVoice, _formatSentAt(vnSentAt));
+      div.appendChild(footer);
+    }
+
+  } else if (e.kind === 'tool_use') {
+    const _isAgent = (e.name === 'Agent');
+    div.className = 'live-entry live-entry-tool' + (_isAgent ? ' live-entry-agent' : '');
+    div._vnEntry = e;   // work-trail.js reads the step from its row
+    const toolLine = document.createElement('div');
+    toolLine.className = 'live-tool-line';
+    // Use a special robot icon for Agent tool, gear icon for everything else
+    const _toolSvg = _isAgent
+      ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><line x1="12" y1="7" x2="12" y2="11"/><circle cx="8" cy="16" r="1" fill="currentColor"/><circle cx="16" cy="16" r="1" fill="currentColor"/></svg>'
+      : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9"/></svg>';
+    toolLine.innerHTML = '<span class="live-tool-icon">' + _toolSvg + '</span>' +
+      '<span class="live-tool-name">' + escHtml(e.name || 'tool') + '</span>' +
+      '<span class="live-tool-desc">' + escHtml((e.desc || '').slice(0, 120)) + '</span>' +
+      '<button class="live-expand-btn">\u25be</button>';
+
+    const detail = document.createElement('div');
+    detail.className = 'live-tool-detail';
+    detail.textContent = e.desc || '';
+
+    toolLine.onclick = () => { _noteDetailToggle(); detail.classList.toggle('open'); };
+    div.appendChild(toolLine);
+    div.appendChild(detail);
+
+  } else if (e.kind === 'tool_result') {
+    div.className = 'live-entry live-entry-result';
+    div._vnEntry = e;   // work-trail.js reads the step from its row
+    const ok = !e.is_error;
+    const text = e.text || '';
+
+    const line = document.createElement('div');
+    line.className = 'live-result-line ' + (ok ? 'live-result-ok' : 'live-result-err');
+    line.style.cursor = 'pointer';
+    const checkSvg = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><polyline points="20 6 9 17 4 12"/></svg>';
+    const xSvg = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    line.innerHTML = (ok ? checkSvg : xSvg) + escHtml(text.slice(0, 80)) + (text.length > 80 ? '\u2026' : '');
+
+    const detail = document.createElement('div');
+    detail.className = 'live-tool-detail';
+    detail.innerHTML = mdParse(_colorDiffLines(escHtml(text)));
+
+    line.onclick = () => { _noteDetailToggle(); detail.classList.toggle('open'); };
+    div.appendChild(line);
+    div.appendChild(detail);
+
+  } else if (e.kind === 'sent_back') {
+    // Smart termination sent the session back when it tried to stop. The card
+    // takes the place of the message it tried to stop on: that message is
+    // moved into the card's "Show" section once both are on the page.
+    _renderSentBackCard(div, e);
+
+  } else if (e.kind === 'system') {
+    const text = e.text || e.message || '';
+
+    /* ── Special: interrupted by user ── */
+    if (/interrupted by user/i.test(text)) return _stoppedDivider(div, e);
+
+    div.className = 'live-entry live-entry-result';
+    const isErr = !!e.is_error;
+    const line = document.createElement('div');
+    line.className = isErr ? 'live-result-line live-result-err' : 'live-result-line';
+    line.style.cursor = 'pointer';
+    if (!isErr) line.style.color = 'var(--text-muted)';
+    const icon = isErr
+      ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'
+      : '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>';
+    line.innerHTML = icon + escHtml(text.slice(0, 120)) + (text.length > 120 ? '\u2026' : '');
+
+    const detail = document.createElement('div');
+    detail.className = 'live-tool-detail';
+    detail.innerHTML = '<pre style="white-space:pre-wrap;margin:0;color:' + (isErr ? 'var(--result-err)' : 'var(--text-muted)') + ';">' + escHtml(text) + '</pre>';
+
+    line.onclick = () => { _noteDetailToggle(); detail.classList.toggle('open'); };
+    div.appendChild(line);
+    div.appendChild(detail);
+
+  } else if (e.kind === 'stream') {
+    // Streaming partial text — render as assistant fragment
+    div.className = 'msg assistant';
+    const text = e.text || '';
+    div.innerHTML = '<div class="msg-role">claude <span class="msg-time" style="color:var(--text-faint);font-size:10px;">streaming\u2026</span></div>' +
+      '<div class="msg-body msg-content">' + mdParse(text) + '</div>';
+
+  } else if (e.kind === 'permission') {
+    // Auto-approval audit log entry
+    const text = e.text || '';
+    const isErr = !!e.is_error;
+    div.className = 'live-entry live-entry-permission';
+    const shieldIcon = isErr
+      ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--result-err)" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="12" y1="9" x2="12" y2="15"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'
+      : '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>';
+    const line = document.createElement('div');
+    line.className = isErr ? 'live-result-line live-result-err' : 'live-result-line';
+    line.style.cursor = 'pointer';
+    line.style.fontSize = '11px';
+    if (!isErr) line.style.color = 'var(--text-faint)';
+    line.innerHTML = shieldIcon + escHtml(text.split('\n')[0]);
+
+    const detail = document.createElement('div');
+    detail.className = 'live-tool-detail';
+    detail.innerHTML = '<pre style="white-space:pre-wrap;margin:0;font-size:11px;color:' + (isErr ? 'var(--result-err)' : 'var(--text-faint)') + ';">' + escHtml(text) + '</pre>';
+
+    line.onclick = () => { _noteDetailToggle(); detail.classList.toggle('open'); };
+    div.appendChild(line);
+    div.appendChild(detail);
+
+  } else if (e.kind === 'directive_conflict') {
+    // Directive conflict resolution card — surfaced when an ambiguous
+    // conflict is detected between two user directives.
+    div.className = 'live-entry live-directive-conflict';
+    const c = e.conflict || {};
+    const newDir = e.new_directive || {};
+    const existDir = e.existing_directive || {};
+    const projectId = e.project_id || '';
+    // Use backend conflict id for the card element; fall back to composite id
+    const backendConflictId = c.id || '';
+    const conflictElId = 'dc-' + (backendConflictId || (newDir.id || '') + '-' + (existDir.id || ''));
+
+    const newTime = newDir.time || newDir.created_at ? _formatMsgTime(newDir.time || newDir.created_at) : '';
+    const existTime = existDir.time || existDir.created_at ? _formatMsgTime(existDir.time || existDir.created_at) : '';
+    const newScope = newDir.scope || newDir.said_to || 'unscoped';
+    const existScope = existDir.scope || existDir.said_to || 'unscoped';
+
+    // Escape for safe use inside single-quoted JS strings in onclick attrs
+    const _a = _escJsAttr;
+    const aProjId = _a(projectId), aBackendCid = _a(backendConflictId);
+    const aCid = _a(conflictElId);
+
+    div.id = conflictElId;
+    // Store backend conflict_id as a data attribute for resolution lookups
+    div.dataset.conflictId = backendConflictId;
+    div.innerHTML =
+      '<div class="dc-header">' +
+        '<svg class="dc-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">' +
+          '<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>' +
+          '<line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>' +
+        '</svg>' +
+        '<span class="dc-title">Directive Conflict</span>' +
+      '</div>' +
+      '<div class="dc-body">' +
+        '<div class="dc-directive dc-directive-old">' +
+          '<div class="dc-dir-meta">' +
+            '<span class="dc-dir-id">' + escHtml(existDir.id || '?') + '</span>' +
+            '<span class="dc-dir-scope">' + escHtml(existScope) + '</span>' +
+            (existTime ? '<span class="dc-dir-time">' + existTime + '</span>' : '') +
+          '</div>' +
+          '<div class="dc-dir-text">' + escHtml(existDir.directive || existDir.content || '') + '</div>' +
+        '</div>' +
+        '<div class="dc-vs">vs</div>' +
+        '<div class="dc-directive dc-directive-new">' +
+          '<div class="dc-dir-meta">' +
+            '<span class="dc-dir-id">' + escHtml(newDir.id || '?') + '</span>' +
+            '<span class="dc-dir-scope">' + escHtml(newScope) + '</span>' +
+            (newTime ? '<span class="dc-dir-time">' + newTime + '</span>' : '') +
+          '</div>' +
+          '<div class="dc-dir-text">' + escHtml(newDir.directive || newDir.content || '') + '</div>' +
+        '</div>' +
+        (c.recommendation ? '<div class="dc-reason">' + escHtml(c.recommendation) + '</div>' : '') +
+        (c.reason ? '<div class="dc-reason">' + escHtml(c.reason) + '</div>' : '') +
+      '</div>' +
+      '<div class="dc-actions" id="' + escHtml(conflictElId) + '-actions">' +
+        '<button class="dc-btn dc-btn-supersede" title="New directive (B) replaces old (A)"' +
+          ' onclick="_resolveDirectiveConflict(\'' + aProjId + '\',\'' + aBackendCid + '\',\'supersede\',\'' + aCid + '\')">Supersede</button>' +
+        '<button class="dc-btn dc-btn-scope" title="Both apply to different sections"' +
+          ' onclick="_resolveDirectiveConflict(\'' + aProjId + '\',\'' + aBackendCid + '\',\'scope\',\'' + aCid + '\')">Scope</button>' +
+        '<button class="dc-btn dc-btn-keep" title="Keep both active"' +
+          ' onclick="_resolveDirectiveConflict(\'' + aProjId + '\',\'' + aBackendCid + '\',\'keep_both\',\'' + aCid + '\')">Keep Both</button>' +
+      '</div>' +
+      '<div class="dc-freeform" id="' + escHtml(conflictElId) + '-freeform">' +
+        '<input type="text" class="dc-freeform-input" placeholder="Or describe how to resolve\u2026"' +
+          ' onkeydown="if(event.key===\'Enter\'){event.preventDefault();_resolveDirectiveConflictFreeform(\'' + aProjId + '\',\'' + aBackendCid + '\',this.value,\'' + aCid + '\');}">' +
+      '</div>';
+  }
+
+  return div;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DIRECTIVE CONFLICT RESOLUTION
+// ═══════════════════════════════════════════════════════════════
+
+/** Escape a string for safe embedding inside a single-quoted JS string in an
+ *  onclick attribute.  Handles ', ", &, <, >, and backslash. */
+function _escJsAttr(s) {
+  if (!s) return '';
+  return String(s)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, '\\&#39;')
+    .replace(/"/g, '&quot;')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/**
+ * Resolve a directive conflict via one-click button (supersede/scope/keep_both).
+ * Sends { conflict_id, action } to match the backend contract.
+ */
+async function _resolveDirectiveConflict(projectId, conflictId, action, conflictElId) {
+  const card = document.getElementById(conflictElId);
+  const actionsEl = card && card.querySelector('.dc-actions');
+  const freeformEl = card && card.querySelector('.dc-freeform');
+  // Save original buttons HTML so we can restore on error
+  const _savedActions = actionsEl ? actionsEl.innerHTML : '';
+  if (actionsEl) actionsEl.innerHTML = '<span class="dc-resolving">Resolving\u2026</span>';
+  if (freeformEl) freeformEl.style.display = 'none';
+
+  const body = {
+    conflict_id: conflictId,
+    action: action,
+  };
+
+  try {
+    const res = await fetch('/api/compose/projects/' + encodeURIComponent(projectId) + '/directives/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Resolution failed');
+    _markConflictResolved(conflictElId, action, data);
+  } catch (err) {
+    console.error('[directive-conflict] Resolution error:', err);
+    // Restore buttons so user can retry
+    if (actionsEl) actionsEl.innerHTML = '<span class="dc-error">Failed: ' + escHtml(err.message) + ' </span>' + _savedActions;
+    if (freeformEl) freeformEl.style.display = '';
+  }
+}
+
+/**
+ * Resolve a directive conflict via free-form text input.
+ * Interprets the text to determine action, then sends { conflict_id, action }
+ * to match the backend contract.
+ */
+async function _resolveDirectiveConflictFreeform(projectId, conflictId, text, conflictElId) {
+  if (!text || !text.trim()) return;
+  const card = document.getElementById(conflictElId);
+  const actionsEl = card && card.querySelector('.dc-actions');
+  const freeformEl = card && card.querySelector('.dc-freeform');
+  const _savedActions = actionsEl ? actionsEl.innerHTML : '';
+  if (actionsEl) actionsEl.innerHTML = '<span class="dc-resolving">Resolving\u2026</span>';
+  if (freeformEl) freeformEl.style.display = 'none';
+
+  // Heuristic: detect intent from text using word boundaries to reduce false positives
+  const lower = text.toLowerCase().trim();
+  let action = 'supersede';  // default
+  if (/\bkeep both\b|\bboth\b.*\bvalid\b|\bintentionally different\b|\bintentional\b/i.test(lower)) action = 'keep_both';
+  else if (/\bscope\b|\bseparate\b|\beach section\b|\btheir own\b/i.test(lower)) action = 'scope';
+
+  try {
+    const res = await fetch('/api/compose/projects/' + encodeURIComponent(projectId) + '/directives/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conflict_id: conflictId,
+        action: action,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Resolution failed');
+    _markConflictResolved(conflictElId, action, data);
+  } catch (err) {
+    console.error('[directive-conflict] Freeform resolution error:', err);
+    if (actionsEl) actionsEl.innerHTML = '<span class="dc-error">Failed: ' + escHtml(err.message) + ' </span>' + _savedActions;
+    if (freeformEl) freeformEl.style.display = '';
+  }
+}
+
+/**
+ * Update the conflict card UI after successful resolution.
+ */
+function _markConflictResolved(conflictElId, resolution, data) {
+  const card = document.getElementById(conflictElId);
+  if (!card) return;
+  card.classList.add('dc-resolved');
+
+  const labels = {
+    supersede: 'Superseded',
+    scope: 'Scoped separately',
+    keep_both: 'Kept both',
+  };
+  const label = labels[resolution] || resolution;
+  const note = data.resolution_directive
+    ? data.resolution_directive.directive || ''
+    : '';
+
+  const actionsEl = card.querySelector('.dc-actions');
+  if (actionsEl) {
+    actionsEl.innerHTML =
+      '<div class="dc-resolved-badge">' +
+        '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg> ' +
+        '<span>' + escHtml(label) + '</span>' +
+      '</div>' +
+      (note ? '<div class="dc-resolved-note">' + escHtml(note) + '</div>' : '');
+  }
+  const freeformEl = card.querySelector('.dc-freeform');
+  if (freeformEl) freeformEl.remove();
+}
+
+/**
+ * Inject a directive conflict card into the live chat log.
+ * Called from socket event handler when compose_directive_logged fires
+ * with ambiguous conflicts.
+ */
+function _injectDirectiveConflict(data) {
+  const logEl = document.getElementById('live-log');
+  if (!logEl) return;
+
+  const directive = data.directive || {};
+  const conflicts = data.conflicts || [];
+
+  // Only surface ambiguous conflicts — global/contextual are auto-resolved
+  const ambiguous = conflicts.filter(c => c.classification === 'ambiguous');
+  if (!ambiguous.length) return;
+
+  for (const conflict of ambiguous) {
+    // Build a synthetic entry for the conflict card renderer.
+    // Map backend ComposeConflict fields to what renderLiveEntry expects.
+    const existingStub = {
+      id: conflict.existing_id || conflict.directive_a_id || '',
+      directive: conflict.existing_text || conflict.directive_a_content || '',
+      content: conflict.existing_text || conflict.directive_a_content || '',
+      time: conflict.existing_time || '',
+      scope: conflict.existing_scope || null,
+    };
+
+    const entry = {
+      kind: 'directive_conflict',
+      project_id: data.project_id,
+      new_directive: directive,
+      existing_directive: existingStub,
+      conflict: conflict,
+    };
+
+    const el = renderLiveEntry(entry);
+    logEl.appendChild(el);   // no auto-scroll: the jump button announces it
+    // [classic] Classic scroll restores the original lines (thread-scroll-classic.js).
+    if (window.vnClassicScroll && vnClassicScroll()) {
+      // Auto-scroll if enabled
+      if (liveAutoScroll) {
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+    }
+  }
+}
+
+/** Build a compact context circle indicator. Clickable to trigger compact when not working. */
+function _buildCtxBarCompact(id, disabled) {
+  const _usage = (window._sessionUsage && window._sessionUsage[id]) || null;
+  if (!_usage) return '';
+  // Window size tracks the CLI's [1m] marker on the session's model id, so a
+  // 1M session doesn't read 100% at 20% fill.  Shared helper lives in
+  // invoke-workforce.js — see _ctxWindowFor.  Fall back to 200K if the
+  // helper hasn't loaded yet (script-order safety).
+  const _cw = (typeof window._ctxWindowFor === 'function')
+    ? window._ctxWindowFor(id) : {size: 200000, label: '200K'};
+  const _ctxWindow = _cw.size;
+  let _tokens = (_usage.input_tokens || 0)
+    + (_usage.cache_read_input_tokens || 0)
+    + (_usage.cache_creation_input_tokens || 0);
+  if (_tokens <= 0 || _tokens > _ctxWindow * 1.5) return '';
+  const _pct = Math.min(100, Math.round((_tokens / _ctxWindow) * 100));
+  const _color = _pct >= 90 ? 'var(--result-err)' : _pct >= 70 ? '#ffb700' : 'var(--accent)';
+  // SVG circle: radius=7, circumference=~43.98
+  const _circ = 2 * Math.PI * 7;
+  const _filled = _circ * (_pct / 100);
+  const _cls = disabled ? 'ctx-circle ctx-disabled' : 'ctx-circle ctx-clickable';
+  const _click = disabled ? '' : ' onclick="liveCompact()"';
+  const _title = disabled ? 'Context ' + _pct + '%' : 'Context ' + _pct + '% — click to compact';
+  return '<div class="' + _cls + '"' + _click + ' title="' + _title + '">' +
+    '<svg width="18" height="18" viewBox="0 0 18 18">' +
+    '<circle cx="9" cy="9" r="7" fill="none" stroke="var(--border-subtle)" stroke-width="2"/>' +
+    '<circle cx="9" cy="9" r="7" fill="none" stroke="' + _color + '" stroke-width="2"' +
+    ' stroke-dasharray="' + _filled.toFixed(2) + ' ' + _circ.toFixed(2) + '"' +
+    ' stroke-linecap="round" transform="rotate(-90 9 9)"/>' +
+    '</svg></div>';
+}
+
+/** Footer under one of your messages: just the time, with a small mic and
+ *  "Voice" when it was dictated.  One builder for both render paths. */
+function _vnMsgFooterHtml(isVoice, timeStr) {
+  const mic = '<svg class="vn-msg-footer-mic" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3" fill="currentColor" stroke="none"/><path d="M19 11a7 7 0 0 1-14 0"/><path d="M12 19v3"/></svg>';
+  return (isVoice ? mic + 'Voice \u00b7 ' : '') + escHtml(timeStr);
+}
+
+// ── Composer status header ────────────────────────────────────────────────
+// Working / Compacting / Awaiting wake-up / Asleep are shown as a header
+// ATTACHED to the text box, inside one border (".vn-card"), instead of a
+// separate tinted box or banner above it.  Each state uses the same icon the
+// session list uses for it (sessions.js _renderSessionRow), drawn in neutral.
+const _ST_ICONS = {
+  working: '<span class="vn-st-mask vn-st-pick"></span>',
+  compacting: '<svg class="vn-st-squeeze" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
+  waking: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
+  asleep: '<span class="vn-st-mask vn-st-sleep"></span>',
+  // Standby: the sidebar's pause icon (session-verb.js).
+  standby: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="M10 9v6"/><path d="M14 9v6"/></svg>',
+};
+const _ST_LABELS = {working: 'Working', compacting: 'Compacting', waking: 'Awaiting wake-up', asleep: 'Sleeping', standby: 'Standby'};
+/** "Set aside 12 min ago" for a Standby session's text box (epoch seconds). */
+function _setAsideText(since) {
+  const s = Math.max(0, Date.now() / 1000 - (+since || 0));
+  if (!(+since > 0)) return '';
+  if (s < 60) return 'Set aside just now';
+  const m = Math.floor(s / 60);
+  if (m < 60) return 'Set aside ' + m + ' min ago';
+  const h = Math.floor(m / 60);
+  if (h < 24) return 'Set aside ' + h + ' hr ago';
+  const d = Math.floor(h / 24);
+  return d === 1 ? 'Set aside yesterday' : 'Set aside ' + d + ' days ago';
+}
+// Keeps "Set aside N min ago" true while the box stays open.  One interval
+// for the page; it only touches the bar when that line is on screen.
+let _setAsideTicker = null;
+function _tickSetAside() {
+  if (_setAsideTicker) return;
+  _setAsideTicker = setInterval(() => {
+    const el = document.querySelector('#live-input-bar .vn-st-since');
+    if (!el) { clearInterval(_setAsideTicker); _setAsideTicker = null; return; }
+    el.textContent = el.dataset.done ? _markedDoneText(el.dataset.since) : _setAsideText(el.dataset.since);
+  }, 30000);
+}
+/** Session substatus -> header state for a WORKING session. */
+function _stKindFor(sub) { return sub === 'compacting' ? 'compacting' : (sub === 'auto-resuming' ? 'waking' : 'working'); }
+/** The motion that goes with a busy state (nothing while a session merely
+ *  waits to wake).  Working: sparks fly off the pickaxe on each strike.
+ *  Compacting has no strike, so it keeps the light along the card's top edge.
+ *  Both carry .vn-st-fx so the state-change swap can find whichever is there. */
+function _stShimmer(kind) {
+  if (kind === 'working') return '<span class="vn-st-fx vn-st-sparks"><i></i><i></i><i></i><i></i></span>';
+  if (kind === 'compacting') return '<span class="vn-st-fx vn-st-shimmer"></span>';
+  return '';
+}
+/** Header row.  `extra` = html after the label (timer, agent summary, hint);
+ *  `right` = html pinned right (Stop). */
+function _stHeader(kind, extra, right) {
+  return '<div class="vn-st"><span class="vn-st-ico" id="live-st-ico">' + _ST_ICONS[kind] + '</span>' +
+    '<span class="vn-st-lbl" id="live-st-lbl">' + _ST_LABELS[kind] + '</span>' + (extra || '') +
+    (right ? '<span class="vn-st-grow"></span>' + right : '') + '</div>';
+}
+
+// ── Status picker in the text box ──
+// A stopped session's status line shows the person's status (Needs you,
+// Standby, Done) and opens a menu to change it.  The menu runs the same
+// actions as the sidebar's right-click (SessionVerdict), so a pick is a hold
+// that any new message ends, and a running turn still shows Working.  Only
+// while the person-oriented statuses are on (window.SessionVerb).
+const _PICK_ICONS = {
+  needs: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="M12 7.5v5.5"/><path d="M12 16.5h.01"/></svg>',
+  standby: _ST_ICONS.standby,
+  done: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><path d="M8 12.5l2.7 2.7L16 9.8"/></svg>',
+};
+const _PICK_LABELS = {needs: 'Needs you', standby: 'Standby', done: 'Done'};
+const _PICK_CHOICES = [
+  ['needs', 'Back on your list; automatic status shows'],
+  ['standby', 'Seen, not now. Ends at the next message'],
+  ['done', 'Your verdict. Ends at the next message'],
+];
+/** 'needs' | 'standby' | 'done' to draw in the picker, or '' (no picker). */
+function _pickGroup(id) {
+  const SV = window.SessionVerb;
+  if (!SV || !SV.display || !SV.shown || !window.SessionVerdict) return '';
+  const g = SV.shown(SV.display(id));
+  return (g === 'needs' || g === 'standby' || g === 'done') ? g : '';
+}
+function _markedDoneText(since) {
+  const t = _setAsideText(since);
+  return t ? t.replace('Set aside', 'Marked done') : '';
+}
+/** The vn-card's opening tag plus its status row, with the picker. */
+function _pickCardOpen(id, g) {
+  const since = (window.SessionVerb && window.SessionVerb.holdSince) ? window.SessionVerb.holdSince(id) : 0;
+  let hint;
+  if (g === 'standby' && since) hint = '<span class="vn-st-hint vn-st-since" data-since="' + since + '">' + _setAsideText(since) + '</span>';
+  else if (g === 'done' && since) hint = '<span class="vn-st-hint vn-st-since" data-since="' + since + '" data-done="1">' + _markedDoneText(since) + '</span>';
+  else if (g === 'needs') hint = '<span class="vn-st-hint">Its reply is waiting for you</span>';
+  else hint = '';
+  return '<div class="vn-card" data-st="' + g + '"><div class="vn-st">' +
+    '<span class="vn-pick-wrap"><button type="button" class="vn-pick" aria-haspopup="menu" aria-expanded="false" title="Change status"' +
+    ' onclick="_togglePickMenu(event, \'' + id + '\')">' +
+    '<span class="vn-st-ico" id="live-st-ico">' + _PICK_ICONS[g] + '</span>' +
+    '<span class="vn-st-lbl" id="live-st-lbl">' + _PICK_LABELS[g] + '</span>' +
+    '<svg class="vn-pick-car" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>' +
+    '</button></span>' + hint + '</div>';
+}
+function _closePickMenu() {
+  const m = document.querySelector('#live-input-bar .vn-pick-menu');
+  if (m) m.remove();
+  const b = document.querySelector('#live-input-bar .vn-pick');
+  if (b) b.setAttribute('aria-expanded', 'false');
+}
+function _togglePickMenu(e, id) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  const btn = e && e.currentTarget;
+  const wrap = btn && btn.parentElement;
+  if (!wrap) return;
+  if (wrap.querySelector('.vn-pick-menu')) { _closePickMenu(); return; }
+  const cur = _pickGroup(id);
+  const check = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
+  const menu = document.createElement('div');
+  menu.className = 'vn-pick-menu';
+  menu.setAttribute('role', 'menu');
+  menu.innerHTML = '<div class="vn-pick-mh">Status</div>' + _PICK_CHOICES.map(([k, d]) =>
+    '<button type="button" role="menuitemradio" aria-checked="' + (k === cur) + '" class="vn-pick-mi' + (k === cur ? ' cur' : '') + '" data-st="' + k + '" data-pick="' + k + '">' +
+    '<span class="vn-pick-ic">' + _PICK_ICONS[k] + '</span><span class="vn-pick-tx"><b>' + _PICK_LABELS[k] + '</b><span>' + d + '</span></span>' +
+    '<span class="vn-pick-ck">' + check + '</span></button>').join('') +
+    '<div class="vn-pick-note">Working and New are set by the session itself.</div>';
+  menu.addEventListener('click', ev => {
+    ev.stopPropagation();
+    const it = ev.target.closest('[data-pick]');
+    if (!it) return;
+    _closePickMenu();
+    _pickStatus(id, it.dataset.pick);
+  });
+  wrap.appendChild(menu);
+  btn.setAttribute('aria-expanded', 'true');
+  const first = menu.querySelector('.vn-pick-mi.cur') || menu.querySelector('.vn-pick-mi');
+  if (first) first.focus();
+}
+/** Same actions as the sidebar's right-click Standby / Mark done / Back to Needs you. */
+function _pickStatus(id, to) {
+  const V = window.SessionVerdict;
+  if (!V || to === _pickGroup(id)) return;
+  if (to === 'done') V.accept(id);
+  else if (to === 'standby') V.standby(id);
+  else V.unpark(id);
+}
+document.addEventListener('click', e => { if (!e.target.closest || !e.target.closest('.vn-pick-wrap')) _closePickMenu(); });
+// Capture phase, and stop it there: the app's own Escape closes the open
+// session, and Escape on an open menu must only close the menu.
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.querySelector('#live-input-bar .vn-pick-menu')) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    _closePickMenu();
+    const b = document.querySelector('#live-input-bar .vn-pick');
+    if (b) b.focus();
+  }
+}, true);
+
+function updateLiveInputBar() {
+  if (!liveSessionId) return;
+  const id = liveSessionId;
+  const bar = document.getElementById('live-input-bar');
+  if (!bar) return;
+  // Keep floating notices (toast, git-sync indicator) above this composer.
+  // Cheap: re-observes only when the bar element itself changed.
+  if (typeof _updateFloatOffset === 'function') _updateFloatOffset();
+
+  // Track whether focus was inside this bar before re-render so we can
+  // restore it synchronously after innerHTML replacement (avoids focus flash).
+  const _barHadFocus = bar.contains(document.activeElement);
+
+  // Whether a *deliberate* GUI action (opening this session — see openInGUI)
+  // asked us to pull focus into the input. Only that should proactively grab
+  // focus. A state-driven re-render must NOT: on touch devices (no physical
+  // keyboard) calling .focus() re-opens the on-screen keyboard, and these
+  // re-renders fire constantly (idle↔working, queue changes, every sub-agent
+  // status tick), so autofocusing on each one makes the keyboard flail on
+  // screen. Focus that already lives in the bar is still preserved below via
+  // _barHadFocus, so "keep typing after send" and mid-typing transitions are
+  // unaffected. The flag is captured here and consumed once, at the commit
+  // point below, so an early-return re-render doesn't swallow it.
+  //
+  // Mobile: even a *deliberate* GUI-open must NOT autofocus. On phones the
+  // on-screen keyboard pops up and covers the session the user just wanted
+  // to look at — they'll tap the composer themselves when they want to type.
+  // The autofocus behavior is desirable on desktop (physical keyboard, no
+  // popover cost), so it stays gated on viewport width like the rest of the
+  // mobile-aware code in this file (_defocusComposerMobile, etc.).
+  const _wantAutofocus = _guiFocusPending && !_isMobileViewport();
+
+  // Don't touch the bar for sessions that haven't started on the server yet.
+  // addNewAgent() renders its own input bar with _newSessionSubmit handler.
+  // If neither runningIds nor sessionKinds know about this session, leave it alone.
+  const isRunning = runningIds.has(id);
+  const kind = sessionKinds[id];  // 'question' | 'working' | 'idle' | undefined
+  if (!isRunning && !kind && guiOpenSessions.has(id)) return;
+
+  // Capture any text the user has typed in either textarea so we can
+  // preserve it across state transitions (e.g. idle → working, working → idle).
+  // This replaces the old early-return that blocked state transitions entirely.
+  const _existingTa = bar.querySelector('#live-input-ta') || bar.querySelector('#live-queue-ta');
+  let _preservedText = _existingTa ? _existingTa.value : '';
+  const wd = waitingData[id];     // {question, options, kind} or undefined
+
+  // Resolve the model for this live session — used for the informational
+  // model badge in idle/waiting/continue bars.
+  const _liveSess = (typeof allSessions !== 'undefined') ? allSessions.find(x => x.id === id) : null;
+  const _liveSessionModel = (_liveSess && _liveSess.model) ? _liveSess.model : '';
+
+  // Compute a state key — for question state, include question text so we re-render if the question changed
+  // For idle, include sleeping-substatus so we re-render the "Awaiting wake-up…"
+  // indicator when the wake-up fires/clears.
+  const _idleSub = (window._sessionSubstatus && window._sessionSubstatus[id]) || '';
+  // Auto-retry countdown / error state — folded into the idle stateKey so the
+  // bar re-renders when a retry is armed/cleared, the attempt advances, or an
+  // error appears (which surfaces the manual Retry button).
+  const _retrySt = (window._sessionRetryState && window._sessionRetryState[id]) || null;
+  const _sessErr = (window._sessionError && window._sessionError[id]) || '';
+  // Usage-limit CTA state.  Folded into BOTH the idle and the not-running
+  // state keys: a quota that kills the session lands in the `!isRunning`
+  // branch, whose key used to be the constant 'ended' — so the CTA would
+  // never have repainted there.  That constant key is the same reason a
+  // stopped session shows no error banner at all today.
+  const _limitSt = (window._sessionLimitState && window._sessionLimitState[id]) || null;
+  const _limitKey = _limitSt ? ':limit:' + _limitSt.limited_model + ':' + _limitSt.limit_reset_at : '';
+  let stateKey;
+  // Only _limitKey is folded in here — NOT _sessErr.  The !isRunning branch
+  // renders the limit CTA but not the generic error banner, so keying off the
+  // error would force a repaint that changes nothing visible while destroying
+  // any text the user had typed into the resume box.
+  // A sleeping session on Standby says so.
+  const _SV = window.SessionVerb;
+  const _standby = !isRunning && !!(_SV && _SV.holdOf && _SV.holdOf(id) === 'standby');
+  const _standbySince = _standby && _SV.holdSince ? _SV.holdSince(id) : 0;
+  // The status picker's status (Needs you / Standby / Done) and its time:
+  // a change redraws the text box.
+  const _pickG = (!isRunning || (kind === 'idle' && _idleSub !== 'auto-resuming')) ? _pickGroup(id) : '';
+  const _pickKey = _pickG ? ':pick:' + _pickG + ':' + ((_SV && _SV.holdSince) ? _SV.holdSince(id) : 0) : '';
+  if (!isRunning) stateKey = 'ended' + _limitKey + (_standby ? ':standby:' + _standbySince : '') + _pickKey;
+  else if (kind === 'question') stateKey = 'question:' + (wd ? wd.question || '' : '');
+  else if (kind === 'idle') stateKey = 'idle:' + _idleSub
+    + (_retrySt ? ':retry:' + _retrySt.retry_at + ':' + _retrySt.retry_attempt : '')
+    + _limitKey
+    + (!_retrySt && _sessErr ? ':err:1' : '')
+    + _pickKey;
+  else {
+    // Include sub-agent count + status in state key so bar re-renders when agents change
+    const _sa = (window._subAgents && window._subAgents[id]) || {};
+    const _saKey = Object.values(_sa).map(a => a.status).join(',');
+    stateKey = 'working:' + _getQueueList(id).length + ':sa:' + _saKey;
+  }
+
+  // Reset working timer when leaving working state — but only if we
+  // have a definitive non-working state (not just 'ended' from missing data)
+  if (!stateKey.startsWith('working') && kind) {
+    _liveWorkingStart = null;
+    if (_liveWorkingTimer) { clearInterval(_liveWorkingTimer); _liveWorkingTimer = null; }
+  }
+
+  // Don't re-render if the bar is already showing this exact state.
+  // This is critical: prevents wiping user's in-progress typed text.
+  if (stateKey === liveBarState) return;
+
+  // Don't rebuild bar while voice is actively recording inside it — innerHTML
+  // would destroy the textarea the recognition targets, cutting the user off.
+  // The bar catches up via deferred updateLiveInputBar() call in voice onend.
+  if (typeof _activeRecognition !== 'undefined' && _activeRecognition &&
+      _activeRecognition._target && bar.contains(_activeRecognition._target)) {
+    return;  // liveBarState NOT updated — so deferred call will still see a mismatch
+  }
+  // Same guard for SpeechNode (MediaRecorder path). Without this, when a session
+  // finishes its turn mid-dictation, the bar re-renders, replaces the textarea, and
+  // the onSubmit closure captured at bar-build time becomes stale — message dropped
+  // every time. _refreshBarSoon() inside commitSend() handles the deferred catch-up.
+  if (typeof _activeSpeechNode !== 'undefined' && _activeSpeechNode &&
+      _activeSpeechNode._target && bar.contains(_activeSpeechNode._target)) {
+    return;  // liveBarState NOT updated — commitSend's _refreshBarSoon() catches up
+  }
+
+  const wasTransition = liveBarState !== null;  // true if switching between states
+  liveBarState = stateKey;
+  // Committed to a real re-render — consume the deliberate-focus request so it
+  // only applies to this one render (the first after a GUI open), never to the
+  // stream of state-driven re-renders that follow.
+  _guiFocusPending = false;
+
+  // The bar is about to be rebuilt (innerHTML replaced), which destroys the
+  // countdown element.  Stop any running auto-retry countdown timer; the idle
+  // branch below re-creates it if a retry banner is rendered.
+  if (_liveRetryTimer) { clearInterval(_liveRetryTimer); _liveRetryTimer = null; }
+
+  // Animate the bar content when switching between states (not on initial render)
+  if (wasTransition) {
+    bar.classList.add('bar-transitioning');
+    setTimeout(() => bar.classList.remove('bar-transitioning'), 350);
+  }
+
+  if (!isRunning) {
+    // A usage limit that kills the session lands here.  Show the model-switch
+    // CTA INSTEAD of the generic "not running" strip — "type a message to
+    // resume" is actively wrong advice when the quota is the thing blocking
+    // you, because resuming on the same model just hits the wall again.
+    const _limitBanner = _buildUsageLimitBanner(id, _limitSt);
+    bar.innerHTML =
+      (_limitBanner || '') +
+      // No limit banner: the "asleep" header is attached to the text box.
+      (_limitBanner ? '' : _pickG
+        ? _pickCardOpen(id, _pickG)
+        : _standby
+        ? '<div class="vn-card" data-st="standby">' + _stHeader('standby', _standbySince
+            ? '<span class="vn-st-hint vn-st-since" data-since="' + _standbySince + '">' + _setAsideText(_standbySince) + '</span>' : '')
+        : '<div class="vn-card">' +
+        _stHeader('asleep', '<span class="vn-st-hint">Wakes when you send a message</span>')) +
+      '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="' +
+      (_limitBanner ? 'Type a message to continue\u2026' : _standby ? 'Type to pick it back up'
+        : _pickG === 'done' ? 'Type to reopen it' : 'Type a message to wake it') + '"' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"' +
+      ' onblur="if(_wasKeyboardDismissBlur()){liveSubmitContinue(\'' + id + '\')}"></textarea>' +
+      (_limitBanner ? '' : '</div>') +
+      '<div class="live-bar-row">' +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id), false, _liveSessionModel) : _buildCtxBarCompact(id)) +
+      '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
+      '<button class="live-send-btn" id="live-voice-btn"></button>' +
+      '</div>';
+    const btnClose = document.getElementById('btn-close');
+    if (btnClose) btnClose.disabled = true;
+    if (!_limitBanner && (_standbySince || (_pickG === 'done' || _pickG === 'standby'))) _tickSetAside();
+    // Tick the "resets in …" text if the CTA is showing with a known reset.
+    if (_limitBanner && _limitSt && (_limitSt.limit_reset_at > 0 || _retrySt)) _startLimitCountdown();
+    setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => liveSubmitContinue(id));
+    if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
+    setTimeout(() => {
+      if (window.vnClassicScroll && vnClassicScroll()) {   // [classic] the original settle-scroll
+        const logEl = document.getElementById('live-log');
+        if (logEl) _autoScrollLiveLog(logEl);
+      } else if (window.ThreadScroll) ThreadScroll.holdBottom();   // bar resized the log
+      const ta = document.getElementById('live-input-ta');
+      if (ta) { if (_wantAutofocus && !_barHadFocus) ta.focus(); _initAutoResize(ta); }
+    }, 50);
+
+  } else if (kind === 'question') {
+    // Claude is asking something — show question text + option buttons + free-form textarea
+    // Queue is managed server-side; never pop queue items into permission responses
+    _renderQueueBanner();
+    const questionText = (wd && wd.question) ? wd.question : '';
+    const options = (wd && wd.options) ? wd.options : null;
+
+    // Render question bubble
+    let questionHTML = '';
+    if (questionText) {
+      // Escape and show last ~400 chars of question (truncate top if very long)
+      const display = questionText.length > 400 ? '\u2026' + questionText.slice(-400) : questionText;
+      questionHTML = '<div class="live-question-text">' + mdParse(display) + '</div>';
+    }
+
+    // Render option buttons (y/n/a, yes/no, or numbered list)
+    const isTool = (wd && wd.kind === 'tool');
+    const _chk = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:middle;"><polyline points="20 6 9 17 4 12"/></svg>';
+    const _xic = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:middle;"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    const _star = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
+    const _shield = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>';
+    const optLabels = { y: _chk + ' Yes', n: _xic + ' No', aa: _shield + ' Auto Most', a: _star + ' Always', yes: _chk + ' Yes', no: _xic + ' No' };
+    let optBtns = '';
+    if (options && options.length) {
+      optBtns = '<div class="live-option-btns">' +
+        options.map((opt) => {
+          // Numbered option: "1. Do X" -> label = "1. Do X", send = "1"
+          // Single token option: "y" / "n" / "yes" / "no" / "a" -> expand label for tool prompts
+          const isNumbered = /^\d+\./.test(opt);
+          const sendVal = isNumbered ? opt.match(/^(\d+)\./)[1] : opt;
+          const label = (!isNumbered && isTool && optLabels[opt.toLowerCase()])
+            ? optLabels[opt.toLowerCase()] : escHtml(opt);
+          const safeVal = sendVal.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+          return '<button class="live-opt-btn" onclick="livePickOption(\'' + safeVal + '\')">' + label + '</button>';
+        }).join('') +
+      '</div>';
+    }
+
+    bar.innerHTML =
+      '<div class="live-waiting-label"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg> Claude has a question</div>' +
+      questionHTML +
+      optBtns +
+      '<textarea id="live-input-ta" class="live-textarea waiting-focus" rows="2" placeholder="Type your response\u2026 (or click an option above)"' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitWaiting()}"' +
+      ' onblur="if(_wasKeyboardDismissBlur()){liveSubmitWaiting()}"></textarea>' +
+      '<div class="live-bar-row">' +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id), false, _liveSessionModel) : _buildCtxBarCompact(id)) +
+      '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
+      '<button class="live-send-btn waiting" id="live-voice-btn"></button>' +
+      '</div>';
+    setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitWaiting);
+    const ta = document.getElementById('live-input-ta');
+    if (ta) {
+      if (_barHadFocus) ta.focus();
+      _initAutoResize(ta);
+      setTimeout(() => {
+        if (window.vnClassicScroll && vnClassicScroll()) {   // [classic] the original settle-scroll
+          const logEl = document.getElementById('live-log');
+          if (logEl) _autoScrollLiveLog(logEl);
+        } else if (window.ThreadScroll) ThreadScroll.holdBottom();   // bar resized the log
+        if (_wantAutofocus && !_barHadFocus) ta.focus();
+      }, 50);
+    }
+
+  } else if (kind === 'idle') {
+    // Sleeping with a scheduled wake-up pending?  Distinguish the idle
+    // bar so the user can tell apart "really done" vs "asleep, will wake
+    // itself up later" \u2014 the latter still accepts manual input (which
+    // supersedes the wake-up).
+    const _sleeping = (_idleSub === 'auto-resuming');
+    // \u2500\u2500 Auto-retry countdown banner \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    // When the server has armed an API-error auto-retry, show a live countdown
+    // (ticked by _liveRetryTimer below) with Cancel + Retry-now controls.  If
+    // the session instead settled on a (non-retrying) error, show a one-click
+    // manual Retry button.  These are mutually exclusive.
+    const _retryBtns =
+      '<button class="live-mini-btn" onclick="liveRetryNow()" ' +
+      'style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border-subtle);' +
+      'background:var(--bg-elevated,var(--bg-card));color:var(--text);cursor:pointer;">Retry now</button>' +
+      '<button class="live-mini-btn" onclick="liveCancelRetry()" ' +
+      'style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border-subtle);' +
+      'background:transparent;color:var(--text-muted);cursor:pointer;">Cancel</button>';
+    let _retryBanner = '';
+    // The usage-limit CTA outranks BOTH the retry countdown and the generic
+    // error banner: when the quota is what's blocking you, "Retry" is the one
+    // button guaranteed not to work, so offering it first is worse than
+    // offering nothing.  The daemon never arms a seconds-scale backoff for a
+    // usage limit, only a timed continue-at-reset (_schedule_limit_resume).  The limit banner shows that countdown itself, with Cancel.
+    const _limitBannerIdle = _buildUsageLimitBanner(id, _limitSt);
+    if (_limitBannerIdle) {
+      _retryBanner = _limitBannerIdle;
+    } else if (_retrySt) {
+      const _secs = Math.max(0, Math.ceil(_retrySt.retry_at - Date.now() / 1000));
+      const _attemptStr = (_retrySt.retry_attempt && _retrySt.retry_max)
+        ? ' \u00b7 attempt ' + _retrySt.retry_attempt + '/' + _retrySt.retry_max : '';
+      const _reasonStr = _retrySt.retry_reason ? ' \u00b7 ' + escHtml(_retrySt.retry_reason) : '';
+      _retryBanner =
+        '<div class="live-retry-banner" style="display:flex;align-items:center;gap:8px;' +
+        'margin-bottom:8px;padding:8px 12px;background:var(--bg-card);' +
+        'border:1px solid var(--warn-border,#8a6d3b);border-radius:8px;">' +
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--warn,#d9a441)" ' +
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/>' +
+        '<path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>' +
+        '<span style="font-size:12px;color:var(--text-muted);flex:1;">' +
+        'Auto-retrying in <strong id="live-retry-countdown" style="color:var(--text);">' +
+        _fmtRetrySecs(_secs) + '</strong>' + _attemptStr + _reasonStr + '</span>' +
+        _retryBtns +
+        '</div>';
+    } else if (_sessErr) {
+      _retryBanner =
+        '<div class="live-retry-banner error" style="display:flex;align-items:center;gap:8px;' +
+        'margin-bottom:8px;padding:8px 12px;background:var(--bg-card);' +
+        'border:1px solid var(--err-border,#a33);border-radius:8px;">' +
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--err,#e06c6c)" ' +
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/>' +
+        '<line x1="12" y1="16" x2="12.01" y2="16"/></svg>' +
+        '<span style="font-size:12px;color:var(--text-muted);flex:1;">' + escHtml(_sessErr) + '</span>' +
+        '<button class="live-mini-btn" onclick="liveRetryNow()" ' +
+        'style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border-subtle);' +
+        'background:var(--bg-elevated,var(--bg-card));color:var(--text);cursor:pointer;">Retry</button>' +
+        '</div>';
+    }
+    bar.innerHTML =
+      _retryBanner +
+      (_sleeping ? '<div class="vn-card">' +
+        _stHeader('waking', '<span class="vn-st-hint">Send a message to take over</span>')
+        : _pickG ? _pickCardOpen(id, _pickG) : '') +
+      '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="' +
+      (_sleeping
+        ? 'Type to override the scheduled wake-up\u2026'
+        : _pickG === 'standby' ? 'Type to pick it back up'
+        : _pickG === 'done' ? 'Type to reopen it'
+        : 'Type your next command\u2026') +
+      '"' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitIdle()}"' +
+      ' onblur="if(_wasKeyboardDismissBlur()){liveSubmitIdle()}"></textarea>' +
+      ((_sleeping || _pickG) ? '</div>' : '') +
+      '<div class="live-bar-row">' +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id), false, _liveSessionModel) : _buildCtxBarCompact(id)) +
+      '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
+      '<button class="live-send-btn" id="live-voice-btn"></button>' +
+      '</div>';
+    setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitIdle);
+    if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
+    if (_pickG === 'standby' || _pickG === 'done') _tickSetAside();
+    // Usage-limit countdown, same in-place text-node pattern as the retry
+    // countdown below.  Shares _liveRetryTimer because the two banners are
+    // mutually exclusive (the limit banner wins) and the bar teardown already
+    // clears that one variable on every rebuild.
+    if (_limitBannerIdle && _limitSt && (_limitSt.limit_reset_at > 0 || _retrySt)) {
+      _startLimitCountdown();
+    } else if (_retrySt) {
+      _liveRetryTimer = setInterval(() => {
+        const rs = (window._sessionRetryState && window._sessionRetryState[liveSessionId]) || null;
+        const el = document.getElementById('live-retry-countdown');
+        if (!rs || !el) {
+          // Retry cleared (server fired/cancelled it) — stop ticking; the
+          // session_state event already forced a re-render of the bar.
+          if (_liveRetryTimer) { clearInterval(_liveRetryTimer); _liveRetryTimer = null; }
+          return;
+        }
+        const secs = Math.max(0, Math.ceil(rs.retry_at - Date.now() / 1000));
+        el.textContent = secs > 0 ? _fmtRetrySecs(secs) : 'now…';
+      }, 1000);
+    }
+    setTimeout(() => {
+      if (window.vnClassicScroll && vnClassicScroll()) {   // [classic] the original settle-scroll
+        const logEl = document.getElementById('live-log');
+        if (logEl) _autoScrollLiveLog(logEl);
+      } else if (window.ThreadScroll) ThreadScroll.holdBottom();   // bar resized the log
+      const ta = document.getElementById('live-input-ta');
+      if (ta) { if (_wantAutofocus && !_barHadFocus) ta.focus(); _initAutoResize(ta); }
+    }, 50);
+
+  } else {
+    // Working state — banner is rendered separately in #live-queue-area
+    if (!_liveWorkingStart) _liveWorkingStart = Date.now();
+    const _elapsed = Math.round((Date.now() - _liveWorkingStart) / 1000);
+    const _elapsedStr = _elapsed >= 60 ? Math.floor(_elapsed/60) + 'm ' + (_elapsed%60) + 's' : _elapsed + 's';
+    const qCount = _getQueueList(id).length;
+
+    // Detect compacting / auto-resuming substatus
+    const _sub = (window._sessionSubstatus && window._sessionSubstatus[id]) || '';
+    const _isCompacting = _sub === 'compacting';
+    const _isAutoResuming = _sub === 'auto-resuming';
+    const _stKind = _stKindFor(_sub);
+
+    // Build sub-agent team strip
+    const _agents = (window._subAgents && window._subAgents[id]) || {};
+    const _agentEntries = Object.entries(_agents);
+    const _workingCount = _agentEntries.length > 0 ? _agentEntries.filter(([, a]) => a.status === 'working').length : 0;
+    const _doneCount = _agentEntries.length > 0 ? _agentEntries.filter(([, a]) => a.status === 'done').length : 0;
+    const _allDone = _agentEntries.length > 0 && _workingCount === 0;
+    let _agentStripHtml = '';
+    let _agentFooterHtml = '';
+
+    if (_agentEntries.length > 0) {
+      if (_allDone) {
+        // All agents finished — collapse to minimal footer inside the working bar
+        _agentFooterHtml = '<span class="vn-st-hint">\u00b7 ' + _doneCount + ' agent' + (_doneCount > 1 ? 's' : '') + ' done</span>';
+      } else {
+        // Some agents still working — show full strip with pills
+        _agentFooterHtml = '<span class="vn-st-hint">\u00b7 ' + _workingCount + ' agent' + (_workingCount > 1 ? 's' : '') +
+          ' running' + (_doneCount > 0 ? ', ' + _doneCount + ' done' : '') + '</span>';
+        _agentStripHtml = '<div class="sub-agent-pills vn-agents">';
+        _agentEntries.forEach(([tuId, ag], idx) => {
+          const isDone = ag.status === 'done';
+          const agentElapsed = isDone && ag.endTime
+            ? Math.round((ag.endTime - ag.startTime) / 1000)
+            : Math.round((Date.now() - ag.startTime) / 1000);
+          const agentTimeStr = agentElapsed >= 60 ? Math.floor(agentElapsed/60) + 'm ' + (agentElapsed%60) + 's' : agentElapsed + 's';
+          const statusIcon = isDone
+            ? '<svg class="sub-agent-check" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>'
+            : '<span class="sub-agent-spinner"></span>';
+          const pillClass = 'sub-agent-pill' + (isDone ? ' done' : ' active');
+          _agentStripHtml += '<div class="' + pillClass + '" style="animation-delay:' + (idx * 0.06) + 's" data-agent-id="' + escHtml(tuId) + '">' +
+            statusIcon +
+            '<span class="sub-agent-label">' + escHtml(ag.desc || 'Agent') + '</span>' +
+            '<span class="sub-agent-time">' + agentTimeStr + '</span>' +
+            '</div>';
+        });
+        _agentStripHtml += '</div>';
+      }
+    }
+
+    bar.innerHTML =
+      '<div class="vn-card" id="live-st-card" data-st="' + _stKind + '">' + _stShimmer(_stKind) +
+      _stHeader(_stKind,
+        '<span class="vn-st-time" id="live-elapsed">' + _elapsedStr + '</span>' + _agentFooterHtml,
+        '<button class="vn-stop" onclick="liveSubmitInterrupt()" title="Interrupt session"><i></i>Stop</button>') +
+      _agentStripHtml +
+      '<textarea id="live-queue-ta" class="live-textarea live-queue-ta" rows="2" ' +
+      'placeholder="' + _queuePlaceholder(qCount) + '"' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveQueueSave()}"' +
+      ' onblur="if(_wasKeyboardDismissBlur()){liveQueueSave()}"></textarea>' +
+      '</div>' +
+      '<div class="live-bar-row">' +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id, true), false, _liveSessionModel) : _buildCtxBarCompact(id, true)) +
+      '<button class="live-send-btn" id="live-voice-btn"></button>' +
+      '</div>';
+    setupVoiceButton(document.getElementById('live-queue-ta'), document.getElementById('live-voice-btn'), liveQueueSave);
+    if (_barHadFocus) { const ta = document.getElementById('live-queue-ta'); if (ta) ta.focus(); }
+    setTimeout(() => {
+      const ta = document.getElementById('live-queue-ta');
+      if (ta) { if (_wantAutofocus && !_barHadFocus) ta.focus(); _initAutoResize(ta); }
+    }, 50);
+    _renderQueueBanner();
+    // Start elapsed timer — update only the time span, NOT the whole bar
+    // Update elapsed timer and compacting label dynamically (no ctx bar in working state)
+    if (!_liveWorkingTimer) {
+      _liveWorkingTimer = setInterval(() => {
+        if (!liveBarState || !liveBarState.startsWith('working') || !_liveWorkingStart) return;
+        const el = document.getElementById('live-elapsed');
+        if (!el) return;
+        const s = Math.round((Date.now() - _liveWorkingStart) / 1000);
+        el.textContent = s >= 60 ? Math.floor(s/60) + 'm ' + (s%60) + 's' : s + 's';
+        // Update compacting / auto-resuming label dynamically without full re-render
+        const card = document.getElementById('live-st-card');
+        if (card) {
+          const want = _stKindFor((window._sessionSubstatus && window._sessionSubstatus[liveSessionId]) || '');
+          if (card.dataset.st !== want) {
+            card.dataset.st = want;
+            const ico = document.getElementById('live-st-ico'), lbl = document.getElementById('live-st-lbl');
+            // Replace the icon AND the travelling light in the same tick: they
+            // share one animation clock and must restart together to stay in step.
+            if (ico) ico.innerHTML = _ST_ICONS[want];
+            if (lbl) lbl.textContent = _ST_LABELS[want];
+            const old = card.querySelector('.vn-st-fx');
+            if (old) old.remove();
+            const sh = _stShimmer(want);
+            if (sh) card.insertAdjacentHTML('afterbegin', sh);
+          }
+        }
+        // Update sub-agent elapsed times without full re-render
+        const agentPills = document.querySelectorAll('.sub-agent-pill.active');
+        if (agentPills.length) {
+          const agents = (window._subAgents && window._subAgents[liveSessionId]) || {};
+          agentPills.forEach(pill => {
+            const agId = pill.dataset.agentId;
+            const ag = agents[agId];
+            if (ag && ag.status === 'working') {
+              const timeEl = pill.querySelector('.sub-agent-time');
+              if (timeEl) {
+                const elapsed = Math.round((Date.now() - ag.startTime) / 1000);
+                timeEl.textContent = elapsed >= 60 ? Math.floor(elapsed/60) + 'm ' + (elapsed%60) + 's' : elapsed + 's';
+              }
+            }
+          });
+        }
+      }, 1000);
+    }
+  }
+
+  // ── Restore text: same-session state transition OR saved draft ──
+  if (!_preservedText) _preservedText = _getDraft(id);
+  if (_preservedText) {
+    const _newTa = document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
+    if (_newTa && !_newTa.value) {
+      _newTa.value = _preservedText;
+      _autoResizeTextarea(_newTa);
+      _newTa.dispatchEvent(new Event('input'));
+    }
+  }
+
+  // ── Re-apply invoke visual if pending ──
+  if (window._pendingInvoke && typeof _applyInvokeVisual === 'function') {
+    _applyInvokeVisual();
+  }
+}
+
+function livePickOption(val) {
+  if (!liveSessionId) return;
+  socket.emit('permission_response', {session_id: liveSessionId, action: val});
+  // Optimistic: clear waiting state locally
+  delete waitingData[liveSessionId];
+  sessionKinds[liveSessionId] = 'working';
+  liveBarState = null;
+  updateLiveInputBar();
+}
+
+function liveQueueSave() {
+  const ta = document.getElementById('live-queue-ta');
+  if (!ta || !liveSessionId) return;
+  let text = ta.value.trim();
+  if (!text && !window._pendingInvoke) return;
+  // Wrap with invoke if pending
+  if (window._pendingInvoke && typeof _wrapInvokeMessage === 'function') {
+    text = _wrapInvokeMessage(text);
+  }
+
+  // If the session went idle while we were recording (e.g. voice dictation
+  // started during 'working' but Claude finished before we stopped talking),
+  // send directly instead of queuing — it would just sit in the queue until
+  // the next idle transition otherwise.
+  const kind = sessionKinds[liveSessionId];
+  if (kind === 'idle' || kind === 'question') {
+    ta.value = '';
+    _resetTextareaHeight(ta);
+    _liveSubmitDirect(liveSessionId, text);
+    return;
+  }
+
+  _addQueue(liveSessionId, text);
+  ta.value = '';
+  _resetTextareaHeight(ta);
+  const total = _getQueueList(liveSessionId).length;
+  ta.placeholder = _queuePlaceholder(total);
+  showToast('Command queued (' + total + ')');
+  _renderQueueBanner();
+  // Scroll chat to bottom so banner is visible
+  const logEl = document.getElementById('live-log');
+  if (logEl) logEl.scrollTop = logEl.scrollHeight;
+  // Keep focus on textarea — desktop only. On mobile, re-focusing after a
+  // send pops the on-screen keyboard back over the chat the user just wanted
+  // to see; matches the mobile defocus in the other submit paths
+  // (liveSubmitContinue / liveSubmitIdle / _newSessionSubmit).
+  if (!_isMobileViewport()) ta.focus();
+}
+
+/** Placeholder for the box you type in while Claude is working.  It carries
+ *  what used to be a separate note in the button row ("Will send automatically
+ *  when done" / "2 queued \u2022 will send in order when idle"), so the row holds
+ *  only status and buttons. */
+function _queuePlaceholder(queued) {
+  return queued
+    ? 'Queue another (' + queued + ' queued)'
+    : 'Sends when Claude finishes';
+}
+
+function liveClearQueue() {
+  if (!liveSessionId) return;
+  const list = _getQueueList(liveSessionId);
+  if (!list.length) return;
+  _removeQueueAt(liveSessionId, _queueViewIndex);
+  const remaining = _getQueueList(liveSessionId).length;
+  showToast(remaining ? 'Removed \u2014 ' + remaining + ' remaining' : 'Queue cleared');
+  _renderQueueBanner();
+  const ta = document.getElementById('live-queue-ta');
+  if (ta) ta.placeholder = _queuePlaceholder(remaining);
+  if (ta) ta.focus();
+}
+
+function liveEditQueue() {
+  if (!liveSessionId) return;
+  const list = _getQueueList(liveSessionId);
+  if (!list.length) return;
+  const text = list[_queueViewIndex];
+  _removeQueueAt(liveSessionId, _queueViewIndex);
+  _renderQueueBanner();
+  const remaining = _getQueueList(liveSessionId).length;
+  const ta = document.getElementById('live-queue-ta');
+  if (ta) {
+    ta.value = text;
+    _autoResizeTextarea(ta);
+    ta.placeholder = _queuePlaceholder(remaining);
+    ta.focus();
+  }
+}
+
+function liveSubmitIdle() {
+  const ta = document.getElementById('live-input-ta');
+  if (!ta || !liveSessionId) return;
+  let text = ta.value.trim();
+  // Allow empty text if we have a pending invoke (send just the invoke)
+  if (!text && !window._pendingInvoke) return;
+  ta.value = '';
+  _resetTextareaHeight(ta);
+  // Wrap with invoke if pending
+  if (window._pendingInvoke && typeof _wrapInvokeMessage === 'function') {
+    text = _wrapInvokeMessage(text);
+  }
+  // Check and consume voice flag
+  const wasVoice = (typeof _lastSubmitWasVoice !== 'undefined' && _lastSubmitWasVoice);
+  if (wasVoice) _lastSubmitWasVoice = false;
+  _liveSubmitDirect(liveSessionId, text, wasVoice ? {voice: true} : undefined);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// WRONG-SESSION DETECTION
+// Lightweight client-side heuristic that warns when a prompt seems
+// more related to a different active session. Runs synchronously
+// (< 1ms) — only the confirmation dialog is async.
+// Fail-open: any error in detection silently allows the send.
+// ═══════════════════════════════════════════════════════════════
+
+/** Common English stopwords removed during keyword extraction. */
+const _STOP_WORDS = new Set([
+  'the','a','an','is','are','it','this','that','in','on','for','to','of',
+  'with','and','or','but','not','from','be','have','has','do','does','did',
+  'will','would','can','could','should','was','were','been','being','at',
+  'by','as','so','if','then','than','just','also','about','up','out','its',
+  'my','your','we','they','them','our','all','any','some','no','like','make',
+  'get','go','use','let','me','you','he','she','please','want','need',
+  'think','know','sure','ok','okay','yes','yeah','thanks','hi','hello','hey'
+]);
+
+/**
+ * Extract topic keywords from text for wrong-session comparison.
+ * Returns a Set of lowercase words after removing stopwords,
+ * short words (< 3 chars), and pure numbers.
+ * @param {string} text
+ * @returns {Set<string>}
+ */
+function _extractTopicKeywords(text) {
+  if (!text) return new Set();
+  const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/);
+  const result = new Set();
+  for (const w of words) {
+    if (w.length < 3) continue;          // too short
+    if (/^\d+$/.test(w)) continue;       // pure number
+    if (_STOP_WORDS.has(w)) continue;    // stopword
+    result.add(w);
+  }
+  return result;
+}
+
+/**
+ * Get topic keywords for a session by reading DOM messages (if current)
+ * and the session title from allSessions.
+ * @param {string} sessionId
+ * @returns {Set<string>}
+ */
+function _getSessionTopicKeywords(sessionId) {
+  try {
+    let text = '';
+    // For the currently rendered session, read recent messages from the DOM
+    if (sessionId === liveSessionId) {
+      const log = document.getElementById('live-log');
+      if (log) {
+        const msgs = log.querySelectorAll('.msg.user, .msg.assistant');
+        // Take the last 6 messages
+        const recent = Array.from(msgs).slice(-6);
+        for (const el of recent) {
+          text += ' ' + (el.textContent || '');
+        }
+      }
+    }
+    // Always include the session title
+    const s = (typeof allSessions !== 'undefined' && Array.isArray(allSessions))
+      ? allSessions.find(x => x.id === sessionId)
+      : null;
+    if (s) {
+      text += ' ' + (s.custom_title || s.display_title || '');
+    }
+    return _extractTopicKeywords(text);
+  } catch (e) {
+    // Fail-open: return empty set so detection doesn't trigger
+    return new Set();
+  }
+}
+
+/**
+ * Check whether a prompt seems more related to a different active session.
+ * Returns { suspect: boolean, betterSessionName: string|null }.
+ *
+ * Trigger condition (conservative to avoid false positives):
+ *   - bestOtherOverlap >= 3 keywords match another session
+ *   - bestOtherOverlap > currentOverlap
+ *   - currentOverlap <= 1 (prompt barely matches current session)
+ *
+ * @param {string} promptText
+ * @param {string} currentSessionId
+ * @returns {{ suspect: boolean, betterSessionName: string|null }}
+ */
+function _checkWrongSession(promptText, currentSessionId) {
+  try {
+    const promptKw = _extractTopicKeywords(promptText);
+    // Too few keywords to judge — skip
+    if (promptKw.size < 2) return { suspect: false, betterSessionName: null };
+
+    // Need allSessions and runningIds to compare
+    if (typeof allSessions === 'undefined' || typeof runningIds === 'undefined') {
+      return { suspect: false, betterSessionName: null };
+    }
+
+    // Only compare if there are at least 2 active sessions
+    const activeSessions = allSessions.filter(s =>
+      runningIds.has(s.id) && s.id !== currentSessionId && s.message_count > 0
+    );
+    if (activeSessions.length === 0) return { suspect: false, betterSessionName: null };
+
+    // Current session keywords (includes DOM messages + title)
+    const currentKw = _getSessionTopicKeywords(currentSessionId);
+    let currentOverlap = 0;
+    for (const w of promptKw) {
+      if (currentKw.has(w)) currentOverlap++;
+    }
+
+    // Find the best-matching other session
+    let bestOverlap = 0;
+    let bestName = null;
+    for (const s of activeSessions) {
+      // For non-rendered sessions, use title-only keywords
+      const otherKw = _extractTopicKeywords(s.custom_title || s.display_title || '');
+      let overlap = 0;
+      for (const w of promptKw) {
+        if (otherKw.has(w)) overlap++;
+      }
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        bestName = s.custom_title || s.display_title || s.id.slice(0, 8);
+      }
+    }
+
+    // Trigger: strong match elsewhere AND weak match here
+    if (bestOverlap >= 3 && bestOverlap > currentOverlap && currentOverlap <= 1) {
+      return { suspect: true, betterSessionName: bestName };
+    }
+    return { suspect: false, betterSessionName: null };
+  } catch (e) {
+    // Fail-open: never block a send due to detection failure
+    console.warn('[wrong-session] detection error (fail-open):', e);
+    return { suspect: false, betterSessionName: null };
+  }
+}
+
+/**
+ * Get display name for a session by ID (for the confirmation dialog).
+ * @param {string} sid
+ * @returns {string}
+ */
+function _getSessionDisplayName(sid) {
+  if (typeof allSessions !== 'undefined' && Array.isArray(allSessions)) {
+    const s = allSessions.find(x => x.id === sid);
+    if (s) return s.custom_title || s.display_title || sid.slice(0, 8);
+  }
+  return sid ? sid.slice(0, 8) : 'Unknown';
+}
+
+/**
+ * SVG icon for the wrong-session confirmation dialog (two crossing arrows).
+ * @returns {string}
+ */
+function _wrongSessionIcon() {
+  return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>';
+}
+
+// ── User-stop intent registry ─────────────────────────────────────────
+// Mirrors the daemon's SessionManager._user_stopped() guard on the client.
+//
+// Why this exists: Sleep must stick.  The ghost-recovery
+// timers below fire 3s after a submit and, if no session_state arrived, do
+// close_session + start_session(resume) to revive a session the daemon
+// silently dropped.  Their cancel handler deliberately ignored
+// `state === 'stopped'` — so the ONE event that proves the user slept the
+// session was the one event that could not cancel recovery.  Sleep within
+// ~3s of sending therefore got overridden: ~1.5s later the frontend
+// re-started the session AND re-sent the last prompt.  The daemon's own
+// _user_stopped guard held; the resurrection was entirely client-side, which is why the session looked dead in the
+// registry yet kept coming back in the UI.
+//
+// We cannot simply cancel on 'stopped': a genuinely dead/ghost session also
+// reports stopped, and that IS the case ghost recovery exists to repair.
+// The correct discriminator is not the state but the CAUSE — did the user
+// ask for this stop?  So every explicit user sleep/stop/close path records
+// intent here, and recovery refuses to override it.  Same principle the
+// daemon already applies server-side.
+window._userStoppedSessions = window._userStoppedSessions || {};
+// Backstop TTL: recovery windows are at most ~4.5s, so a stale flag can
+// never permanently disable ghost recovery for a session.
+const _USER_STOP_INTENT_TTL_MS = 60000;
+
+/** Record that the user explicitly slept/stopped this session. */
+function markUserStopped(sid) {
+  if (!sid) return;
+  window._userStoppedSessions[sid] = Date.now();
+}
+
+/** Clear the flag — the user explicitly wants this session running again. */
+function clearUserStopped(sid) {
+  if (!sid) return;
+  delete window._userStoppedSessions[sid];
+}
+
+/** True if the user deliberately put this session down (and it hasn't aged out). */
+function isUserStopped(sid) {
+  const t = sid && window._userStoppedSessions[sid];
+  if (!t) return false;
+  if (Date.now() - t > _USER_STOP_INTENT_TTL_MS) {
+    delete window._userStoppedSessions[sid];
+    return false;
+  }
+  return true;
+}
+
+window.markUserStopped = markUserStopped;
+window.clearUserStopped = clearUserStopped;
+window.isUserStopped = isUserStopped;
+
+async function _liveSubmitDirect(sid, text, opts) {
+  if (!sid) return;
+
+  // An explicit send is an explicit "I want this session running" — it
+  // supersedes any earlier sleep, so recovery is armed normally again.
+  clearUserStopped(sid);
+
+  // ...and it supersedes an earlier READING/FOLLOW scroll state for the same
+  // reason: a clean send is unambiguous "I'm driving again" intent. Restores
+  // full LIVE from ANY scroll position and jumps to the bottom — if you
+  // scrolled up to copy something and then sent, you want to see the reply.
+  //
+  // ONLY clean sends belong here, and _liveSubmitDirect is exactly that
+  // boundary. The two non-clean paths reach the model without passing through
+  // this function, so neither can hijack your scroll position:
+  //   - QUEUING a message goes through _addQueue(), which never calls this.
+  //     Stacking up work is not a request to watch it happen.
+  //   - DRAINING the queue is server-side (see the note by _shiftQueue: "server
+  //     auto-dispatches from queue on idle"). The message arrives as a plain
+  //     session_entry, with no client-side send call at all — correct, since a
+  //     drain is not a user action in the first place.
+  // Do NOT add ThreadScroll.onSend() to _addQueue or any queue-drain handler.
+  if (window.ThreadScroll && sid === liveSessionId) ThreadScroll.onSend();
+
+  // Mobile: drop keyboard on send. Callers vary (liveSubmitIdle, the
+  // direct-send branch of liveQueueSave, and liveSubmitWaiting's fallback)
+  // so centralize the defocus here — a single call covers every entry
+  // point. Idempotent if the caller already blurred (matches the pattern in
+  // liveSubmitContinue / liveSubmitWaiting / _newSessionSubmit).
+  _defocusComposerMobile();
+
+  // ── Wrong-session detection gate ──
+  // Runs before any socket.emit. The _checkWrongSession() call is synchronous
+  // (< 1ms). Only the showConfirm dialog is async, and it only appears when
+  // a mismatch is detected (rare). Fail-open: errors never block sends.
+  if (window._wrongSessionDetectionEnabled && !(opts && opts.skipWrongSessionCheck) && !(opts && opts.isPermission)) {
+    try {
+      const _wsCheck = _checkWrongSession(text, sid);
+      if (_wsCheck.suspect) {
+        const _wsConfirmed = await showConfirm(
+          'Wrong session?',
+          'This prompt seems more related to <strong>' + escHtml(_wsCheck.betterSessionName) +
+          '</strong>.<br><br>Send to <strong>' + escHtml(_getSessionDisplayName(sid)) + '</strong> anyway?',
+          { confirmText: 'Send anyway', cancelText: 'Cancel', icon: _wrongSessionIcon() }
+        );
+        if (!_wsConfirmed) {
+          // Restore text to textarea so the user doesn't lose their message
+          const _wsTa = document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
+          if (_wsTa) _wsTa.value = text;
+          _liveSending = false;
+          return;
+        }
+      }
+    } catch (_wsErr) {
+      // Fail-open: detection error must never block a legitimate send
+      console.warn('[wrong-session] gate error (fail-open):', _wsErr);
+    }
+  }
+
+  performance.mark('submit-' + sid);
+  _liveSending = true;
+  _clearDraft(sid);
+  const _isVoice = opts && opts.voice;
+
+  // Clear stale client-side queue — message is being sent directly
+  delete _sessionQueues[sid];
+  _renderQueueBanner();
+
+  // Only treat as permission response if explicitly flagged (not from queue)
+  const isPermission = opts && opts.isPermission;
+  const wasPermission = isPermission && !!waitingData[sid];
+  if (wasPermission) {
+    const actionMap = {yes: 'y', no: 'n', always: 'a', 'almost always': 'aa', 'almost-always': 'aa', 'almostalways': 'aa', allow: 'y', deny: 'n'};
+    const action = actionMap[text.toLowerCase()] || text;
+    socket.emit('permission_response', {session_id: sid, action: action});
+    // Optimistic clear
+    delete waitingData[sid];
+    sessionKinds[sid] = 'working';
+  } else if (runningIds.has(sid)) {
+    // Send message — server will process if idle, or queue if busy
+    socket.emit('send_message', {session_id: sid, text: text, voice: _isVoice || undefined, remote_tailnet: window.VN_IS_TAILNET || undefined});
+    // Ghost session safety net: if no session_state event arrives within 3s,
+    // the daemon has lost this session. Fall back to start_session to recover.
+    const _ghostTimer = setTimeout(() => {
+      socket.off('session_state', _ghostCancel);
+      if (liveSessionId !== sid) return;
+      // User slept/stopped this session while we were waiting — that is an
+      // explicit instruction, not a ghost.  Never resurrect it.
+      if (isUserStopped(sid)) {
+        console.log('[submit] Ghost recovery skipped for', sid, '— user slept the session');
+        return;
+      }
+      console.warn('[submit] No daemon response for', sid, 'after 3s — ghost recovery: close then restart');
+      // Close the zombie session first, then restart after a short delay
+      socket.emit('close_session', {session_id: sid});
+      runningIds.delete(sid);
+      delete sessionKinds[sid];
+      setTimeout(() => {
+        if (liveSessionId !== sid) return;
+        // Re-check: the user may have hit Sleep during the 1.5s gap.
+        if (isUserStopped(sid)) {
+          console.log('[submit] Ghost restart aborted for', sid, '— user slept the session');
+          return;
+        }
+        socket.emit('start_session', {
+          session_id: sid,
+          prompt: text,
+          cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
+          resume: true,
+        });
+        runningIds.add(sid);
+        sessionKinds[sid] = 'working';
+        updateLiveInputBar();
+      }, 1500);
+    }, 3000);
+    const _ghostCancel = function(data) {
+      if (data && data.session_id === sid && data.state !== 'stopped') {
+        clearTimeout(_ghostTimer);
+        socket.off('session_state', _ghostCancel);
+      }
+    };
+    socket.on('session_state', _ghostCancel);
+  } else {
+    // Session not in runningIds — try send_message first (it handles
+    // IDLE/WORKING/WAITING gracefully with auto-queue), then fall back to
+    // start_session only if the session truly doesn't exist on the backend.
+    // This prevents the "Session already running" error when the frontend's
+    // runningIds is stale (missed WebSocket event) but the backend still has
+    // the session alive.
+    console.warn('[submit] Session', sid, 'not in runningIds — trying send_message first');
+    // Install a one-shot error listener: if send_message fails because the
+    // session doesn't exist or is stopped, fall back to start_session.
+    const _fallbackHandler = function(err) {
+      if (err && err.session_id === sid && /not found|is stopped/i.test(err.message || '')) {
+        socket.off('error', _fallbackHandler);
+        clearTimeout(_ghostTimer2);  // fallback fired — no need for ghost timer
+        socket.off('session_state', _ghostCancel2);
+        // "is stopped" is exactly what the daemon reports for a session the
+        // user just slept.  If they slept it after this send, honour that
+        // rather than auto-resuming it back to life.
+        if (isUserStopped(sid)) {
+          console.log('[submit] Resume-on-error skipped for', sid, '— user slept the session');
+          return;
+        }
+        console.warn('[submit] send_message failed (' + err.message + ') — resuming with start_session');
+        socket.emit('start_session', {
+          session_id: sid,
+          prompt: text,
+          cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
+          resume: true,
+        });
+        sessionKinds[sid] = 'working';
+        updateLiveInputBar();
+      }
+    };
+    socket.on('error', _fallbackHandler);
+    // Ghost safety net: if neither an error nor a session_state arrives
+    // within 3s, the daemon silently dropped the message. Resume directly.
+    const _ghostTimer2 = setTimeout(() => {
+      socket.off('error', _fallbackHandler);
+      socket.off('session_state', _ghostCancel2);
+      if (liveSessionId !== sid) return;
+      // Explicit user sleep beats ghost recovery — see the intent registry.
+      if (isUserStopped(sid)) {
+        console.log('[submit] Ghost recovery skipped for', sid, '— user slept the session');
+        return;
+      }
+      console.warn('[submit] No daemon response for', sid, 'after 3s (not-running path) — close then restart');
+      socket.emit('close_session', {session_id: sid});
+      setTimeout(() => {
+        if (liveSessionId !== sid) return;
+        // Re-check: the user may have hit Sleep during the 1.5s gap.
+        if (isUserStopped(sid)) {
+          console.log('[submit] Ghost restart aborted for', sid, '— user slept the session');
+          return;
+        }
+        socket.emit('start_session', {
+          session_id: sid,
+          prompt: text,
+          cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
+          resume: true,
+        });
+        sessionKinds[sid] = 'working';
+        updateLiveInputBar();
+      }, 1500);
+    }, 3000);
+    const _ghostCancel2 = function(data) {
+      if (data && data.session_id === sid && data.state !== 'stopped') {
+        clearTimeout(_ghostTimer2);
+        socket.off('session_state', _ghostCancel2);
+        socket.off('error', _fallbackHandler);
+      }
+    };
+    socket.on('session_state', _ghostCancel2);
+    socket.emit('send_message', {session_id: sid, text: text});
+    runningIds.add(sid);
+    guiOpenAdd(sid);
+  }
+
+  // Add optimistic user bubble only for real messages (not permission answers, not slash commands)
+  const _isSlash = text.trim().startsWith('/') && !text.trim().includes(' ');
+  if (!wasPermission && text.length > 1 && !_isSlash) {
+    _addOptimisticBubble(sid, text, _isVoice);
+  }
+
+  // Optimistically set working state and render the full working bar immediately
+  if (!wasPermission) {
+    sessionKinds[sid] = 'working';
+  }
+  liveBarState = null;
+  updateLiveInputBar();
+
+  // Start the message watchdog — if we don't get ANY response activity within
+  // 10 seconds, force a state resync to unstick the UI.
+  _startMessageWatchdog(sid);
+
+  // Reset sending flag after brief delay (keeps session_entry dedup working)
+  setTimeout(() => { _liveSending = false; }, 500);
+}
+
+// ── Message watchdog ──
+// After sending a message, if no session_entry or session_state event arrives
+// for this session within 10s, force a state resync from the server. This is
+// the catch-all safety net that prevents the UI from ever getting permanently
+// stuck in "working" when a response was silently lost.
+//
+// Escalation ladder:
+//   10s — request_state_snapshot via WebSocket (fast, covers most hiccups)
+//   16s — direct HTTP fetch of /api/live/state/<sid> to get ground truth
+//   22s — force UI to idle if server says idle/stopped but WS event was lost
+// PERF-CRITICAL: Watchdog dedup — window._ assignments enable cross-script dedup. Do NOT remove. See CLAUDE.md #16.
+//
+// Two independent watchdog systems both poll
+// /api/live/state/<sid> — the per-submit watchdog (here) and the continuous
+// background watchdog (socket.js setInterval).  Profiling showed both firing within
+// 1 second of each other, doubling the IPC load.  The window._ assignments let
+// socket.js check whether this per-submit watchdog is already monitoring a session,
+// and skip its own poll for that session.  When the per-submit timer fires,
+// window._watchdogTimer becomes null, and the background watchdog resumes coverage.
+let _watchdogTimer = null;
+let _watchdogSid = null;
+// Expose to other scripts (socket.js) for dedup of background watchdog polls
+window._watchdogTimer = null;
+window._watchdogSid = null;
+
+function _startMessageWatchdog(sid) {
+  // Clear any previous watchdog
+  if (_watchdogTimer) clearTimeout(_watchdogTimer);
+  _watchdogSid = sid;
+  window._watchdogSid = sid;
+  _watchdogTimer = setTimeout(() => {
+    _watchdogTimer = null;
+    window._watchdogTimer = null;
+    if (_watchdogSid !== sid || sessionKinds[sid] !== 'working') return;
+
+    // Tier 1: WS snapshot resync
+    console.warn('[watchdog] No response activity for', sid, 'after 10s — requesting state snapshot');
+    socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
+
+    // Tier 2: direct HTTP fetch (bypasses WS entirely)
+    setTimeout(() => {
+      if (sessionKinds[sid] !== 'working') return;
+      console.warn('[watchdog] Still stuck after WS resync for', sid, '— fetching state via HTTP');
+      _watchdogHttpCheck(sid);
+    }, 6000);
+
+    // Tier 3: last resort — fetch again and force-apply
+    setTimeout(() => {
+      if (sessionKinds[sid] !== 'working') return;
+      console.warn('[watchdog] STILL stuck for', sid, 'after 22s — force-fetching and applying');
+      _watchdogHttpCheck(sid, true);
+    }, 12000);
+  }, 10000);
+  window._watchdogTimer = _watchdogTimer;
+}
+
+function _watchdogHttpCheck(sid, forceApply) {
+  fetch('/api/live/state/' + encodeURIComponent(sid))
+    .then(r => r.ok ? r.json() : null)
+    .then(data => {
+      if (!data) return;
+      const serverState = data.state;
+      const serverEntryCount = data.entry_count || 0;
+      console.log('[watchdog] HTTP state for', sid, '=', serverState,
+        'entries:', serverEntryCount, '(UI: working, rendered:', liveLineCount, ')');
+      if (serverState && serverState !== 'working') {
+        // Server knows it's not working — force the UI to match
+        console.warn('[watchdog] Forcing UI state to', serverState, 'for', sid);
+        if (serverState === 'waiting') {
+          sessionKinds[sid] = 'question';
+        } else if (serverState === 'idle') {
+          sessionKinds[sid] = 'idle';
+        } else if (serverState === 'stopped') {
+          delete sessionKinds[sid];
+          runningIds.delete(sid);
+        }
+        if (sid === liveSessionId) {
+          liveBarState = null;
+          updateLiveInputBar();
+          // Re-fetch entries ONLY if DOM is empty — if entries are already
+          // rendered from real-time streaming, a re-fetch would wipe them
+          // and re-render with pagination, slicing off the response tail.
+          const _wdLog = document.getElementById('live-log');
+          const _wdHasEntries = _wdLog && _wdLog.querySelectorAll('.msg').length > 0;
+          if (!_wdHasEntries) {
+            socket.emit('get_session_log', {session_id: sid, since: 0, limit: LIVE_PAGE_SIZE, project: localStorage.getItem('activeProject') || ''});
+          }
+        }
+        filterSessions();
+      } else if (serverState === 'working') {
+        // Server also thinks working — check for missing entries even
+        // while the session is still active. If real-time events were
+        // lost mid-stream, we might have fewer entries than the server.
+        if (sid === liveSessionId && serverEntryCount > liveLineCount + 1) {
+          console.warn('[watchdog] Entry mismatch while working: server has', serverEntryCount,
+            'but frontend has', liveLineCount, '— re-fetching');
+          socket.emit('get_session_log', {session_id: sid, since: 0, limit: LIVE_PAGE_SIZE, project: localStorage.getItem('activeProject') || ''});
+        }
+        if (forceApply) {
+          // Request a fresh snapshot to resync any other stale state
+          socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
+        }
+      }
+    })
+    .catch(err => console.error('[watchdog] HTTP check failed:', err));
+}
+
+// Called by socket event handlers to signal that response activity was received,
+// cancelling the watchdog (everything is fine, response is flowing).
+function _cancelMessageWatchdog(sid) {
+  if (_watchdogTimer && _watchdogSid === sid) {
+    clearTimeout(_watchdogTimer);
+    _watchdogTimer = null;
+    _watchdogSid = null;
+    window._watchdogTimer = null;
+    window._watchdogSid = null;
+  }
+}
+
+// Called by streaming event handlers (session_entry, session_usage) to signal
+// that data IS flowing but the session has not completed yet.  Instead of
+// cancelling the watchdog outright (which leaves no safety-net if the final
+// IDLE event is silently lost), restart the timer so we keep monitoring.
+function _resetMessageWatchdog(sid) {
+  // Only reset if the session is still working
+  if (sessionKinds[sid] !== 'working') return;
+  _startMessageWatchdog(sid);
+}
+
+// `opts.passive`: the bubble was not typed in this tab (a queued message the
+// server dispatched, a hook line). It must not move the reader's view; only a
+// send from this tab jumps to the bottom.
+function _addOptimisticBubble(sid, text, isVoice, opts) {
+  if (sid !== liveSessionId) return;
+  const logEl = document.getElementById('live-log');
+  if (!logEl) return;
+  // A queued or hook message arrives with the server's "Sent from ... at" stamp:
+  // hide it here too, as the confirmed bubble does.
+  const _vnMeta = _stripVnMeta(text || '');
+  text = _vnMeta.clean;
+  if (_vnMeta.voice) isVoice = true;
+  // A hook line (see _parseVnEvent) is drawn under its source, without its markers.
+  const _vnEvent = _parseVnEvent(text);
+  if (_vnEvent) text = _vnEvent.body;
+
+  // Clear skeleton/placeholder on first message
+  const skel = logEl.querySelector('.skel-bar, .skeleton-loader, .skel-row');
+  if (skel) logEl.innerHTML = '';
+
+  // Fade out empty state if this is the first message
+  const emptyEl = logEl.querySelector('.empty-state');
+  if (emptyEl) {
+    emptyEl.classList.add('fading-out');
+    emptyEl.addEventListener('animationend', () => emptyEl.remove(), {once: true});
+  }
+
+  const now = new Date();
+  const h = now.getHours() % 12 || 12;
+  const timestamp = h + ':' + String(now.getMinutes()).padStart(2, '0') + ' ' + (now.getHours() >= 12 ? 'PM' : 'AM');
+  const msgId = ++_optimisticMsgId;
+  const userMsg = document.createElement('div');
+  userMsg.className = 'msg user msg-entering optimistic-bubble' + (_vnEvent ? ' vn-event-msg' : '');
+  userMsg.dataset.optimisticId = msgId;
+  // Strip [[invoke::name::path=]]...[[/invoke]] tags and render as premium pill.
+  // Reuse the same _renderInvokePills() helper the server-rendered path uses so
+  // the optimistic bubble and the persisted entry stay in lockstep on tag format.
+  let _bodyHtml;
+  const _invokeResult = (typeof _renderInvokePills === 'function') ? _renderInvokePills(text) : null;
+  if (_invokeResult) {
+    _bodyHtml = _invokeResult.pillHtml + ' ' +
+      (_invokeResult.remainder ? '<pre style="white-space:pre-wrap;margin:0;display:inline;">' + escHtml(_invokeResult.remainder) + '</pre>' : '');
+  } else {
+    _bodyHtml = '<pre style="white-space:pre-wrap;margin:0;display:inline;">' + escHtml(text) + '</pre>';
+  }
+  userMsg.innerHTML = '<div class="msg-role">' + (_vnEvent ? escHtml(_vnEvent.source) : 'me') + ' <span class="msg-time">' + timestamp + '</span></div><div class="msg-body msg-content">' + _bodyHtml + '</div>';
+  // Add VN metadata footer
+  const vnFooter = document.createElement('div');
+  vnFooter.className = 'vn-msg-footer';
+  const nowH = now.getHours() % 12 || 12;
+  const _timeStr = nowH + ':' + String(now.getMinutes()).padStart(2, '0') + ' ' + (now.getHours() >= 12 ? 'PM' : 'AM');
+  vnFooter.innerHTML = _vnMsgFooterHtml(isVoice, _timeStr);
+  if (!_vnEvent) userMsg.appendChild(vnFooter);   // "sent from" belongs to what the user typed
+  userMsg.addEventListener('animationend', () => userMsg.classList.remove('msg-entering'), {once: true});
+  logEl.appendChild(userMsg);
+  // [classic] Classic scroll: every bubble jumps to the bottom.
+  if (!(opts && opts.passive) || (window.vnClassicScroll && vnClassicScroll())) logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ── Optimistic bubble lookup — MUST ignore ThreadScroll's tail nodes ────────
+//
+// ThreadScroll (thread-scroll.js) pins two bookkeeping nodes
+// as the LAST children of #live-log — the jump-to-latest pill wrapper
+// (.vn-jump-wrap) and the IntersectionObserver sentinel (.vn-thread-sentinel) —
+// and a MutationObserver re-pins them after every single append. They are not
+// messages, but they do occupy the `:last-child` slot.
+//
+// That silently broke the positional optimistic-bubble dedup in socket.js,
+// which used `.msg.user.optimistic-bubble:last-child`. After ThreadScroll
+// landed that selector could never match, so the optimistic bubble was never
+// removed when the server echoed the user entry back — every sent message
+// rendered TWICE until the next full log re-render cleaned it up.
+//
+// Any future "is this the last message?" test against #live-log must go through
+// a tail-aware check like this one, never `:last-child`.
+const _THREAD_TAIL_CLASSES = ['vn-thread-sentinel', 'vn-jump-wrap'];
+
+function _isThreadTailNode(el) {
+  if (!el || !el.classList) return false;
+  return _THREAD_TAIL_CLASSES.some(c => el.classList.contains(c));
+}
+
+/**
+ * Returns the pending optimistic user bubble — the last `.msg.user.optimistic-bubble`
+ * in `logEl`, but only if nothing except ThreadScroll's tail nodes follows it.
+ *
+ * Deliberately position-based, NOT text-matching: sending the same text twice
+ * ("yes", "ok") must still render two bubbles.
+ *
+ * @param {HTMLElement} logEl  the #live-log container
+ * @returns {HTMLElement|null}
+ */
+function _findTrailingOptimisticBubble(logEl) {
+  if (!logEl) return null;
+  const kids = logEl.children;
+  for (let i = kids.length - 1; i >= 0; i--) {
+    const el = kids[i];
+    if (_isThreadTailNode(el)) continue;
+    // First real (non-tail) node from the bottom: it's the bubble or nothing.
+    return (el.classList && el.classList.contains('msg')
+            && el.classList.contains('user')
+            && el.classList.contains('optimistic-bubble')) ? el : null;
+  }
+  return null;
+}
+window._findTrailingOptimisticBubble = _findTrailingOptimisticBubble;
+
+// On mobile, drop focus after sending so the iOS keyboard dismisses and the reply is
+// visible immediately. No-op on desktop and when the composer isn't the focused element.
+function _defocusComposerMobile() {
+  try {
+    if (!window.matchMedia || !window.matchMedia('(max-width: 768px)').matches) return;
+    const ta = document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
+    if (ta && document.activeElement === ta) ta.blur();
+  } catch (_) {}
+}
+
+function liveSubmitContinue(fromId) {
+  const ta = document.getElementById('live-input-ta');
+  let text = ta ? ta.value.trim() : '';
+  if (!text && !window._pendingInvoke) return;
+  ta.value = '';
+  _resetTextareaHeight(ta);
+  _defocusComposerMobile();
+  if (window._pendingInvoke && typeof _wrapInvokeMessage === 'function') {
+    text = _wrapInvokeMessage(text);
+  }
+
+  const sid = typeof fromId === 'string' ? fromId : liveSessionId;
+  if (!sid) return;
+  _clearDraft(sid);
+
+  // Check and consume voice flag
+  const wasVoice = (typeof _lastSubmitWasVoice !== 'undefined' && _lastSubmitWasVoice);
+  if (wasVoice) _lastSubmitWasVoice = false;
+
+  // Add optimistic user bubble (with voice tag if applicable)
+  _addOptimisticBubble(sid, text, wasVoice);
+
+  _liveSending = true;
+  performance.mark('submit-' + sid);
+
+  // Clear any stale client-side queue from a previous interrupt —
+  // the message is being sent directly, not queued.
+  delete _sessionQueues[sid];
+  _renderQueueBanner();
+
+  // If session is not running, resume it via WebSocket.
+  //
+  // Carry the model this session should wake on. `SessionModel.resumeModel`
+  // prefers the DAEMON-CONFIRMED model (kept fresh from every device) over
+  // this tab's local pending choice, which can be stale — picked here, then
+  // switched from the phone. Sending the stale local choice woke the session
+  // on the old model and silently undid the switch. `undefined` is omitted
+  // from the payload; the daemon then pins the model it has recorded for the
+  // session, so an unknown-here model is never replaced by the CLI default.
+  if (!runningIds.has(sid)) {
+    const _desiredModel = (typeof SessionModel !== 'undefined')
+      ? ((SessionModel.resumeModel
+          ? SessionModel.resumeModel(sid)
+          : SessionModel.getDesired(sid)) || '')
+      : '';
+    // Same precedence for effort; '' omits it and the daemon re-pins the
+    // level it remembers for this session.
+    const _resumeThinking = (typeof SessionModel !== 'undefined' && SessionModel.resumeThinking)
+      ? SessionModel.resumeThinking(sid) : '';
+    socket.emit('start_session', {
+      session_id: sid,
+      prompt: text,
+      cwd: _currentProjectDir(),
+      resume: true,
+      model: _desiredModel || undefined,
+      thinking_level: _resumeThinking || undefined,
+      voice: wasVoice || undefined,
+    });
+    runningIds.add(sid);
+    guiOpenAdd(sid);
+  } else {
+    // Session is running — send message directly
+    socket.emit('send_message', {session_id: sid, text: text, voice: wasVoice || undefined});
+  }
+
+  // Immediately render full working bar
+  sessionKinds[sid] = 'working';
+  liveBarState = null;
+  updateLiveInputBar();
+
+  // Start watchdog for this submit path too
+  _startMessageWatchdog(sid);
+
+  // Reset sending flag after brief delay (keeps session_entry dedup working)
+  setTimeout(() => { _liveSending = false; }, 1000);
+}
+
+function liveSubmitWaiting() {
+  const ta = document.getElementById('live-input-ta');
+  if (!ta || !liveSessionId) return;
+  let text = ta.value.trim();
+  if (!text && !window._pendingInvoke) return;
+  ta.value = '';
+  _resetTextareaHeight(ta);
+  if (window._pendingInvoke && typeof _wrapInvokeMessage === 'function') {
+    text = _wrapInvokeMessage(text);
+  }
+  _defocusComposerMobile();
+  _clearDraft(liveSessionId);
+
+  // Use permission_response if there's an active permission request
+  if (waitingData[liveSessionId]) {
+    // Map common textual responses to the accepted single-char actions
+    const actionMap = {yes: 'y', no: 'n', always: 'a', 'almost always': 'aa', 'almost-always': 'aa', 'almostalways': 'aa', allow: 'y', deny: 'n'};
+    const action = actionMap[text.toLowerCase()] || text;
+    socket.emit('permission_response', {session_id: liveSessionId, action: action});
+    // Optimistic clear
+    delete waitingData[liveSessionId];
+    sessionKinds[liveSessionId] = 'working';
+    liveBarState = null;
+    updateLiveInputBar();
+    _startMessageWatchdog(liveSessionId);
+  } else {
+    // Fallback to direct send (watchdog is started inside _liveSubmitDirect)
+    _liveSubmitDirect(liveSessionId, text);
+  }
+}
+
+function liveSubmitInterrupt() {
+  if (!liveSessionId) return;
+  // Grab and preserve any text the user typed into the queue textarea (not yet queued).
+  const queueTa = document.getElementById('live-queue-ta');
+  const preservedQueueText = queueTa ? queueTa.value.trim() : '';
+  // Collect already-queued messages and merge with preserved textarea text.
+  // The merged text is placed in the idle input so the user can send it.
+  const queued = _getQueueList(liveSessionId);
+  const parts = [...queued];
+  if (preservedQueueText) parts.push(preservedQueueText);
+  const mergedText = parts.join('\n\n');
+  // Clear queue and interrupt normally
+  socket.emit('clear_queue', {session_id: liveSessionId});
+  delete _sessionQueues[liveSessionId];
+  _renderQueueBanner();
+  socket.emit('interrupt_session', {session_id: liveSessionId});
+  // Optimistic: immediately show idle state in the chat UI
+  sessionKinds[liveSessionId] = 'idle';
+  liveBarState = null;
+  updateLiveInputBar();
+  // Place merged text into the idle textarea so user can send it
+  if (mergedText) {
+    const idleTa = document.getElementById('live-input-ta');
+    if (idleTa) { idleTa.value = mergedText; _initAutoResize(idleTa); }
+  }
+}
+
+// Cancel a pending API-error auto-retry (Cancel button in the countdown banner).
+// Stops the local countdown immediately and tells the server to drop the timer;
+// the resulting session_state event re-renders the bar without the banner.
+function liveCancelRetry() {
+  if (!liveSessionId) return;
+  if (_liveRetryTimer) { clearInterval(_liveRetryTimer); _liveRetryTimer = null; }
+  if (window._sessionRetryState) delete window._sessionRetryState[liveSessionId];
+  socket.emit('cancel_auto_retry', {session_id: liveSessionId});
+  liveBarState = null;
+  updateLiveInputBar();
+}
+
+// Fire the auto-retry / manual retry immediately (Retry-now button during a
+// countdown, or the manual Retry button after the budget was exhausted or a
+// permanent error).  The server resends the last user message right away.
+function liveRetryNow() {
+  if (!liveSessionId) return;
+  if (_liveRetryTimer) { clearInterval(_liveRetryTimer); _liveRetryTimer = null; }
+  if (window._sessionRetryState) delete window._sessionRetryState[liveSessionId];
+  if (window._sessionError) delete window._sessionError[liveSessionId];
+  socket.emit('retry_now', {session_id: liveSessionId});
+  // Optimistically show working so the bar doesn't flash an empty idle state.
+  sessionKinds[liveSessionId] = 'working';
+  liveBarState = null;
+  updateLiveInputBar();
+  if (typeof _startMessageWatchdog === 'function') _startMessageWatchdog(liveSessionId);
+}
+
+function liveClearDisplay() {
+  const logEl = document.getElementById('live-log');
+  if (logEl) { logEl.innerHTML = ''; liveLineCount = 0; }
+  _liveEntryStash = [];
+  _liveRenderedFrom = 0;
+  showToast('Display cleared');
+}
+
+function liveCompact() {
+  if (!liveSessionId) return;
+  // Optimistically set compacting substatus so bar immediately shows
+  // "Compacting…" instead of "Working…" while waiting for compact_boundary
+  if (!window._sessionSubstatus) window._sessionSubstatus = {};
+  window._sessionSubstatus[liveSessionId] = 'compacting';
+  socket.emit('send_message', {session_id: liveSessionId, text: '/compact'});
+  showToast('Compacting context\u2026');
+}
+
+async function closeSession(id) {
+  if (!id) return;
+  const s = allSessions.find(x => x.id === id);
+  const name = (s && s.display_title) || id.slice(0, 8);
+  const confirmed = await showConfirm('Close Session', '<p>Close <strong>' + escHtml(name) + '</strong>?</p><p>This will stop the running Claude process and close the terminal window.</p>', { danger: true, confirmText: 'Close', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>' });
+  if (!confirmed) return;
+  // Record the intent BEFORE emitting so any in-flight ghost-recovery timer
+  // sees it the moment it fires and declines to resurrect the session.
+  markUserStopped(id);
+  // Close via WebSocket — UNCONDITIONALLY.  This used to be gated on
+  // `runningIds.has(id)`, on the assumption that a session missing from
+  // runningIds could not be live on the daemon.  That assumption is false, and
+  // the Stop menu item itself proves it: sessions.js offers Stop whenever
+  // getSessionStatus() != 'sleeping', which includes sessions considered idle
+  // via guiOpenSessions or restart memory — neither of which is in runningIds.
+  // For exactly those sessions the guard made Stop a client-side no-op: local
+  // state was cleared, nothing reached the daemon, the session kept running,
+  // and the next page refresh rebuilt the truth from the server and showed it
+  // idle again.  Only the daemon knows whether it holds a session, so always
+  // ask it; a stop for a session it doesn't have is a no-op there (the server
+  // no longer reports "Session not found" as an error for close_session).
+  socket.emit('close_session', {session_id: id});
+  guiOpenDelete(id);
+  runningIds.delete(id);
+  delete sessionKinds[id];
+  // Also drop any restart-restored state so a dormant session the user just
+  // stopped actually falls back to 'sleeping' on the next render.  Without
+  // this, getSessionStatus() would keep reading window.sessionLastState and
+  // re-show the session as idle, making the Stop action look like a no-op.
+  if (window.sessionLastState) delete window.sessionLastState[id];
+  showToast('Session closed');
+  // Update the input bar to reflect stopped state — keep chat visible
+  liveBarState = null;
+  updateLiveInputBar();
+  filterSessions();
+}

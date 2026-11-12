@@ -1,0 +1,1856 @@
+"""
+Tests for API-error auto-retry with exponential backoff in SessionManager.
+
+Background: when a turn ends with a ResultMessage(is_error=True) caused by a
+transient upstream failure (API overload / 429 / 529 / 5xx / network), the
+session used to log "Session ended with error" and sit idle forever.  These
+tests cover the auto-retry that resends the last user message on an exponential
+backoff, the countdown state surfaced to the UI, and the Cancel / Retry-now
+controls.
+
+Mirrors the mock/fixture pattern of tests/test_self_healing.py.  Timing-
+sensitive behavior is exercised with a tiny backoff base (monkeypatched) and a
+recorder in place of the real send path; pure functions are tested directly.
+"""
+
+import asyncio
+import inspect
+import time
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+from tests._empty_cwd import EMPTY_CWD
+
+
+# ---------------------------------------------------------------------------
+# Mock SDK types (mirrors test_self_healing.py; MockResultMessage extended with
+# subtype + result so we can exercise the error classifier through the backend)
+# ---------------------------------------------------------------------------
+
+class MockTextBlock:
+    def __init__(self, text=""):
+        self.type = "text"
+        self.text = text
+
+
+class MockAssistantMessage:
+    def __init__(self, content=None):
+        self.content = content or []
+        self.role = "assistant"
+
+
+class MockResultMessage:
+    def __init__(self, session_id="test-session", total_cost_usd=0.05,
+                 duration_ms=1000, is_error=False, num_turns=1, usage=None,
+                 subtype="", result=""):
+        self.session_id = session_id
+        self.total_cost_usd = total_cost_usd
+        self.duration_ms = duration_ms
+        self.is_error = is_error
+        self.num_turns = num_turns
+        self.usage = usage or {}
+        self.subtype = subtype
+        self.result = result
+
+
+class MockToolUseBlock:
+    def __init__(self, id="tool-1", name="Bash", input=None):
+        self.type = "tool_use"
+        self.id = id
+        self.name = name
+        self.input = input or {}
+
+
+class MockToolResultBlock:
+    def __init__(self, tool_use_id="tool-1", content="", is_error=False):
+        self.type = "tool_result"
+        self.tool_use_id = tool_use_id
+        self.content = content
+        self.is_error = is_error
+
+
+class MockThinkingBlock:
+    def __init__(self, text=""):
+        self.type = "thinking"
+        self.text = text
+
+
+class MockUserMessage:
+    def __init__(self, content=None):
+        self.content = content or []
+        self.role = "user"
+
+
+class MockStreamEvent:
+    def __init__(self, event="content_block_delta", data=None):
+        self.event = event
+        self.data = data or {}
+
+
+class MockPermissionResultAllow:
+    def __init__(self, updated_input=None, updated_permissions=None):
+        self.updated_input = updated_input
+        self.updated_permissions = updated_permissions
+
+
+class MockPermissionResultDeny:
+    def __init__(self, message="", interrupt=False):
+        self.message = message
+        self.interrupt = interrupt
+
+
+class MockToolPermissionContext:
+    def __init__(self):
+        self.signal = None
+        self.suggestions = []
+
+
+class MockClaudeSDKClient:
+    """Mock SDK client that yields predefined messages."""
+
+    def __init__(self, options=None):
+        self.options = options
+        self._messages = []
+        self._response_messages = []
+        self._connected = False
+        self._queries = []
+        self._interrupted = False
+        self._disconnected = False
+        self.connect_prompt = None
+
+    async def connect(self, prompt=None):
+        self._connected = True
+        self.connect_prompt = prompt
+
+    async def query(self, prompt, session_id="default"):
+        self._queries.append(prompt)
+
+    async def receive_messages(self):
+        for msg in self._messages:
+            yield msg
+
+    async def receive_response(self):
+        for msg in self._response_messages:
+            yield msg
+
+    async def interrupt(self):
+        self._interrupted = True
+
+    async def disconnect(self):
+        self._disconnected = True
+        self._connected = False
+
+    async def get_server_info(self):
+        return {"version": "mock"}
+
+
+class _RaisingClient:
+    """A connected SDK client whose receive_response() raises a configured
+    exception on the first message — simulates the API/connection failing
+    mid-turn (a 500 result, a dropped connection, etc.)."""
+
+    def __init__(self, err_str):
+        self._err = err_str
+        self._connected = True
+
+    async def connect(self, prompt=None):
+        self._connected = True
+
+    async def query(self, prompt, session_id="default"):
+        pass
+
+    async def receive_response(self):
+        raise RuntimeError(self._err)
+        yield  # unreachable — makes this an async generator function
+
+    async def interrupt(self):
+        pass
+
+    async def disconnect(self):
+        self._connected = False
+
+    async def get_server_info(self):
+        return {"version": "mock"}
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def mock_socketio():
+    sio = MagicMock()
+    sio.emit = MagicMock()
+    return sio
+
+
+@pytest.fixture
+def mock_sdk_types():
+    type_mocks = {
+        'claude_code_sdk': MagicMock(),
+        'claude_code_sdk.types': MagicMock(),
+    }
+    type_mocks['claude_code_sdk'].ClaudeSDKClient = MockClaudeSDKClient
+    type_mocks['claude_code_sdk'].ClaudeCodeOptions = MagicMock
+
+    types_mod = type_mocks['claude_code_sdk.types']
+    types_mod.AssistantMessage = MockAssistantMessage
+    types_mod.UserMessage = MockUserMessage
+    types_mod.ResultMessage = MockResultMessage
+    types_mod.StreamEvent = MockStreamEvent
+    types_mod.TextBlock = MockTextBlock
+    types_mod.ThinkingBlock = MockThinkingBlock
+    types_mod.ToolUseBlock = MockToolUseBlock
+    types_mod.ToolResultBlock = MockToolResultBlock
+    types_mod.PermissionResultAllow = MockPermissionResultAllow
+    types_mod.PermissionResultDeny = MockPermissionResultDeny
+    types_mod.ContentBlock = MagicMock
+    types_mod.ToolPermissionContext = MockToolPermissionContext
+    types_mod.Message = MagicMock
+    return type_mocks
+
+
+@pytest.fixture
+def sm_module(mock_sdk_types):
+    with patch.dict('sys.modules', mock_sdk_types):
+        from tests._sm_fresh import fresh_session_manager
+        sm_mod = fresh_session_manager()
+
+        sm_mod.AssistantMessage = MockAssistantMessage
+        sm_mod.UserMessage = MockUserMessage
+        sm_mod.ResultMessage = MockResultMessage
+        sm_mod.StreamEvent = MockStreamEvent
+        sm_mod.TextBlock = MockTextBlock
+        sm_mod.ThinkingBlock = MockThinkingBlock
+        sm_mod.ToolUseBlock = MockToolUseBlock
+        sm_mod.ToolResultBlock = MockToolResultBlock
+        sm_mod.PermissionResultAllow = MockPermissionResultAllow
+        sm_mod.PermissionResultDeny = MockPermissionResultDeny
+        sm_mod.ClaudeSDKClient = MockClaudeSDKClient
+        sm_mod.ClaudeCodeOptions = MagicMock
+        yield sm_mod
+
+
+@pytest.fixture
+def session_manager(mock_socketio, sm_module, tmp_path):
+    manager = sm_module.SessionManager()
+    manager._queue_path = tmp_path / "test_queues.json"
+    manager._queues = {}
+    manager.start(mock_socketio)
+    yield manager
+    manager.stop()
+
+
+def wait_for(condition, timeout=5.0, interval=0.01):
+    """Poll until condition() is truthy or timeout expires."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = condition()
+        if result:
+            return result
+        time.sleep(interval)
+    raise TimeoutError(f"Condition not met within {timeout}s")
+
+
+def _make_idle_session(sm_module, manager, sid, user_text="do the thing"):
+    """Register an IDLE SessionInfo with one user entry and return it."""
+    info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+    info.cwd = EMPTY_CWD
+    info.entries.append(sm_module.LogEntry(kind="user", text=user_text))
+    with manager._lock:
+        manager._sessions[sid] = info
+    return info
+
+
+# ===========================================================================
+# Pure-function unit tests — classifier, backoff schedule, reason text
+# ===========================================================================
+
+class TestClassifier:
+    @pytest.mark.parametrize("text", [
+        "API Error: 529 Overloaded",
+        "overloaded_error",
+        "429 Too Many Requests",
+        "rate limit exceeded",
+        "Internal Server Error (500)",
+        "502 Bad Gateway",
+        "503 service unavailable",
+        "connection reset by peer",
+        "request timed out",
+        "network error, please try again",
+    ])
+    def test_transient_errors_classified_transient(self, sm_module, text):
+        assert sm_module.SessionManager._classify_result_error("error_during_execution", text) == "transient"
+
+    def test_max_turns_is_permanent(self, sm_module):
+        assert sm_module.SessionManager._classify_result_error("error_max_turns", "") == "permanent"
+        assert sm_module.SessionManager._classify_result_error("error_max_turns", "anything") == "permanent"
+
+
+# ===========================================================================
+# Usage limit (plan/quota exhaustion) — a class of its own
+#
+# Why this is NOT "transient": a quota stands for HOURS.  Arming the
+# exponential backoff against it burns the whole bounded retry budget
+# (_API_RETRY_MAX) re-hitting the same wall, and leaves nothing for the
+# genuine transient outage that comes later.  The only action that actually
+# unblocks the user is switching to a model with headroom, so this class
+# exists to drive the model-switch CTA instead of a useless Retry button.
+# ===========================================================================
+
+class TestUsageLimitClassification:
+    # Every string below was extracted from the INSTALLED CLI BINARY (its
+    # billing/rate-limit copy and the `rateLimitType` enum), not invented.  If
+    # a future CLI reworks this copy, these are the cases to re-derive.
+    @pytest.mark.parametrize("text", [
+        # Rendered by the CLI as "<rateLimitType> reached".
+        "Usage limit reached",
+        "Usage limit reached · continuing automatically",
+        "usage limit reached — check plan",
+        # Weekly/5-hour phrasing — note this does NOT contain "weekly limit
+        # reached", which is why literal matching failed on it.
+        "Lower-priority mode ended · you have reached your weekly usage limit",
+        # Credit exhaustion.  The CLI's own remedy here is "Switch to another
+        # model to continue" — exactly what our CTA offers.
+        "You're out of usage credits. Switch to another model to continue.",
+        "Your organization is out of usage credits. Contact your admin to add more.",
+        "usage_cap_reached",
+        # The CLI splices "org's monthly usage limit" into a composed sentence;
+        # the fragment alone carries no exhaustion verb, so test the real shape.
+        "You've reached your org's monthly usage limit",
+        # API-side billing.
+        "Your credit balance is too low to access the API",
+        "quota exceeded",
+        # Legacy pipe form kept working for older CLI builds.
+        "Claude AI usage limit reached|1756612800",
+    ])
+    def test_usage_limits_get_their_own_class(self, sm_module, text):
+        assert sm_module.SessionManager._classify_result_error(
+            "error_during_execution", text) == "usage_limit"
+
+    @pytest.mark.parametrize("text", [
+        # These MENTION a limit without being one.  Misclassifying any of them
+        # parks a healthy session behind a CTA it can never dismiss.
+        "Your usage limit has reset · press enter to continue",
+        "Usage limit has reset · press enter to continue",
+        "Usage limit available again · continuing now",
+        "Approaching your 5-hour usage limit — Claude will wrap up the current step.",
+        "Server is temporarily limiting requests (not your usage limit)",
+        "/upgrade to increase your usage limit.",
+    ])
+    def test_limit_adjacent_strings_are_not_limits(self, sm_module, text):
+        assert sm_module.SessionManager._parse_usage_limit(text)[0] is False
+        assert sm_module.SessionManager._classify_result_error("", text) != "usage_limit"
+
+    @pytest.mark.parametrize("raw,expected", [
+        ('{"resetsAtSeconds":1756612800}', 1756612800.0),
+        ('{"resetsAt": 1756612800}', 1756612800.0),
+        ('{"resets_at_seconds": 1756612800}', 1756612800.0),
+        ("Claude AI usage limit reached|1756612800", 1756612800.0),
+    ])
+    def test_reset_instant_parsed_from_every_known_encoding(self, sm_module,
+                                                            raw, expected):
+        """The installed CLI uses `resetsAtSeconds`, NOT the legacy pipe form.
+        Both (and the API's `resetsAt`) must yield the same countdown."""
+        text = "Usage limit reached " + raw
+        is_limit, reset = sm_module.SessionManager._parse_usage_limit(text)
+        assert is_limit is True
+        assert reset == expected
+
+    def test_usage_limit_outranks_a_cooccurring_429(self, sm_module):
+        """A quota message frequently ALSO carries a 429.  Matching the
+        transient signature first would arm a seconds-scale backoff against an
+        hours-long wall — the precedence here is the whole point."""
+        text = "429: Claude AI usage limit reached|1756612800"
+        assert sm_module.SessionManager._classify_result_error("", text) == "usage_limit"
+
+    @pytest.mark.parametrize("text", [
+        "429 Too Many Requests",
+        "rate limit exceeded",
+        "API Error: 529 Overloaded",
+    ])
+    def test_plain_throttles_stay_transient(self, sm_module, text):
+        """Guard against over-matching: a server-side throttle IS fixed by the
+        backoff and must keep its auto-retry."""
+        assert sm_module.SessionManager._classify_result_error("", text) == "transient"
+
+    def test_parses_epoch_seconds_reset(self, sm_module):
+        is_limit, reset = sm_module.SessionManager._parse_usage_limit(
+            "Claude AI usage limit reached|1756612800")
+        assert is_limit is True
+        assert reset == 1756612800.0
+
+    def test_parses_epoch_millis_reset(self, sm_module):
+        """Some CLI builds emit milliseconds; a value implausible as seconds is
+        scaled down rather than rendered as a countdown in the year 57000."""
+        is_limit, reset = sm_module.SessionManager._parse_usage_limit(
+            "Claude AI usage limit reached|1756612800000")
+        assert is_limit is True
+        assert reset == 1756612800.0
+
+    def test_prose_clock_reset_is_resolved(self, sm_module):
+        """A human clock time ("reset at 6pm") is resolved to the next 6pm in
+        local time (the CLI states resets this way, so
+        returning 0.0 left nothing to schedule the auto-continue against)."""
+        from datetime import datetime
+        now = datetime(2026, 10, 7, 16, 43).astimezone().timestamp()
+        is_limit, reset = sm_module.SessionManager._parse_usage_limit(
+            "Claude usage limit reached. Your limit will reset at 6pm.", now=now)
+        assert is_limit is True
+        assert reset == datetime(2026, 10, 7, 18, 0).astimezone().timestamp()
+
+    def test_no_reset_time_at_all_is_zero(self, sm_module):
+        """No reset of any kind → 0.0, so the banner omits the countdown
+        rather than inventing a number."""
+        is_limit, reset = sm_module.SessionManager._parse_usage_limit(
+            "You're out of usage credits. Switch to another model to continue.")
+        assert is_limit is True
+        assert reset == 0.0
+
+    def test_non_limit_text_is_not_a_limit(self, sm_module):
+        assert sm_module.SessionManager._parse_usage_limit(
+            "503 service unavailable") == (False, 0.0)
+        assert sm_module.SessionManager._parse_usage_limit("") == (False, 0.0)
+        assert sm_module.SessionManager._parse_usage_limit(None) == (False, 0.0)
+
+    def test_apply_usage_limit_disarms_retry_and_records_model(self, sm_module):
+        """_apply_usage_limit must leave NO armed backoff behind — that is the
+        difference between "park with a CTA" and "burn 5 retries on a wall"."""
+        sm = sm_module.SessionManager.__new__(sm_module.SessionManager)
+        info = sm_module.SessionInfo(session_id="ul-1")
+        info.model = "claude-opus-5"
+        info._api_retry_needed = True
+        info.retry_at = time.time() + 600
+        info.retry_attempt = 2
+        info.retry_max = 5
+        info.retry_reason = "Rate limited"
+
+        sm._apply_usage_limit(info, "Claude AI usage limit reached|%d"
+                              % int(time.time() + 3600))
+
+        assert info.limited_model == "claude-opus-5"
+        assert info.limit_reset_at > time.time()
+        assert info._api_retry_needed is False
+        assert info.retry_at == 0.0
+        assert info.retry_attempt == 0
+        assert info.retry_max == 0
+        assert info.retry_reason == ""
+        assert "usage limit" in info.error.lower()
+
+    def test_flag_api_retry_records_limit_and_refuses_to_arm(self, sm_module):
+        """Channel (b): the quota surfaced as a raised exception rather than an
+        is_error RESULT.  It must still populate the CTA fields and still
+        refuse to arm a backoff."""
+        sm = sm_module.SessionManager.__new__(sm_module.SessionManager)
+        info = sm_module.SessionInfo(session_id="ul-2")
+        info.model = "claude-fable-5"
+        armed = sm._flag_api_retry_if_transient(
+            info, "Claude AI usage limit reached|1756612800")
+        assert armed is False
+        assert info._api_retry_needed is False
+        assert info.limited_model == "claude-fable-5"
+        assert info.limit_reset_at == 1756612800.0
+
+    def test_state_dict_always_carries_limit_fields(self, sm_module):
+        """Always-present (like retry_at) so the client can tell "not limited"
+        from "old daemon that doesn't send the key"."""
+        info = sm_module.SessionInfo(session_id="ul-3")
+        d = info.to_state_dict()
+        assert d["limited_model"] == ""
+        assert d["limit_reset_at"] == 0.0
+
+    def test_clear_usage_limit_is_idempotent(self, sm_module):
+        sm = sm_module.SessionManager.__new__(sm_module.SessionManager)
+        info = sm_module.SessionInfo(session_id="ul-4")
+        info.limited_model = "claude-opus-5"
+        info.limit_reset_at = 123.0
+        sm._clear_usage_limit(info)
+        sm._clear_usage_limit(info)
+        assert info.limited_model == ""
+        assert info.limit_reset_at == 0.0
+
+    @pytest.mark.parametrize("text", [
+        "invalid request: messages must be non-empty",
+        "401 unauthorized",
+        "authentication failed",
+        "403 forbidden",
+    ])
+    def test_known_permanent_errors(self, sm_module, text):
+        assert sm_module.SessionManager._classify_result_error("error_during_execution", text) == "permanent"
+
+    def test_unknown_error_defaults_transient(self, sm_module):
+        # An unrecognised is_error result is retried (bounded by the cap).
+        assert sm_module.SessionManager._classify_result_error("", "some weird message") == "transient"
+        assert sm_module.SessionManager._classify_result_error("", "") == "transient"
+
+
+class TestBackoffSchedule:
+    def test_exponential_schedule(self, sm_module):
+        SM = sm_module.SessionManager
+        # Defaults: base=10, factor=2, cap=1800 ->
+        # 10, 20, 40, 80, 160, 320, 640, 1280, min(2560,1800)=1800, 1800
+        expected = [10, 20, 40, 80, 160, 320, 640, 1280, 1800, 1800]
+        got = [SM._api_retry_delay(n) for n in range(10)]
+        assert got == expected
+
+    def test_negative_attempt_clamped(self, sm_module):
+        SM = sm_module.SessionManager
+        assert SM._api_retry_delay(-5) == SM._API_RETRY_BASE
+
+    def test_cap_respected(self, sm_module):
+        # Very large attempt index never exceeds the cap.
+        assert sm_module.SessionManager._api_retry_delay(100) == sm_module.SessionManager._API_RETRY_CAP
+
+    def test_window_covers_overnight(self, sm_module):
+        # The total retry window (sum of all attempt delays) must comfortably
+        # exceed a 2-hour outage so an overnight task can recover.
+        SM = sm_module.SessionManager
+        total = sum(SM._api_retry_delay(n) for n in range(SM._API_RETRY_MAX))
+        assert total >= 2 * 3600, f"retry window only {total}s (< 2h)"
+
+    def test_jitter_within_bounds(self, sm_module):
+        SM = sm_module.SessionManager
+        base = 100.0
+        for _ in range(300):
+            v = SM._apply_jitter(base)
+            assert 80.0 <= v <= 120.0, f"jitter {v} outside +/-20% of {base}"
+
+    def test_jitter_zero_returns_base(self, sm_module, monkeypatch):
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_JITTER', 0)
+        assert sm_module.SessionManager._apply_jitter(123.0) == 123.0
+
+    @pytest.mark.parametrize("secs,expected", [
+        (5, "5s"), (59, "59s"), (60, "1m"), (90, "1m 30s"),
+        (600, "10m"), (1800, "30m"), (3600, "1h"), (3725, "1h 2m"),
+    ])
+    def test_fmt_duration(self, sm_module, secs, expected):
+        assert sm_module.SessionManager._fmt_duration(secs) == expected
+
+
+class TestReasonText:
+    @pytest.mark.parametrize("text,expected", [
+        ("529 overloaded", "API overloaded"),
+        ("429 rate limit", "Rate limited"),
+        ("500 internal server error", "Server error"),
+        ("connection timed out", "Network error"),
+        ("something else entirely", "Temporary error"),
+    ])
+    def test_reason_text(self, sm_module, text, expected):
+        assert sm_module.SessionManager._retry_reason_text(text) == expected
+
+
+# ===========================================================================
+# Detection channel (b): non-transport stream EXCEPTIONS (5xx / overload / …)
+# These are the API errors raised mid-stream that previously hit
+# "reconnect, no retry" and dead-ended.
+# ===========================================================================
+
+class TestExceptionChannelDetection:
+    @pytest.mark.parametrize("err_str", [
+        "Error code: 500 - {'type': 'error', 'error': {'type': 'api_error'}}",
+        "anthropic.InternalServerError: 500",
+        "503 Service Unavailable",
+        "502 Bad Gateway",
+        "API Error: 529 Overloaded",
+        "overloaded_error",
+        "429 rate limit exceeded",
+        "Connection reset by peer",
+        "read operation timed out",
+        # Unknown error strings default to transient → still retried.
+        "some unexpected failure nobody anticipated",
+    ])
+    def test_transient_exceptions_flagged(self, session_manager, sm_module, err_str):
+        info = _make_idle_session(sm_module, session_manager, "exc-" + str(abs(hash(err_str)) % 9999))
+        flagged = session_manager._flag_api_retry_if_transient(info, err_str)
+        assert flagged is True
+        assert info._api_retry_needed is True
+        assert info.retry_reason  # a human reason was set
+
+    @pytest.mark.parametrize("err_str", [
+        "Error code: 400 - invalid request: messages must be non-empty",
+        "401 Unauthorized",
+        "403 Forbidden",
+    ])
+    def test_permanent_exceptions_not_flagged(self, session_manager, sm_module, err_str):
+        info = _make_idle_session(sm_module, session_manager, "excp-" + str(abs(hash(err_str)) % 9999))
+        flagged = session_manager._flag_api_retry_if_transient(info, err_str)
+        assert flagged is False
+        assert info._api_retry_needed is False
+
+    def test_not_flagged_without_user_message(self, session_manager, sm_module):
+        # Empty transcript — nothing to continue, so never arm.
+        info = sm_module.SessionInfo(session_id="exc-empty", state=sm_module.SessionState.IDLE)
+        with session_manager._lock:
+            session_manager._sessions["exc-empty"] = info
+        assert session_manager._flag_api_retry_if_transient(info, "503 Service Unavailable") is False
+
+    def test_not_flagged_when_budget_exhausted(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "exc-exhausted")
+        info._api_retry_count = sm_module.SessionManager._API_RETRY_MAX
+        assert session_manager._flag_api_retry_if_transient(info, "500 internal server error") is False
+
+    def test_drive_loops_detect_exception_channel(self, sm_module):
+        # Both stream drivers must classify the non-transport exception and
+        # route transient ones into the backoff (not the old no-retry path).
+        for meth in (sm_module.SessionManager._drive_session,
+                     sm_module.SessionManager._send_query):
+            src = inspect.getsource(meth)
+            assert "_flag_api_retry_if_transient" in src, \
+                "non-transport exception branch does not flag API retry"
+
+
+# ===========================================================================
+# Detection channel (c): connectivity loss / dead transport.
+# An internet outage that kills the CLI surfaces as a transport error; the
+# short 3-try stream-heal escalates into the SAME long backoff, reconnecting
+# each attempt until the network returns.
+# ===========================================================================
+
+class TestConnectivityEscalation:
+    @pytest.mark.parametrize("err_str", [
+        "Could not resolve host: api.anthropic.com",
+        "getaddrinfo failed: Name or service not known",
+        "Connection refused",
+        "Connection reset by peer",
+        "[Errno 101] Network is unreachable",
+        "No route to host",
+        "SSL handshake failed",
+        "Temporary failure in name resolution",
+        "HTTPSConnectionPool: Max retries exceeded",
+    ])
+    def test_connectivity_strings_classified_transient(self, sm_module, err_str):
+        assert sm_module.SessionManager._classify_result_error("", err_str) == "transient"
+
+    def test_escalate_flags_reconnect_retry(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "esc-1")
+        info._ever_got_result = True   # session is resumable (produced a RESULT)
+        flagged = session_manager._escalate_heal_to_backoff(info, "Connection lost")
+        assert flagged is True
+        assert info._api_retry_needed is True
+        assert info._retry_needs_reconnect is True
+        assert info.retry_reason == "Connection lost"
+
+    def test_escalate_not_before_first_result(self, session_manager, sm_module):
+        # A crash before the first RESULT can't --resume (no real UUID yet) —
+        # escalation must bail so it doesn't spin a doomed reconnect.
+        info = _make_idle_session(sm_module, session_manager, "esc-firstturn")
+        info._ever_got_result = False
+        assert session_manager._escalate_heal_to_backoff(info, "Connection lost") is False
+
+    def test_escalate_not_without_user_message(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="esc-empty", state=sm_module.SessionState.IDLE)
+        with session_manager._lock:
+            session_manager._sessions["esc-empty"] = info
+        assert session_manager._escalate_heal_to_backoff(info, "Connection lost") is False
+
+    def test_escalate_not_when_budget_exhausted(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "esc-exhausted")
+        info._api_retry_count = sm_module.SessionManager._API_RETRY_MAX
+        assert session_manager._escalate_heal_to_backoff(info, "Connection lost") is False
+
+    def test_clear_resets_reconnect_flag(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "esc-clear")
+        info._retry_needs_reconnect = True
+        session_manager._clear_api_retry(info, reset_count=True)
+        assert info._retry_needs_reconnect is False
+
+    def test_give_up_branches_escalate(self, sm_module):
+        # Both drive loops must escalate a give-up into the long backoff
+        # rather than only printing "please resend".
+        for meth in (sm_module.SessionManager._drive_session,
+                     sm_module.SessionManager._send_query):
+            src = inspect.getsource(meth)
+            assert "_escalate_heal_to_backoff" in src
+
+    def test_timer_reconnects_then_continues(self, session_manager, sm_module, monkeypatch):
+        # When the retry needs a reconnect, the timer reconnects first, then
+        # resumes with the continue prompt.
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_BASE', 0.05)
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_JITTER', 0)
+        info = _make_idle_session(sm_module, session_manager, "esc-timer")
+        info._retry_needs_reconnect = True
+
+        reconnect_calls = []
+        async def _fake_reconnect(sid, inf):
+            reconnect_calls.append(sid)
+            return True
+        monkeypatch.setattr(session_manager, '_reconnect_client', _fake_reconnect)
+
+        recorder = []
+        monkeypatch.setattr(session_manager, 'send_message',
+                            lambda sid, text, **kw: recorder.append((sid, text, kw)) or {"ok": True})
+
+        async def _arm():
+            session_manager._arm_api_retry("esc-timer", info)
+        asyncio.run_coroutine_threadsafe(_arm(), session_manager._loop).result(timeout=2)
+
+        wait_for(lambda: len(recorder) >= 1, timeout=3)
+        assert reconnect_calls, "reconnect was not attempted before firing"
+        sid, text, kw = recorder[0]
+        assert text  # a retry was resent (original, since no output produced yet)
+        assert info._retry_needs_reconnect is False  # cleared after success
+
+    def test_timer_rearms_when_reconnect_fails(self, session_manager, sm_module, monkeypatch):
+        # Reconnect fails (outage ongoing) → consume the attempt and re-arm the
+        # next backoff instead of giving up.
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_BASE', 0.05)
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_JITTER', 0)
+        info = _make_idle_session(sm_module, session_manager, "esc-fail")
+        info._retry_needs_reconnect = True
+
+        async def _fake_reconnect(sid, inf):
+            return False
+        monkeypatch.setattr(session_manager, '_reconnect_client', _fake_reconnect)
+
+        recorder = []
+        monkeypatch.setattr(session_manager, 'send_message',
+                            lambda sid, text, **kw: recorder.append((sid, text, kw)) or {"ok": True})
+
+        async def _arm():
+            session_manager._arm_api_retry("esc-fail", info)
+        asyncio.run_coroutine_threadsafe(_arm(), session_manager._loop).result(timeout=2)
+
+        # After the first failed reconnect, the attempt count advances and a new
+        # countdown is armed (it keeps trying), and no resend happened yet.
+        wait_for(lambda: info._api_retry_count >= 1, timeout=3)
+        assert recorder == [], "should not resend while still disconnected"
+        assert info._retry_needs_reconnect is True  # still needs reconnect
+
+
+# ===========================================================================
+# END-TO-END: drive a real turn (_send_query) through a failure and confirm
+# the exponential backoff actually arms + fires.  Covers the two cases the
+# feature exists for: 500-class API errors and network connection loss.
+# ===========================================================================
+
+class TestEndToEndFailureArmsBackoff:
+    @pytest.mark.parametrize("err_str,kind", [
+        # 500-class API errors
+        ("Error code: 500 - {'type':'error','error':{'type':'api_error'}}", "500"),
+        ("503 Service Unavailable", "500"),
+        ("anthropic.InternalServerError: Internal server error", "500"),
+        ("API Error: 529 Overloaded", "500"),
+        # Network connection interruption (raised as a NON-transport exception
+        # — a "...closed" string would instead be a transport error handled by
+        # the stream-heal→escalate path, covered in TestConnectivityEscalation).
+        ("Could not resolve host: api.anthropic.com", "network"),
+        ("[Errno 111] Connection refused", "network"),
+        ("HTTPSConnectionPool(host='api.anthropic.com'): Max retries exceeded", "network"),
+        ("[Errno 101] Network is unreachable", "network"),
+    ])
+    def test_turn_failure_arms_and_fires_backoff(
+        self, session_manager, sm_module, monkeypatch, err_str, kind
+    ):
+        # Fast, deterministic backoff so the timer fires within the test.
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_BASE', 0.05)
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_JITTER', 0)
+
+        sid = "e2e-" + kind + "-" + str(abs(hash(err_str)) % 99999)
+        info = _make_idle_session(sm_module, session_manager, sid, user_text="do the long task")
+        # A connected client whose stream raises the failure mid-turn.
+        info.client = _RaisingClient(err_str)
+        info.state = sm_module.SessionState.WORKING  # as send_message would set it
+
+        # Isolate from the real reconnect machinery (jsonl repair, CLI spawn).
+        async def _fake_reconnect(s, i):
+            return True
+        monkeypatch.setattr(session_manager, '_reconnect_client', _fake_reconnect)
+
+        # Capture the auto-retry resend instead of driving a second turn.
+        recorder = []
+        monkeypatch.setattr(session_manager, 'send_message',
+                            lambda s, t, **kw: recorder.append((s, t, kw)) or {"ok": True})
+
+        # Drive the turn end-to-end on the manager loop (via _tracked_coro so the
+        # finally's superseded-guard sees us as the owning task).
+        async def _drive():
+            await session_manager._tracked_coro(
+                info, session_manager._send_query(sid, "do the long task"))
+        # Ceiling, not an expectation: ~3s alone, but the Publish gate runs
+        # 8 parallel workers and 8s was exceeded under that load.
+        asyncio.run_coroutine_threadsafe(_drive(), session_manager._loop).result(timeout=30)
+
+        # The turn failed → a transient error was detected → the exponential
+        # backoff was armed → the timer fired → it re-sent under the _auto_retry
+        # flag.  No assistant output was produced before the error, so the retry
+        # RE-SENDS THE ORIGINAL request (not the "continue" prompt).
+        wait_for(lambda: len(recorder) >= 1, timeout=15)
+        s, text, kw = recorder[0]
+        assert s == sid
+        assert text == "do the long task"  # original re-sent (no output before error)
+        assert kw.get("_auto_retry") is True
+        assert info._api_retry_count == 1
+        # A connection error raised mid-stream is a NON-transport exception, so
+        # the except branch already reconnected — no second reconnect needed.
+        assert info._retry_needs_reconnect is False
+
+    def test_permanent_turn_failure_does_not_arm(self, session_manager, sm_module, monkeypatch):
+        # A genuinely permanent error (400 invalid request) must NOT auto-retry.
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_BASE', 0.05)
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_JITTER', 0)
+        sid = "e2e-permanent"
+        info = _make_idle_session(sm_module, session_manager, sid)
+        info.client = _RaisingClient("Error code: 400 - invalid request: bad content")
+        info.state = sm_module.SessionState.WORKING
+
+        async def _fake_reconnect(s, i):
+            return True
+        monkeypatch.setattr(session_manager, '_reconnect_client', _fake_reconnect)
+        recorder = []
+        monkeypatch.setattr(session_manager, 'send_message',
+                            lambda s, t, **kw: recorder.append((s, t, kw)) or {"ok": True})
+
+        async def _drive():
+            await session_manager._tracked_coro(
+                info, session_manager._send_query(sid, "x"))
+        # Ceiling, not an expectation: ~3s alone, but the Publish gate runs
+        # 8 parallel workers and 8s was exceeded under that load.
+        asyncio.run_coroutine_threadsafe(_drive(), session_manager._loop).result(timeout=30)
+
+        # Give any (erroneously) armed timer a moment — then confirm nothing fired.
+        time.sleep(0.4)
+        assert recorder == [], "permanent error must not auto-retry"
+        assert info.retry_at == 0.0
+
+
+# ===========================================================================
+# Serialization — retry fields exposed to the UI
+# ===========================================================================
+
+class TestSerialization:
+    def test_to_state_dict_includes_retry_fields(self, sm_module):
+        info = sm_module.SessionInfo(session_id="s1", state=sm_module.SessionState.IDLE)
+        d = info.to_state_dict()
+        for key in ("retry_at", "retry_attempt", "retry_max", "retry_reason"):
+            assert key in d, f"{key} missing from to_state_dict()"
+        # Defaults (no retry pending)
+        assert d["retry_at"] == 0.0
+        assert d["retry_attempt"] == 0
+        assert d["retry_max"] == 0
+        assert d["retry_reason"] == ""
+
+    def test_to_state_dict_reflects_armed_retry(self, sm_module):
+        info = sm_module.SessionInfo(session_id="s2", state=sm_module.SessionState.IDLE)
+        info.retry_at = 1234567890.0
+        info.retry_attempt = 2
+        info.retry_max = 5
+        info.retry_reason = "API overloaded"
+        d = info.to_state_dict()
+        assert d["retry_at"] == 1234567890.0
+        assert d["retry_attempt"] == 2
+        assert d["retry_max"] == 5
+        assert d["retry_reason"] == "API overloaded"
+
+
+# ===========================================================================
+# Clearing / counter semantics
+# ===========================================================================
+
+class TestClearAndCounter:
+    def test_clear_resets_all_fields(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "clr-1")
+        info.retry_at = time.time() + 10
+        info.retry_attempt = 3
+        info.retry_max = 5
+        info.retry_reason = "Rate limited"
+        info._api_retry_needed = True
+        info._api_retry_count = 3
+        session_manager._clear_api_retry(info, reset_count=True)
+        assert info.retry_at == 0.0
+        assert info.retry_attempt == 0
+        assert info.retry_max == 0
+        assert info.retry_reason == ""
+        assert info._api_retry_needed is False
+        assert info._api_retry_count == 0
+
+    def test_clear_can_preserve_count(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "clr-2")
+        info._api_retry_count = 2
+        session_manager._clear_api_retry(info, reset_count=False)
+        assert info._api_retry_count == 2
+
+    def test_new_user_message_resets_count(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "reset-1")
+        info._api_retry_count = 3
+        # Simulate a session that had cancelled/errored (error banner showing).
+        info.error = "Auto-retry cancelled — use Retry or type a new message"
+        # Stub out the turn dispatch so send_message runs its counter logic
+        # without actually launching a coroutine.
+        with patch.object(session_manager, '_send_query', MagicMock()), \
+             patch.object(session_manager, '_tracked_coro', MagicMock()), \
+             patch('asyncio.run_coroutine_threadsafe', MagicMock()):
+            session_manager.send_message("reset-1", "a brand new message")
+        # Taking over resets the budget AND clears the stale error banner, so a
+        # fresh failure starts a brand-new backoff chain.
+        assert info._api_retry_count == 0
+        assert info.error == ""
+
+    def test_auto_retry_send_preserves_count(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "reset-2")
+        info._api_retry_count = 3
+        with patch.object(session_manager, '_send_query', MagicMock()), \
+             patch.object(session_manager, '_tracked_coro', MagicMock()), \
+             patch('asyncio.run_coroutine_threadsafe', MagicMock()):
+            session_manager.send_message("reset-2", "retry text", _auto_retry=True)
+        assert info._api_retry_count == 3
+
+
+# ===========================================================================
+# Cancel / Retry-now actions
+# ===========================================================================
+
+class TestCancelAndRetryNow:
+    def test_cancel_auto_retry_clears_and_idles(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "cancel-1")
+        info.retry_at = time.time() + 30
+        info.retry_attempt = 1
+        info.retry_max = 5
+        info._api_retry_count = 1
+        result = session_manager.cancel_auto_retry("cancel-1")
+        assert result["ok"] is True
+        assert info.retry_at == 0.0
+        assert info._api_retry_count == 0
+        assert info.state == sm_module.SessionState.IDLE
+        assert "cancel" in info.error.lower()
+
+    def test_retry_now_during_countdown_fires_and_preserves_count(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "rn-1")
+        info.retry_at = time.time() + 30      # countdown active
+        info.retry_attempt = 2
+        info._api_retry_count = 2
+        recorder = []
+        with patch.object(session_manager, 'send_message',
+                          side_effect=lambda sid, text, **kw: recorder.append((sid, text, kw)) or {"ok": True}):
+            result = session_manager.retry_now("rn-1")
+        assert result["ok"] is True
+        assert recorder, "send_message was not called"
+        sid, text, kw = recorder[0]
+        assert kw.get("_auto_retry") is True
+        assert text  # a retry was resent (original here — no assistant output in this session)
+        assert info.retry_at == 0.0           # countdown cleared
+        # Mid-countdown retry consumes the attempt — counter keeps accumulating.
+        assert info._api_retry_count == 3
+
+    def test_retry_now_from_error_resets_budget(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "rn-2")
+        info.retry_at = 0.0                   # no countdown — settled error
+        info.error = "Auto-retry gave up after 5 attempts — use Retry to try again"
+        info._api_retry_count = 5
+        recorder = []
+        with patch.object(session_manager, 'send_message',
+                          side_effect=lambda sid, text, **kw: recorder.append((sid, text, kw)) or {"ok": True}):
+            result = session_manager.retry_now("rn-2")
+        assert result["ok"] is True
+        assert recorder, "send_message was not called"
+        # Manual retry from a settled error is a fresh start: budget reset to 0,
+        # then this resend consumes one -> 1.
+        assert info._api_retry_count == 1
+
+    def test_retry_now_rejects_non_idle(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "rn-3")
+        info.state = sm_module.SessionState.WORKING
+        result = session_manager.retry_now("rn-3")
+        assert result["ok"] is False
+
+    def test_actions_unknown_session(self, session_manager):
+        assert session_manager.cancel_auto_retry("nope")["ok"] is False
+        assert session_manager.retry_now("nope")["ok"] is False
+
+
+# ===========================================================================
+# End-to-end timer behavior — arm -> backoff -> fire resend
+# ===========================================================================
+
+class TestArmAndFire:
+    def test_arm_then_timer_fires_continue(self, session_manager, sm_module, monkeypatch):
+        # Tiny backoff + no jitter so the timer fires quickly and deterministically.
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_BASE', 0.05)
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_JITTER', 0)
+        info = _make_idle_session(sm_module, session_manager, "arm-1", user_text="do the original thing")
+        # The failed turn already ran a TOOL (side-effectful work), so the retry
+        # must CONTINUE (not replay, which would duplicate it).
+        info.entries.append(sm_module.LogEntry(kind="tool_use", text=""))
+
+        recorder = []
+        monkeypatch.setattr(session_manager, 'send_message',
+                            lambda sid, text, **kw: recorder.append((sid, text, kw)) or {"ok": True})
+
+        # Arm must run on the manager loop (it uses asyncio.create_task).
+        async def _arm():
+            session_manager._arm_api_retry("arm-1", info)
+        fut = asyncio.run_coroutine_threadsafe(_arm(), session_manager._loop)
+        fut.result(timeout=2)
+
+        # Countdown is now visible to the UI.
+        assert info.retry_at > 0
+        assert info.retry_attempt == 1
+        assert info.retry_max == sm_module.SessionManager._API_RETRY_MAX
+
+        # Timer fires — and (because output existed) sends the CONTINUE prompt,
+        # NOT a replay of the original instruction.
+        wait_for(lambda: len(recorder) >= 1, timeout=3)
+        sid, text, kw = recorder[0]
+        assert sid == "arm-1"
+        assert text == sm_module.SessionManager._API_RETRY_CONTINUE_PROMPT
+        assert text != "do the original thing"
+        assert kw.get("_auto_retry") is True
+        assert info._api_retry_count == 1
+        assert info.retry_at == 0.0  # cleared on fire
+
+    def test_cancel_prevents_timer_fire(self, session_manager, sm_module, monkeypatch):
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_BASE', 0.3)
+        monkeypatch.setattr(sm_module.SessionManager, '_API_RETRY_JITTER', 0)
+        info = _make_idle_session(sm_module, session_manager, "arm-2")
+
+        recorder = []
+        monkeypatch.setattr(session_manager, 'send_message',
+                            lambda sid, text, **kw: recorder.append((sid, text, kw)) or {"ok": True})
+
+        async def _arm():
+            session_manager._arm_api_retry("arm-2", info)
+        asyncio.run_coroutine_threadsafe(_arm(), session_manager._loop).result(timeout=2)
+        assert info.retry_at > 0
+
+        # Cancel before the (0.3s) timer fires.
+        session_manager.cancel_auto_retry("arm-2")
+        time.sleep(0.6)
+        assert recorder == [], "Cancelled retry should not have resent the message"
+        assert info.retry_at == 0.0
+
+
+# ===========================================================================
+# Structural tests — verify the wiring is in place (no timing dependence)
+# ===========================================================================
+
+class TestStructuralWiring:
+    def test_process_message_flags_transient_retry(self, sm_module):
+        src = inspect.getsource(sm_module.SessionManager._process_message)
+        assert "_api_retry_needed" in src
+        assert "_classify_result_error" in src
+
+    def test_drive_loops_arm_retry(self, sm_module):
+        for meth in (sm_module.SessionManager._drive_session,
+                     sm_module.SessionManager._send_query):
+            src = inspect.getsource(meth)
+            assert "_arm_api_retry" in src, "finally block does not arm API retry"
+            # Must not double-fire when transport self-heal already owns a retry.
+            assert "_stream_heal_needed" in src
+
+    def test_arm_uses_backoff_and_schedules_task(self, sm_module):
+        src = inspect.getsource(sm_module.SessionManager._arm_api_retry)
+        assert "_api_retry_delay" in src
+        assert "create_task" in src
+
+    def test_send_message_has_auto_retry_param(self, sm_module):
+        sig = inspect.signature(sm_module.SessionManager.send_message)
+        assert "_auto_retry" in sig.parameters
+
+    def test_constants_exist(self, sm_module):
+        SM = sm_module.SessionManager
+        assert isinstance(SM._API_RETRY_MAX, int) and SM._API_RETRY_MAX >= 1
+        assert SM._API_RETRY_CAP >= SM._API_RETRY_BASE
+
+
+
+class TestDrainSkipAndResendOriginal:
+    """Regression for two bugs found via live-CLI fault testing:
+    (1) the post-turn listener blocked the arm on the channel-a (is_error
+        RESULT) path — the drive loops must arm directly + skip the drain;
+    (2) re-send the ORIGINAL request when the failed turn produced no output,
+        else the 'continue' prompt makes the model ramble."""
+
+    def test_drive_loops_arm_instead_of_blocking_drain(self, sm_module):
+        # Both drive loops must choose _arm_api_retry over _post_turn_compact_drain
+        # when a retry is flagged, so the listener can't block the arm.
+        for meth in (sm_module.SessionManager._drive_session,
+                     sm_module.SessionManager._send_query):
+            src = inspect.getsource(meth)
+            assert "_api_retry_needed" in src and "_arm_api_retry" in src
+            assert "_post_turn_compact_drain" in src
+            # the arm and the drain must be in the same result-handled block
+            i_arm = src.find("_arm_api_retry(info.session_id")
+            i_drain = src.find("await self._post_turn_compact_drain")
+            assert i_arm != -1 and i_drain != -1 and i_arm < i_drain, \
+                "arm must be chosen before/instead of the blocking drain"
+
+    def test_fire_resends_original_when_no_output(self, session_manager, sm_module):
+        # Transcript has the user request but NO assistant text after it.
+        info = _make_idle_session(sm_module, session_manager, "resend-1",
+                                  user_text="Reply with token ABC123")
+        rec = []
+        with patch.object(session_manager, 'send_message',
+                          side_effect=lambda s, t, **k: rec.append((t, k)) or {"ok": True}):
+            session_manager._fire_api_retry("resend-1", info)
+        assert rec and rec[0][0] == "Reply with token ABC123", \
+            "should re-send the ORIGINAL request when no output was produced"
+        assert rec[0][1].get("_auto_retry") is True
+
+    def test_fire_continues_when_had_output(self, session_manager, sm_module):
+        # Transcript shows the turn already ran a TOOL (side-effectful work) —
+        # so the retry must CONTINUE, not re-send (which would duplicate it).
+        info = _make_idle_session(sm_module, session_manager, "resend-2",
+                                  user_text="Do the big task")
+        info.entries.append(sm_module.LogEntry(kind="tool_use", text=""))
+        info.entries.append(sm_module.LogEntry(kind="tool_result", text="done"))
+        rec = []
+        with patch.object(session_manager, 'send_message',
+                          side_effect=lambda s, t, **k: rec.append((t, k)) or {"ok": True}):
+            session_manager._fire_api_retry("resend-2", info)
+        assert rec and rec[0][0] == sm_module.SessionManager._API_RETRY_CONTINUE_PROMPT, \
+            "should send the continue prompt when the turn had produced output"
+
+
+class TestQueueDuringRetry:
+    """A queued follow-up must wait behind an active auto-retry countdown —
+    the retry is the continuation of the failed turn and must run first."""
+
+    def test_queue_held_while_retry_pending(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "q-1")
+        info.retry_at = time.time() + 30   # countdown active
+        dispatched = []
+        with patch.object(session_manager, '_try_dispatch_queue',
+                          side_effect=lambda sid: dispatched.append(sid)):
+            r = session_manager.queue_message("q-1", "a follow-up")
+        assert r.get("ok") is not False
+        assert dispatched == [], "queued message must NOT dispatch during a retry countdown"
+
+    def test_queue_dispatches_once_retry_cleared(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "q-2")
+        info.retry_at = 0.0   # no countdown -> normal dispatch
+        dispatched = []
+        with patch.object(session_manager, '_try_dispatch_queue',
+                          side_effect=lambda sid: dispatched.append(sid)):
+            session_manager.queue_message("q-2", "a follow-up")
+        assert dispatched, "queued message should dispatch normally when no retry is pending"
+
+    def test_fire_does_not_emit_idle_before_send(self, sm_module):
+        # _fire_api_retry must NOT emit an IDLE state (open queue gate) before
+        # send_message flips to WORKING — otherwise a queued msg races ahead.
+        src = inspect.getsource(sm_module.SessionManager._fire_api_retry)
+        # the send happens; and there is no _emit_state immediately before it
+        assert "send_message(info.session_id, retry_text" in src
+        tail = src[src.rfind("info._api_retry_count += 1"):]
+        assert "_emit_state(info)" not in tail, \
+            "_fire_api_retry must not emit IDLE state before send_message (queue race)"
+
+
+# ===========================================================================
+# Usage limit → continue automatically once it resets
+#
+# The scenario: a long autonomous session hit "You've hit your session limit ·
+# resets 5pm (America/New_York)" at 4:43pm and was still dead after 5pm.  Four
+# gaps stacked: the new wording was not recognised as a limit; even a
+# recognised limit only offered a model switch, never a continue-at-reset; the
+# user's message had been trimmed out of the 200-entry in-memory log, so even
+# the transient fallback refused to retry ("nothing to resume"); and the turn
+# was a notification-triggered auto-resume, whose flagged retry the post-turn
+# listener never armed.
+# ===========================================================================
+
+REAL_LIMIT_TEXT = "You've hit your session limit · resets 5pm (America/New_York)"
+
+
+def _epoch(iso):
+    from datetime import datetime
+    return datetime.fromisoformat(iso).timestamp()
+
+
+class TestUsageLimitAutoResume:
+
+    # ── recognition + reset time ──
+
+    def test_real_cli_wording_is_a_usage_limit(self, sm_module):
+        S = sm_module.SessionManager
+        assert S._classify_result_error("success", REAL_LIMIT_TEXT) == "usage_limit"
+
+    def test_real_cli_wording_resets_at_5pm_new_york(self, sm_module):
+        ok, reset = sm_module.SessionManager._parse_usage_limit(
+            REAL_LIMIT_TEXT, now=_epoch("2026-10-07T16:43:48-04:00"))
+        assert ok is True
+        assert reset == _epoch("2026-10-07T17:00:00-04:00")
+
+    @pytest.mark.parametrize("text, now_iso, expected_iso", [
+        ("You've hit your session limit · resets 5:30pm (America/New_York)",
+         "2026-10-07T16:43:48-04:00", "2026-10-07T17:30:00-04:00"),
+        ("You've hit your weekly limit · resets Oct 9, 5pm (America/New_York)",
+         "2026-10-07T16:43:48-04:00", "2026-10-09T17:00:00-04:00"),
+        # Seen just after the reset: the reset just happened, not "tomorrow".
+        (REAL_LIMIT_TEXT, "2026-10-07T17:00:40-04:00", "2026-10-07T17:00:00-04:00"),
+        # Seen hours later: the next 5pm.
+        (REAL_LIMIT_TEXT, "2026-10-07T21:00:00-04:00", "2026-10-08T17:00:00-04:00"),
+        ("You've hit your session limit · resets 9am (Europe/London)",
+         "2026-10-07T08:00:00+01:00", "2026-10-07T09:00:00+01:00"),
+    ])
+    def test_clock_reset_forms(self, sm_module, text, now_iso, expected_iso):
+        ok, reset = sm_module.SessionManager._parse_usage_limit(text, now=_epoch(now_iso))
+        assert ok is True
+        assert reset == _epoch(expected_iso)
+
+    def test_unknown_zone_falls_back_to_local_time(self, sm_module):
+        from datetime import datetime
+        now = datetime(2026, 10, 7, 16, 43).astimezone().timestamp()
+        ok, reset = sm_module.SessionManager._parse_usage_limit(
+            "You've hit your session limit · resets 5pm (Mars/Olympus_Mons)", now=now)
+        assert ok is True
+        assert reset == datetime(2026, 10, 7, 17, 0).astimezone().timestamp()
+
+    @pytest.mark.parametrize("text", [
+        "You'll hit your session limit soon",
+        "Approaching your session limit",
+        "You are about to hit your weekly limit",
+    ])
+    def test_warnings_are_not_limits(self, sm_module, text):
+        assert sm_module.SessionManager._parse_usage_limit(text)[0] is False
+
+    # ── scheduling the continue ──
+
+    def test_schedule_waits_for_a_known_reset(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "lim-ahead")
+        info.limit_reset_at = time.time() + 1000
+        assert session_manager._schedule_limit_resume(info) is True
+        assert info._api_retry_needed is True
+        assert info.retry_reason == "Usage limit"
+        assert info._limit_resume_at == pytest.approx(
+            info.limit_reset_at + session_manager._LIMIT_RESUME_GRACE)
+
+    def test_schedule_after_a_reset_that_just_passed(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "lim-passed")
+        info.limit_reset_at = time.time() - 30
+        assert session_manager._schedule_limit_resume(info) is True
+        assert info._limit_resume_at == pytest.approx(
+            time.time() + session_manager._LIMIT_JUST_RESET_DELAY, abs=5)
+
+    def test_schedule_backs_off_when_the_passed_reset_keeps_failing(self, session_manager, sm_module):
+        """Rounded/stale reset time: every resume lands on the limit again.
+        Waits must double (2, 4, 8, 16 min, then the probe cap) rather than
+        hitting the wall every 2 minutes until the budget is gone."""
+        info = _make_idle_session(sm_module, session_manager, "lim-stale")
+        S = session_manager
+        waits = []
+        for attempt in range(6):
+            info._api_retry_count = attempt
+            info.limit_reset_at = time.time() - 30
+            assert S._schedule_limit_resume(info) is True
+            waits.append(round(info._limit_resume_at - time.time()))
+        expected = [min(S._LIMIT_PROBE_INTERVAL, S._LIMIT_JUST_RESET_DELAY * 2 ** a)
+                    for a in range(6)]
+        assert waits == pytest.approx(expected, abs=3)
+        assert waits[-1] == pytest.approx(S._LIMIT_PROBE_INTERVAL, abs=3)
+
+    def test_schedule_probes_when_reset_unknown(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "lim-unknown")
+        info.limit_reset_at = 0.0
+        assert session_manager._schedule_limit_resume(info) is True
+        assert info._limit_resume_at == pytest.approx(
+            time.time() + session_manager._LIMIT_PROBE_INTERVAL, abs=5)
+
+    def test_schedule_respects_kill_switch_and_budget(self, session_manager, sm_module, monkeypatch):
+        info = _make_idle_session(sm_module, session_manager, "lim-off")
+        info.limit_reset_at = time.time() + 600
+        monkeypatch.setattr(sm_module.SessionManager, "_LIMIT_AUTO_RESUME", False)
+        assert session_manager._schedule_limit_resume(info) is False
+        monkeypatch.setattr(sm_module.SessionManager, "_LIMIT_AUTO_RESUME", True)
+        info._api_retry_count = session_manager._API_RETRY_MAX
+        assert session_manager._schedule_limit_resume(info) is False
+        assert info._api_retry_needed is False
+
+    def test_schedule_needs_a_turn_to_resume(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="lim-empty", state=sm_module.SessionState.IDLE)
+        info.limit_reset_at = time.time() + 600
+        assert session_manager._schedule_limit_resume(info) is False
+
+    def test_trimmed_log_still_has_a_turn_to_resume(self, session_manager, sm_module):
+        """A long autonomous turn trimmed the user's message out
+        of memory; that must not read as "nothing to resume"."""
+        info = sm_module.SessionInfo(session_id="lim-trim", state=sm_module.SessionState.IDLE)
+        info.entries.append(sm_module.LogEntry(kind="tool_use", text="Bash"))
+        info._entries_trimmed = True
+        assert session_manager._has_user_message(info) is True
+        info.limit_reset_at = time.time() + 600
+        assert session_manager._schedule_limit_resume(info) is True
+
+    # ── arming: wait for the reset, not the backoff ──
+
+    def test_arm_waits_for_reset_instead_of_backoff(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "lim-arm")
+        info._api_retry_needed = True
+        info.retry_reason = "Usage limit"
+        target = time.time() + 1800
+        info._limit_resume_at = target
+        try:
+            session_manager._arm_api_retry(info.session_id, info)
+            assert target <= info.retry_at <= target + 31   # + spread, not a 10s backoff
+            assert info._limit_resume_at == 0.0               # consumed
+            assert info.retry_attempt == 1
+            assert any("continuing automatically" in (e.text or "") for e in info.entries)
+        finally:
+            session_manager._clear_api_retry(info, reset_count=True)
+
+    def test_arm_flagged_retry_from_post_turn_listener(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "lim-listener")
+        assert session_manager._arm_flagged_retry(info.session_id, info) is False  # nothing flagged
+        info._api_retry_needed = True
+        info.retry_reason = "Usage limit"
+        info._limit_resume_at = time.time() + 600
+        try:
+            assert session_manager._arm_flagged_retry(info.session_id, info) is True
+            assert info.retry_at > time.time() + 500
+        finally:
+            session_manager._clear_api_retry(info, reset_count=True)
+        info._api_retry_needed = True
+        info._stream_heal_needed = True                       # self-heal owns it
+        assert session_manager._arm_flagged_retry(info.session_id, info) is False
+
+    def test_post_turn_listener_arms_what_auto_resume_turns_flag(self, sm_module):
+        """Notification-triggered turns never reach _send_query/_drive_session's
+        finally blocks; the listener must arm their flagged retries (both at
+        its start, for the drain's peek phase, and after each RESULT)."""
+        src = inspect.getsource(sm_module.SessionManager._extended_post_turn_listener)
+        assert src.count("self._arm_flagged_retry(session_id, info)") >= 2
+
+    # ── firing ──
+
+    def test_fire_with_trimmed_log_continues_instead_of_giving_up(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="lim-fire", state=sm_module.SessionState.IDLE)
+        info._entries_trimmed = True
+        with session_manager._lock:
+            session_manager._sessions[info.session_id] = info
+        info.retry_at = time.time() + 1
+        sent = []
+
+        def fake_send(sid, text, **kw):
+            sent.append((sid, text, kw))
+            return {"ok": True}
+
+        with patch.object(session_manager, "send_message", side_effect=fake_send):
+            session_manager._fire_api_retry(info.session_id, info)
+        assert sent and sent[0][1] == session_manager._API_RETRY_CONTINUE_PROMPT
+        assert sent[0][2].get("_auto_retry") is True
+        assert info.error != "Session ended with error"
+
+    # ── the scenario end to end, through _process_message ──
+
+    def test_limit_result_in_a_long_turn_schedules_the_continue(self, session_manager, sm_module):
+        from engine.backends.messages import MessageKind, VibeNodeMessage
+        info = sm_module.SessionInfo(session_id="lim-e2e", state=sm_module.SessionState.WORKING)
+        info.model = "claude-fable-5-1"
+        info.entries.append(sm_module.LogEntry(kind="tool_use", text="Bash"))
+        info._entries_trimmed = True                          # user message trimmed away
+        with session_manager._lock:
+            session_manager._sessions[info.session_id] = info
+        msg = VibeNodeMessage(kind=MessageKind.RESULT, is_error=True, subtype="success",
+                              data={"result": REAL_LIMIT_TEXT}, session_id=info.session_id)
+        asyncio.run_coroutine_threadsafe(
+            session_manager._process_message(info.session_id, msg), session_manager._loop
+        ).result(10)
+        assert info.limited_model == "claude-fable-5-1"
+        assert info.limit_reset_at > 0
+        assert info._api_retry_needed is True
+        assert info._limit_resume_at >= info.limit_reset_at
+        assert info.error != "Session ended with error"
+        # A "session limit" binds every model: a Fable session waits for the
+        # reset rather than switching (TestUsageLimitAutoSwitch).
+        assert info.limit_switch_to == ""
+
+    def test_exception_channel_schedules_the_continue(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "lim-exc")
+        assert session_manager._flag_api_retry_if_transient(info, REAL_LIMIT_TEXT) is True
+        assert info.limit_reset_at > 0
+        assert info._limit_resume_at > 0
+
+
+# ===========================================================================
+# A Fable limit switches to the newest Opus and keeps going
+#
+# When a Fable session hits its usage limit, switch to Opus and
+# continue instead of waiting days for the reset, for every future Fable and
+# Opus version, defaulting to the most recent Opus.  Keyed by family; the
+# target comes from the session's own CLI (its "opus" alias resolves to the
+# CLI's newest Opus), else from VibeNode's model list.  Only a limit that binds
+# the model ("Fable limit") switches; the 5-hour "session limit" and the
+# "weekly limit" bind every model.  If Opus then hits its own limit, the
+# session continues on whichever model resets first.  The switch rides the
+# auto-retry countdown (visible, cancellable) and falls back to the
+# continue-at-reset plan when it fails.
+# ===========================================================================
+
+# What CLI 2.1.291 reported in its initialize response (probed).
+CLI_MODELS = [
+    {"value": "default", "resolvedModel": "claude-opus-5-5"},
+    {"value": "opus", "resolvedModel": "claude-opus-5-5"},
+    {"value": "fable", "resolvedModel": "claude-fable-5-1"},
+    {"value": "sonnet", "resolvedModel": "claude-sonnet-5-5"},
+    {"value": "haiku", "resolvedModel": "claude-haiku-4-5-20251001"},
+    {"value": "claude-opus-5", "resolvedModel": "claude-opus-5"},
+    {"value": "claude-fable-5", "resolvedModel": "claude-fable-5"},
+    {"value": "claude-opus-4-8", "resolvedModel": "claude-opus-4-8"},
+]
+FABLE_LIMIT_TEXT = "You've hit your Fable limit · resets Oct 12, 9am (America/New_York)"
+DAY = 24 * 3600
+
+
+def _limited(sm_module, manager, sid, model="claude-fable-5-1", reset_in=3 * DAY,
+             scope="model"):
+    """An idle session just stopped by a usage limit on ``model``."""
+    info = _make_idle_session(sm_module, manager, sid)
+    info.model = model
+    info.limited_model = model
+    info.limit_reset_at = time.time() + reset_in
+    info._limit_scope = scope
+    info.client = object()
+    return info
+
+
+def _run(manager, coro, timeout=10):
+    return asyncio.run_coroutine_threadsafe(coro, manager._loop).result(timeout)
+
+
+class TestUsageLimitAutoSwitch:
+
+    # ── which limits switch ──
+
+    @pytest.mark.parametrize("text, scope", [
+        (FABLE_LIMIT_TEXT, "model"),
+        ("You've hit your Opus limit · resets Oct 14, 9am (America/New_York)", "model"),
+        (REAL_LIMIT_TEXT, "account"),                              # "session limit"
+        ("You've hit your weekly limit · resets Oct 9, 5pm (America/New_York)", "account"),
+        ("You've hit your usage credit limit", "account"),
+        ("You've hit your monthly spend limit.", "account"),
+        ("You've hit your team's shared budget. /model to switch models.", "account"),
+        ("Usage limit reached", ""),
+    ])
+    def test_limit_scope_follows_the_clis_names(self, session_manager, text, scope):
+        assert session_manager._limit_scope(text) == scope
+
+    @pytest.mark.parametrize("text, family, scope", [
+        # Another model's limit says nothing about this one.
+        ("You've hit your Opus limit · resets Oct 14, 9am (America/New_York)", "fable", ""),
+        ("You've hit your Opus limit · resets Oct 14, 9am (America/New_York)", "opus", "model"),
+        # A model name next to "limit" wins over a window word around it.
+        ("Opus weekly limit reached", "opus", "model"),
+        ("You've hit your weekly Fable limit", "fable", "model"),
+        ("Your Max plan's Fable limit is used up", "fable", "model"),
+        ("Credit balance is too low", "fable", "account"),
+    ])
+    def test_limit_scope_for_the_sessions_family(self, session_manager, text, family, scope):
+        assert session_manager._limit_scope(text, family) == scope
+
+    def test_account_wide_limits_never_switch(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-acct", scope="account")
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(info) is None
+
+    def test_unknown_wording_asks_the_usage_tracker(self, session_manager, sm_module):
+        """A limit that names no window: if both account windows still have
+        room, the one that was hit must be the model's own."""
+        info = _limited(sm_module, session_manager, "sw-unknown", scope="")
+        now = time.time()
+        future = now + DAY
+
+        def state(five=0.4, seven=0.7, resets=future, seen=now):
+            return {"windows": {
+                "five_hour": {"utilization": five, "resets_at": resets, "seen_at": seen},
+                "seven_day": {"utilization": seven, "resets_at": resets, "seen_at": seen}}}
+
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            session_manager._usage_state = state()
+            assert session_manager._limit_switch_plan(info)[0] == "claude-opus-5-5"
+            for blocked in (state(five=1.0), {},
+                            state(seen=now - 3600),              # too old to vouch for now
+                            state(resets=now - 60)):             # a window that has ended
+                session_manager._usage_state = blocked
+                assert session_manager._limit_switch_plan(info) is None
+
+    def test_switch_back_needs_a_recognised_model_limit(self, session_manager, sm_module):
+        """On wording that names no window, two models must not trade places
+        every probe interval on a limit neither can pass."""
+        info = _limited(sm_module, session_manager, "sw-no-pingpong", model="claude-opus-5-5",
+                        reset_in=0, scope="")
+        info.limit_reset_at = 0.0                                 # no reset time stated
+        info._limit_origin = "claude-fable-5-1"
+        info._limit_until["fable"] = time.time() - 10            # Fable looks free
+        now = time.time()
+        session_manager._usage_state = {"windows": {
+            k: {"utilization": 0.2, "resets_at": now + DAY, "seen_at": now}
+            for k in ("five_hour", "seven_day")}}
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(info) is None
+            info._limit_scope = "model"
+            assert session_manager._limit_switch_plan(info)[0] == "claude-fable-5-1"
+
+    @pytest.mark.parametrize("limited", ["claude-opus-5-5", "claude-sonnet-5", "claude-haiku-4-5", ""])
+    def test_only_fable_switches(self, session_manager, sm_module, limited):
+        info = _limited(sm_module, session_manager, "sw-other", model=limited)
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(info) is None
+
+    @pytest.mark.parametrize("switch", ["_LIMIT_AUTO_SWITCH", "_LIMIT_AUTO_RESUME"])
+    def test_kill_switches(self, session_manager, sm_module, monkeypatch, switch):
+        monkeypatch.setattr(sm_module.SessionManager, switch, False)
+        info = _limited(sm_module, session_manager, "sw-off")
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(info) is None
+
+    def test_a_reset_that_just_passed_does_not_switch(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-passed", reset_in=-30)
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(info) is None
+
+    # ── choosing the target ──
+
+    def test_target_is_the_clis_own_newest_opus(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-alias")
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._newest_model_of(info, "opus") == "claude-opus-5-5"
+            plan = session_manager._limit_switch_plan(info)
+        assert plan[0] == "claude-opus-5-5"
+        assert plan[1] == pytest.approx(time.time() + session_manager._LIMIT_SWITCH_DELAY, abs=2)
+
+    def test_target_covers_future_versions(self, session_manager, sm_module):
+        """No ids in the code: a future Opus is the target, from the alias and
+        from a plain list without one."""
+        info = _limited(sm_module, session_manager, "sw-future", model="claude-fable-6")
+        future = [{"value": "opus", "resolvedModel": "claude-opus-6-1"}]
+        with patch.object(session_manager._sdk, "supported_models", return_value=future):
+            assert session_manager._limit_switch_plan(info)[0] == "claude-opus-6-1"
+        no_alias = [{"value": m, "resolvedModel": m} for m in
+                    ("claude-opus-5-5", "claude-opus-6", "claude-opus-6-2-20270101",
+                     "claude-opus-6-2", "claude-sonnet-7")]
+        with patch.object(session_manager._sdk, "supported_models", return_value=no_alias):
+            assert session_manager._newest_model_of(info, "opus") == "claude-opus-6-2"
+
+    def test_target_falls_back_to_vibenode_models(self, session_manager, sm_module):
+        """A CLI that does not report its models: VibeNode's own list."""
+        info = _limited(sm_module, session_manager, "sw-list")
+        with patch.object(session_manager._sdk, "supported_models", return_value=[]), \
+             patch.object(session_manager, "_known_models",
+                          return_value=["claude-fable-5-1", "claude-opus-5", "claude-opus-5-5",
+                                        "claude-opus-5-20260601", "claude-sonnet-5-5"]):
+            assert session_manager._newest_model_of(info, "opus") == "claude-opus-5-5"
+
+    def test_an_alias_without_a_resolved_id_is_used_as_is(self, session_manager, sm_module):
+        """The CLI resolves it; _apply_limit_switch reads back what it ran."""
+        info = _limited(sm_module, session_manager, "sw-bare-alias")
+        listed = [{"value": "opus"}, {"value": "claude-opus-5", "resolvedModel": "claude-opus-5"}]
+        with patch.object(session_manager._sdk, "supported_models", return_value=listed):
+            assert session_manager._newest_model_of(info, "opus") == "opus"
+            # A 1M session keeps 1M on the alias too (CLI 2.1.291 accepts
+            # "opus[1m]" and runs claude-opus-5-5[1m]).
+            info.limited_model = "claude-fable-5-1[1m]"
+            assert session_manager._newest_model_of(info, "opus") == "opus[1m]"
+
+    def test_a_1m_session_stays_1m(self, session_manager, sm_module):
+        """Its context may not fit in 200K.  A marker already on the resolved
+        id is not doubled, and is not added to a session that had none."""
+        info = _limited(sm_module, session_manager, "sw-1m", model="claude-fable-5-1[1m]")
+        marked = [{"value": "opus", "resolvedModel": "claude-opus-5-5[1m]"}]
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._newest_model_of(info, "opus") == "claude-opus-5-5[1m]"
+        with patch.object(session_manager._sdk, "supported_models", return_value=marked):
+            assert session_manager._newest_model_of(info, "opus") == "claude-opus-5-5[1m]"
+            info.limited_model = "claude-fable-5-1"
+            assert session_manager._newest_model_of(info, "opus") == "claude-opus-5-5"
+
+    def test_model_helpers(self, sm_module):
+        S = sm_module.SessionManager
+        assert S._model_family("claude-fable-5-1[1m]") == "fable"
+        assert S._model_version("claude-opus-5") == (5, 0)
+        assert S._model_version("claude-haiku-4-5-20251001") == (4, 5)
+        assert S._model_version("claude-opus-4-20250514") == (4, 0)   # not 4.20250514
+        assert S._model_label("claude-opus-4-20250514") == "Opus 4"
+        assert S._model_label("claude-opus-5-5[1m]") == "Opus 5.5"
+        assert S._model_label("opus") == "Opus"
+        assert S._model_label("opus[1m]") == "Opus"
+        assert S._model_family("opus[1m]") == "opus"
+        assert S._model_family("default") == ""
+        assert S._newest_in_family(["claude-opus-5-5", "claude-opus-5-20260601"], "opus") \
+            == "claude-opus-5-5"
+        assert S._newest_in_family(["opus", "claude-opus-5"], "opus") == "claude-opus-5"
+
+    # ── when Opus is limited too: whichever model resets first ──
+
+    def test_opus_limit_goes_back_to_fable_when_fable_resets_first(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-back", model="claude-opus-5-5",
+                        reset_in=4 * DAY)
+        info._limit_origin = "claude-fable-5-1"
+        fable_free = time.time() + 2 * DAY
+        info._limit_until["fable"] = fable_free
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            plan = session_manager._limit_switch_plan(info)
+        assert plan == ("claude-fable-5-1", fable_free)
+
+    def test_opus_limit_waits_when_opus_resets_first(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-stay", model="claude-opus-5-5",
+                        reset_in=1 * DAY)
+        info._limit_origin = "claude-fable-5-1"
+        info._limit_until["fable"] = time.time() + 4 * DAY
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(info) is None
+
+    def test_an_origin_that_has_reset_is_switched_back_to_now(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-back-now", model="claude-opus-5-5")
+        info._limit_origin = "claude-fable-5-1"
+        info._limit_until["fable"] = time.time() - 10
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            plan = session_manager._limit_switch_plan(info)
+        assert plan[0] == "claude-fable-5-1"
+        assert plan[1] == pytest.approx(time.time() + session_manager._LIMIT_SWITCH_DELAY, abs=2)
+
+    def test_a_known_limited_opus_is_only_used_if_it_frees_up_first(self, session_manager, sm_module):
+        opus_free = time.time() + 1 * DAY
+        soon = _limited(sm_module, session_manager, "sw-wait", reset_in=3 * 3600)
+        soon._limit_until["opus"] = opus_free
+        later = _limited(sm_module, session_manager, "sw-later", reset_in=3 * DAY)
+        later._limit_until["opus"] = opus_free
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(soon) is None      # Fable back in 3h
+            assert session_manager._limit_switch_plan(later) == ("claude-opus-5-5", opus_free)
+
+    # ── scheduling and arming ──
+
+    def test_schedule_switches_instead_of_waiting_for_the_reset(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-sched")
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._schedule_limit_resume(info) is True
+        assert info.limit_switch_to == "claude-opus-5-5"
+        assert info._api_retry_needed is True
+        assert info.retry_reason == "Switching to Opus 5.5"
+        assert info._limit_resume_at == pytest.approx(
+            time.time() + session_manager._LIMIT_SWITCH_DELAY, abs=2)
+        assert info.to_state_dict()["limit_switch_to"] == "claude-opus-5-5"
+
+    def test_switch_still_needs_a_turn_and_budget(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-budget")
+        info._api_retry_count = session_manager._API_RETRY_MAX
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._schedule_limit_resume(info) is False
+        assert info.limit_switch_to == ""
+
+    def test_arm_counts_down_to_the_switch_without_the_spread(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-arm")
+        info.limit_switch_to = "claude-opus-5-5"
+        info._api_retry_needed = True
+        info._limit_resume_at = time.time() + 5
+        try:
+            session_manager._arm_api_retry(info.session_id, info)
+            assert info.retry_at == pytest.approx(time.time() + 5, abs=2)   # no 30s spread
+            assert any("Fable 5.1 hit its usage limit. Switching to Opus 5.5 and continuing"
+                       in (e.text or "") for e in info.entries)
+        finally:
+            session_manager._clear_api_retry(info, reset_count=True)
+        assert info.limit_switch_to == ""                     # cleared with the countdown
+
+    def test_arm_says_when_a_switch_back_waits_for_a_reset(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-arm-back", model="claude-opus-5-5")
+        info.limit_switch_to = "claude-fable-5-1"
+        info._api_retry_needed = True
+        info._limit_resume_at = time.time() + 2 * 3600
+        try:
+            session_manager._arm_api_retry(info.session_id, info)
+            assert any("Switching to Fable 5.1 when its limit resets" in (e.text or "")
+                       for e in info.entries)
+        finally:
+            session_manager._clear_api_retry(info, reset_count=True)
+
+    def test_a_skipped_arm_drops_the_plan(self, session_manager, sm_module):
+        """A newer turn supersedes the retry; a later, unrelated error must not
+        inherit its limit wait or its switch."""
+        info = _limited(sm_module, session_manager, "sw-skip")
+        info.state = sm_module.SessionState.WORKING
+        info.limit_switch_to = "claude-opus-5-5"
+        info._limit_resume_at = time.time() + 5
+        session_manager._arm_api_retry(info.session_id, info)
+        assert info.retry_at == 0.0
+        assert info._limit_resume_at == 0.0 and info.limit_switch_to == ""
+
+    # ── the switch itself ──
+
+    def test_switch_confirms_then_resumes_the_turn(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-go")
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = time.time() + 1
+        pushes, sent = [], []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+
+        def fake_send(sid, text, **kw):
+            sent.append((sid, text, kw))
+            return {"ok": True}
+
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()) as set_model, \
+             patch.object(session_manager, "send_message", side_effect=fake_send):
+            _run(session_manager, session_manager._switch_then_fire(info.session_id, info))
+        set_model.assert_awaited_once()
+        assert set_model.await_args.args[1] == "claude-opus-5-5"
+        assert info.model == "claude-opus-5-5"
+        assert info.limited_model == "" and info.limit_switch_to == "" and info.error == ""
+        assert info._limit_origin == "claude-fable-5-1"         # Opus limit later: back to it
+        assert info._model_switch_in_progress is True            # the resumed turn clears it
+        ev = [d for n, d in pushes if n == "session_model_changed"]
+        assert ev and ev[-1]["model"] == "claude-opus-5-5" and ev[-1]["limited_model"] == ""
+        assert any(e.text == "Switched to Opus 5.5." for e in info.entries)
+        # The interrupted request is re-sent (no tool ran yet), as an auto-retry.
+        assert sent and sent[0][1] == "do the thing" and sent[0][2].get("_auto_retry") is True
+
+    def test_switching_back_clears_the_origin(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-home", model="claude-opus-5-5")
+        info._limit_origin = "claude-fable-5-1"
+        info.limit_switch_to = "claude-fable-5-1"
+        info.retry_at = time.time() + 1
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()), \
+             patch.object(session_manager, "send_message", return_value={"ok": True}):
+            _run(session_manager, session_manager._switch_then_fire(info.session_id, info))
+        assert info.model == "claude-fable-5-1" and info._limit_origin == ""
+
+    def test_an_alias_switch_records_what_the_cli_ran(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-readback")
+        info.limit_switch_to = "opus"
+        info.retry_at = time.time() + 1
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()), \
+             patch.object(session_manager._sdk, "applied_model",
+                          new=AsyncMock(return_value="claude-opus-5-5")), \
+             patch.object(session_manager, "send_message", return_value={"ok": True}):
+            _run(session_manager, session_manager._switch_then_fire(info.session_id, info))
+        assert info.model == "claude-opus-5-5"
+
+    def test_failed_switch_waits_for_the_reset_instead(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-fail")
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = time.time() + 1
+        sent = []
+        try:
+            with patch.object(session_manager._sdk, "set_model",
+                              new=AsyncMock(side_effect=Exception("model not supported"))), \
+                 patch.object(session_manager, "send_message",
+                              side_effect=lambda *a, **k: sent.append(a) or {"ok": True}):
+                _run(session_manager, session_manager._switch_then_fire(info.session_id, info))
+            assert sent == []
+            assert info.model == "claude-fable-5-1" and info.limited_model == "claude-fable-5-1"
+            assert info.limit_switch_to == ""
+            assert info._model_switch_in_progress is False
+            reset_wait = info.limit_reset_at + session_manager._LIMIT_RESUME_GRACE
+            assert reset_wait <= info.retry_at <= reset_wait + 31
+            assert any("Could not switch to Opus 5.5" in (e.text or "") for e in info.entries)
+        finally:
+            session_manager._clear_api_retry(info, reset_count=True)
+
+    def test_cancel_during_the_switch_does_not_resend(self, session_manager, sm_module):
+        """Cancel (or Stop, or Sleep) lands while the control request is out."""
+        info = _limited(sm_module, session_manager, "sw-cancel-mid")
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = time.time() + 1
+        sent = []
+
+        async def set_model_then_cancel(client, model):
+            session_manager._clear_api_retry(info, reset_count=True)
+
+        with patch.object(session_manager._sdk, "set_model", new=set_model_then_cancel), \
+             patch.object(session_manager, "send_message",
+                          side_effect=lambda *a, **k: sent.append(a) or {"ok": True}):
+            _run(session_manager, session_manager._switch_then_fire(info.session_id, info))
+        assert sent == []
+        assert info.model == "claude-opus-5-5"                  # the CLI did switch: recorded
+
+    def test_a_manual_switch_supersedes_a_pending_auto_switch(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-manual")
+        info.limit_switch_to = "claude-opus-5-5"
+        info._limit_origin = "claude-fable-5"
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()):
+            assert session_manager.set_session_model(info.session_id, "claude-sonnet-5")["ok"] is True
+        assert info.limit_switch_to == "" and info._limit_origin == ""
+        assert info.model == "claude-sonnet-5"
+
+    def test_a_failed_manual_switch_keeps_the_auto_switch(self, session_manager, sm_module):
+        """The pick did not happen, so the countdown still switches."""
+        info = _limited(sm_module, session_manager, "sw-manual-fail")
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = time.time() + 5
+        with patch.object(session_manager._sdk, "set_model",
+                          new=AsyncMock(side_effect=Exception("model not supported"))):
+            assert session_manager.set_session_model(info.session_id, "claude-sonnet-5")["ok"] is False
+        assert info.limit_switch_to == "claude-opus-5-5"
+        # ... but not once the countdown is gone (Cancel meanwhile).
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = 0.0
+        with patch.object(session_manager._sdk, "set_model",
+                          new=AsyncMock(side_effect=Exception("model not supported"))):
+            session_manager.set_session_model(info.session_id, "claude-sonnet-5")
+        assert info.limit_switch_to == ""
+
+    def test_an_earlier_manual_pick_does_not_suppress_a_later_switch(self, session_manager, sm_module):
+        """The user picks Fable again while it is still limited: the next Fable
+        limit must switch to Opus, not resend on Fable."""
+        info = _limited(sm_module, session_manager, "sw-repick")
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()):
+            assert session_manager.set_session_model(info.session_id, "claude-fable-5-1")["ok"] is True
+        info.limited_model = info.model
+        info.limit_reset_at = time.time() + DAY
+        info._limit_scope = "model"
+        info.retry_at = time.time() + 1
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._schedule_limit_resume(info) is True
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()) as set_model, \
+             patch.object(session_manager, "send_message", return_value={"ok": True}):
+            _run(session_manager, session_manager._switch_then_fire(info.session_id, info))
+        set_model.assert_awaited_once()
+        assert info.model == "claude-opus-5-5"
+
+    def test_timer_switches_then_continues(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-timer")
+        session_manager._LIMIT_SWITCH_MIN_DELAY_S = 0.05
+        info.limit_switch_to = "claude-opus-5-5"
+        info._api_retry_needed = True
+        info._limit_resume_at = time.time() + 0.05
+        sent = []
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()), \
+             patch.object(session_manager, "send_message",
+                          side_effect=lambda sid, text, **kw: sent.append(text) or {"ok": True}):
+            session_manager._arm_api_retry(info.session_id, info)
+            wait_for(lambda: sent, timeout=6)
+        assert info.model == "claude-opus-5-5"
+
+    def test_retry_now_switches_first(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-now")
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = time.time() + 600
+        sent = []
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()) as set_model, \
+             patch.object(session_manager, "send_message",
+                          side_effect=lambda sid, text, **kw: sent.append(text) or {"ok": True}):
+            assert session_manager.retry_now(info.session_id)["ok"] is True
+            wait_for(lambda: sent, timeout=5)
+        set_model.assert_awaited_once()
+        assert info.model == "claude-opus-5-5"
+
+    def test_cancel_falls_back_to_waiting_for_the_reset(self, session_manager, sm_module):
+        """Cancel during "switching to Opus in 5s" means "don't switch"."""
+        info = _limited(sm_module, session_manager, "sw-cancel")
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = time.time() + 5
+        try:
+            assert session_manager.cancel_auto_retry(info.session_id)["ok"] is True
+            assert info.limit_switch_to == ""
+            assert info.limited_model == "claude-fable-5-1"        # the CTA stays
+            reset_wait = info.limit_reset_at + session_manager._LIMIT_RESUME_GRACE
+            assert reset_wait <= info.retry_at <= reset_wait + 31
+            assert any("Not switching models" in (e.text or "") for e in info.entries)
+        finally:
+            session_manager._clear_api_retry(info, reset_count=True)
+
+    # ── end to end through _process_message ──
+
+    def test_fable_limit_result_schedules_the_switch(self, session_manager, sm_module):
+        from engine.backends.messages import MessageKind, VibeNodeMessage
+        info = sm_module.SessionInfo(session_id="sw-e2e", state=sm_module.SessionState.WORKING)
+        info.model = "claude-fable-5-1"
+        info.client = object()
+        info.entries.append(sm_module.LogEntry(kind="user", text="build it"))
+        with session_manager._lock:
+            session_manager._sessions[info.session_id] = info
+        msg = VibeNodeMessage(kind=MessageKind.RESULT, is_error=True, subtype="success",
+                              data={"result": FABLE_LIMIT_TEXT}, session_id=info.session_id)
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            _run(session_manager, session_manager._process_message(info.session_id, msg))
+        assert info.limited_model == "claude-fable-5-1"
+        assert info._limit_scope == "model"
+        assert info.limit_switch_to == "claude-opus-5-5"
+        assert info._api_retry_needed is True
+        assert info._limit_resume_at < info.limit_reset_at     # now, not at the reset

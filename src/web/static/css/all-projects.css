@@ -1,0 +1,28 @@
+/* All projects view (src/web/static/js/all-projects.js): a project pill on each card
+   and row of the left menu.  Neutral on purpose: colour on these cards means
+   status, so the pill never takes a colour of its own. */
+
+.project-item-all .project-item-mark { background: none; border: 1px dashed var(--text-faint); color: var(--text-secondary); }
+
+.vn-ap .vn-ap-label {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%; box-sizing: border-box;
+  padding: 1px 7px 1px 2px; border-radius: 999px; font-size: 10.5px; font-weight: 500; line-height: 15px;
+  color: var(--text-muted); background: var(--bg-hover); border: 1px solid var(--border-secondary);
+  white-space: nowrap; vertical-align: middle;
+}
+.vn-ap .vn-ap-ic {
+  flex: none; width: 13px; height: 13px; box-sizing: border-box; border-radius: 4px; display: grid; place-items: center;
+  font-size: 8.5px; font-weight: 700; line-height: 1; color: var(--text-secondary); border: 1px solid var(--text-faint);
+}
+.vn-ap .vn-ap-nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* card: the pill gets its own line, and the card grows by it so the title keeps two lines */
+.vn-ap > .wf-card[data-sid] { height: 156px; }
+.vn-ap > .wf-card > .vn-ap-label { display: flex; width: fit-content; margin: 4px auto 1px; max-width: calc(100% - 12px); }
+
+/* list: the narrow column keeps the title; the pill shrinks to its tile (name on hover) */
+.vn-ap > .session-item .session-col-name { display: flex; align-items: center; min-width: 0; }
+.vn-ap > .session-item .session-col-name > * { flex: none; }
+.vn-ap > .session-item .session-col-name > .vn-ap-t { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vn-ap > .session-item .vn-ap-label { flex: none; margin-left: 6px; padding: 1px; border: 0; background: none; }
+.vn-ap > .session-item .vn-ap-nm { display: none; }

@@ -1,0 +1,989 @@
+"""
+Tests for src/engine/session_registry.py -- persistent session registry for
+crash recovery.
+
+This is CRITICAL crash-recovery code.  SessionRegistry saves active
+session state to disk so that if the daemon crashes, it can recover
+sessions that were mid-task.  A bug here could:
+
+- Lose all active sessions on crash (if save fails silently)
+- Recover sessions that should NOT be recovered (idle, stopped, stale)
+- Fail to recover sessions that SHOULD be recovered (working, waiting)
+- Corrupt the registry file (non-atomic write)
+
+Sections:
+  1. load_registry
+  2. save_registry_now (atomic write)
+  3. schedule_registry_save (debounce)
+  4. recover_sessions (the critical path)
+  5. cancel_timer
+"""
+
+import json
+import os
+import time
+import threading
+import pytest
+from pathlib import Path
+from unittest.mock import MagicMock, patch, call
+
+from engine.session_registry import SessionRegistry, REGISTRY_PATH, MAX_RECOVERY_AGE
+
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+def _write_registry(path, sessions):
+    """Write a registry JSON file with the given sessions dict."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"sessions": sessions}, indent=2),
+                    encoding="utf-8")
+
+
+# =========================================================================
+# Section 1: load_registry
+# =========================================================================
+
+
+class TestLoadRegistry:
+    """Test reading the session registry from disk.
+
+    The registry must be resilient to missing, empty, and corrupted files
+    since the daemon could crash at any point during a write.
+    """
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        """Missing registry file returns empty sessions dict.
+
+        WHY: On first launch or after manual deletion, there are no
+        sessions to recover.  Returning a non-dict or raising would
+        crash the recovery logic.
+        """
+        reg = SessionRegistry()
+        with patch.object(
+            type(reg), 'load_registry',
+            wraps=reg.load_registry
+        ):
+            # Patch REGISTRY_PATH to point to a nonexistent file
+            with patch('engine.session_registry.REGISTRY_PATH',
+                       tmp_path / "nonexistent.json"):
+                result = reg.load_registry()
+        assert result == {"sessions": {}}
+
+    def test_malformed_json_returns_empty(self, tmp_path):
+        """Corrupted JSON falls back to empty sessions dict.
+
+        WHY: A crash during save_registry_now could leave a partial
+        JSON file.  The recovery logic must not crash on bad data.
+        """
+        reg = SessionRegistry()
+        bad_file = tmp_path / "bad_registry.json"
+        bad_file.write_text("{this is not valid json!!", encoding="utf-8")
+        with patch('engine.session_registry.REGISTRY_PATH', bad_file):
+            result = reg.load_registry()
+        assert result == {"sessions": {}}
+
+    def test_valid_json_returns_correct_structure(self, tmp_path):
+        """Valid registry file returns the correct dict structure.
+
+        WHY: The most basic happy path -- the registry must be read
+        correctly for recovery to work at all.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        sessions = {
+            "sess-1": {"name": "Test", "state": "working", "cwd": "/tmp"},
+            "sess-2": {"name": "Other", "state": "idle", "cwd": "/home"},
+        }
+        _write_registry(registry_file, sessions)
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            result = reg.load_registry()
+        assert "sessions" in result
+        assert len(result["sessions"]) == 2
+        assert result["sessions"]["sess-1"]["name"] == "Test"
+
+    def test_json_without_sessions_key_returns_empty(self, tmp_path):
+        """JSON that is valid but missing 'sessions' key returns empty.
+
+        WHY: An old or corrupted file format must not crash recovery.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        registry_file.write_text('{"version": 1}', encoding="utf-8")
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            result = reg.load_registry()
+        assert result == {"sessions": {}}
+
+    def test_non_dict_json_returns_empty(self, tmp_path):
+        """JSON that is valid but not a dict returns empty.
+
+        WHY: A file containing just a list or string must not crash.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        registry_file.write_text('["not", "a", "dict"]', encoding="utf-8")
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            result = reg.load_registry()
+        assert result == {"sessions": {}}
+
+
+# =========================================================================
+# Section 2: save_registry_now
+# =========================================================================
+
+
+class TestSaveRegistryNow:
+    """Test atomic writing of the session registry.
+
+    The save MUST be atomic (write to temp file, then rename) so that
+    a crash mid-write never leaves a corrupt registry that prevents
+    recovery of ALL sessions.
+    """
+
+    def test_basic_save_and_load_roundtrip(self, tmp_path):
+        """Save followed by load returns the same data.
+
+        WHY: The most fundamental requirement -- data must survive
+        a save/load cycle or crash recovery is completely broken.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        snapshot = {
+            "sess-1": {"name": "Test", "state": "working", "cwd": "/tmp"},
+        }
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.save_registry_now(snapshot)
+            result = reg.load_registry()
+        assert result["sessions"]["sess-1"]["name"] == "Test"
+        assert result["sessions"]["sess-1"]["state"] == "working"
+
+    def test_correct_snapshot_format(self, tmp_path):
+        """Saved file has the expected JSON structure.
+
+        WHY: The format must include the top-level 'sessions' key
+        that load_registry expects.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        snapshot = {"s1": {"name": "A"}, "s2": {"name": "B"}}
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.save_registry_now(snapshot)
+        data = json.loads(registry_file.read_text(encoding="utf-8"))
+        assert "sessions" in data
+        assert len(data["sessions"]) == 2
+        assert data["sessions"]["s1"]["name"] == "A"
+
+    def test_creates_parent_directory(self, tmp_path):
+        """save_registry_now creates parent directories if needed.
+
+        WHY: On first run, ~/.claude/ may not exist yet.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "subdir" / "registry.json"
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.save_registry_now({"s1": {"name": "Test"}})
+        assert registry_file.exists()
+
+    def test_overwrites_existing_file(self, tmp_path):
+        """Saving overwrites the existing registry (via atomic replace).
+
+        WHY: The registry must reflect current state, not accumulate
+        historical data.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.save_registry_now({"s1": {"name": "First"}})
+            reg.save_registry_now({"s2": {"name": "Second"}})
+            result = reg.load_registry()
+        assert "s1" not in result["sessions"]
+        assert result["sessions"]["s2"]["name"] == "Second"
+
+    def test_empty_snapshot(self, tmp_path):
+        """Saving an empty snapshot writes a valid but empty registry.
+
+        WHY: When all sessions end, the registry should be cleared.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.save_registry_now({})
+            result = reg.load_registry()
+        assert result["sessions"] == {}
+
+
+# =========================================================================
+# Section 3: schedule_registry_save (debounce)
+# =========================================================================
+
+
+class TestScheduleRegistrySave:
+    """Test the debounced save mechanism.
+
+    Multiple rapid state changes should batch into a single disk write.
+    Without debouncing, every session state change hits disk, which can
+    cause I/O contention under load.
+
+    The tests shrink the 3s production window to 0.2s so they don't sleep
+    through it; the window's real value is pinned separately below.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _short_debounce(self, monkeypatch):
+        monkeypatch.setattr(SessionRegistry, "_SAVE_DEBOUNCE_S", 0.2)
+
+    def test_production_debounce_window_is_three_seconds(self, monkeypatch):
+        monkeypatch.undo()
+        assert SessionRegistry._SAVE_DEBOUNCE_S == 3.0
+
+    def test_calls_save_fn_after_delay(self, tmp_path):
+        """The save callback fires after the debounce delay.
+
+        WHY: If the timer never fires, registry state is never persisted
+        and crash recovery has stale data.
+        """
+        reg = SessionRegistry()
+        save_called = threading.Event()
+        call_count = [0]
+
+        def fake_save():
+            call_count[0] += 1
+            save_called.set()
+
+        reg.schedule_registry_save(fake_save)
+        save_called.wait(timeout=5)
+        assert call_count[0] == 1
+        reg.cancel_timer()
+
+    def test_debounce_skips_if_timer_pending(self, tmp_path):
+        """Multiple rapid calls result in only one save.
+
+        WHY: Without debounce, N state changes cause N disk writes.
+        The debounce pattern ensures the pending timer captures the
+        latest state when it fires.
+        """
+        reg = SessionRegistry()
+        save_called = threading.Event()
+        call_count = [0]
+
+        def fake_save():
+            call_count[0] += 1
+            save_called.set()
+
+        # Schedule multiple saves rapidly
+        reg.schedule_registry_save(fake_save)
+        reg.schedule_registry_save(fake_save)
+        reg.schedule_registry_save(fake_save)
+
+        save_called.wait(timeout=5)
+        # Allow a bit more time for any extra calls (a timer per call would
+        # have fired with the first, within milliseconds)
+        time.sleep(0.1)
+        # Only one save should have fired (the first timer)
+        assert call_count[0] == 1
+        reg.cancel_timer()
+
+
+# =========================================================================
+# Section 4: recover_sessions (the critical path)
+# =========================================================================
+
+
+class TestRecoverSessions:
+    """Test crash recovery logic.
+
+    This is the most critical code path in session_registry.  Bugs here
+    can either fail to recover valid sessions (user loses work) or
+    recover sessions that should stay dead (zombie sessions, resource
+    waste, stale state).
+    """
+
+    def _make_mock_store(self, session_exists=True):
+        """Create a mock ChatStore for recovery tests."""
+        store = MagicMock()
+        if session_exists:
+            store.find_session_path.return_value = Path("/fake/session.jsonl")
+        else:
+            store.find_session_path.return_value = None
+        store.repair_incomplete_turn.return_value = True
+        return store
+
+    def test_recovers_working_sessions(self, tmp_path):
+        """Sessions in 'working' state are recovered.
+
+        WHY: 'working' means the agent was mid-response when the daemon
+        crashed.  Resuming picks up where it left off.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-1": {
+                "name": "Active",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "claude-3",
+                "last_activity": now - 60,  # 1 minute ago
+            },
+        }
+        _write_registry(registry_file, sessions)
+
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+
+        start_fn.assert_called_once()
+        call_kwargs = start_fn.call_args
+        assert call_kwargs.kwargs["session_id"] == "sess-1"
+        assert call_kwargs.kwargs["resume"] is True
+        assert call_kwargs.kwargs["cwd"] == os.path.normpath("/tmp")
+
+    def test_recovers_waiting_sessions(self, tmp_path):
+        """Sessions in 'waiting' state are recovered.
+
+        WHY: 'waiting' means the agent is waiting for user input
+        (permission prompt).  The session should be reconnected.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-1": {
+                "name": "Waiting",
+                "state": "waiting",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+            },
+        }
+        _write_registry(registry_file, sessions)
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+        start_fn.assert_called_once()
+
+    def test_recovers_starting_sessions(self, tmp_path):
+        """Sessions in 'starting' state are recovered.
+
+        WHY: 'starting' means the session was being initialized when
+        the daemon crashed.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-1": {
+                "name": "Starting",
+                "state": "starting",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+            },
+        }
+        _write_registry(registry_file, sessions)
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+        start_fn.assert_called_once()
+
+    def test_skips_idle_sessions(self, tmp_path):
+        """Sessions in 'idle' state are NOT recovered.
+
+        WHY: Idle sessions have completed their work.  Recovering them
+        wastes resources and confuses the user with unexpected reconnects.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-idle": {
+                "name": "Idle",
+                "state": "idle",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+            },
+        }
+        _write_registry(registry_file, sessions)
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+        start_fn.assert_not_called()
+
+    def test_skips_stopped_sessions(self, tmp_path):
+        """Sessions in 'stopped' state are NOT recovered.
+
+        WHY: Stopped sessions were explicitly terminated by the user.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-stopped": {
+                "name": "Stopped",
+                "state": "stopped",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+            },
+        }
+        _write_registry(registry_file, sessions)
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+        start_fn.assert_not_called()
+
+    def test_skips_stale_sessions(self, tmp_path):
+        """Sessions older than MAX_RECOVERY_AGE are skipped.
+
+        WHY: Very old sessions are unlikely to still be relevant.
+        Recovering a 12-hour-old session would waste resources and
+        possibly send stale messages to a model that has lost context.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-stale": {
+                "name": "Stale",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 7200,  # 2 hours ago (> 1 hour max)
+            },
+        }
+        _write_registry(registry_file, sessions)
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store, max_age=3600)
+        start_fn.assert_not_called()
+
+    def test_skips_planner_sessions(self, tmp_path):
+        """Planner sessions are never recovered.
+
+        WHY: Planner sessions are transient orchestration sessions
+        that should not persist across crashes.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-planner": {
+                "name": "Planner",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "session_type": "planner",
+                "last_activity": now - 30,
+            },
+        }
+        _write_registry(registry_file, sessions)
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+        start_fn.assert_not_called()
+
+    def test_skips_deleted_session_files(self, tmp_path):
+        """Sessions whose .jsonl file was deleted are NOT recovered.
+
+        WHY: If the user deleted the session file, recovering would
+        undo the deletion -- creating a ghost session with no history.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-deleted": {
+                "name": "Deleted",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+            },
+        }
+        _write_registry(registry_file, sessions)
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store(session_exists=False)
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+        start_fn.assert_not_called()
+
+    def test_one_failure_does_not_block_others(self, tmp_path):
+        """If one session fails to recover, others still proceed.
+
+        WHY: A single corrupted session must not prevent recovery of
+        all other valid sessions.  Each recovery is independent.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-fail": {
+                "name": "Fails",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+            },
+            "sess-ok": {
+                "name": "Succeeds",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+            },
+        }
+        _write_registry(registry_file, sessions)
+
+        def side_effect(**kwargs):
+            if kwargs["session_id"] == "sess-fail":
+                return {"ok": False, "error": "boom"}
+            return {"ok": True}
+
+        start_fn = MagicMock(side_effect=side_effect)
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+        # Both should have been attempted
+        assert start_fn.call_count == 2
+
+    def test_empty_registry_no_recovery(self, tmp_path):
+        """Empty registry means nothing to recover.
+
+        WHY: After a clean shutdown with no active sessions, recovery
+        should be a no-op.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {})
+        start_fn = MagicMock()
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+        start_fn.assert_not_called()
+
+    def test_missing_registry_file_no_recovery(self, tmp_path):
+        """Missing registry file means nothing to recover.
+
+        WHY: First launch -- no crash history exists.
+        """
+        reg = SessionRegistry()
+        start_fn = MagicMock()
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH',
+                   tmp_path / "nonexistent.json"):
+            reg.recover_sessions(start_fn, store)
+        start_fn.assert_not_called()
+
+    def test_start_session_fn_receives_correct_args(self, tmp_path):
+        """start_session_fn is called with the correct keyword arguments.
+
+        WHY: The recovery must pass session_id, prompt="", cwd, name,
+        resume=True, and model.  Wrong args could create a new session
+        instead of resuming, or resume the wrong one.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-abc": {
+                "name": "My Session",
+                "state": "working",
+                "cwd": "/projects/myapp",
+                "model": "claude-sonnet-4-20250514",
+                "last_activity": now - 60,
+            },
+        }
+        _write_registry(registry_file, sessions)
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+        start_fn.assert_called_once_with(
+            session_id="sess-abc",
+            prompt="",
+            cwd=os.path.normpath("/projects/myapp"),
+            name="My Session",
+            resume=True,
+            model="claude-sonnet-4-20250514",
+            # Subsessions (spec §4.1): recovery passes the parent pointer
+            # + origin turn through with safe defaults for legacy registries.
+            parent_session_id=None,
+            subsession_origin_turn=0,
+            # Phase 6.5 P1-1: parent_deleted_at tombstone round-trips through
+            # recovery so a daemon restart preserves the orphan state.  None
+            # for legacy registries (the field is absent).
+            parent_deleted_at=None,
+            # Phase 6.5 P1-4: auto-report-on-idle preference persists
+            # through recovery.  False for legacy registries.
+            auto_report_on_idle=False,
+        )
+
+    def test_repairs_incomplete_turn_before_recovery(self, tmp_path):
+        """repair_incomplete_turn is called before starting recovery.
+
+        WHY: If the daemon crashed mid-response, the .jsonl ends with
+        an incomplete assistant turn (stop_reason=null).  The CLI's
+        --resume chokes on this, so we must repair it first.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-1": {
+                "name": "Repair Me",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+            },
+        }
+        _write_registry(registry_file, sessions)
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+        # cwd is normalized by os.path.normpath inside recover_sessions,
+        # so on Windows "/tmp" becomes "\\tmp"
+        store.repair_incomplete_turn.assert_called_once_with(
+            "sess-1", cwd=os.path.normpath("/tmp")
+        )
+
+    def test_rehydrates_inbox_dirty_when_disk_has_undelivered(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 6.5 P0-3 — when a recovered session has on-disk
+        ``delivered: false`` reports, recover_sessions calls
+        mark_inbox_dirty_fn(sid) so the next send_message drains them.
+
+        Without this, the parent boots with inbox_dirty=False and the
+        fast-path drain at session_manager.py:595 reads False and skips
+        the disk read forever, stranding the reports.
+        """
+        # Isolate Path.home() to a fresh tmp dir so the subsession_inbox
+        # module writes its inbox.json into our sandbox, not into the
+        # user's real ~/.claude tree.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        from engine import subsession_inbox as ibx
+
+        # Seed an undelivered report on disk for the parent SID we'll
+        # recover.  This is exactly the state a real daemon restart
+        # would leave behind: report-to-parent was called, the write
+        # hit disk, then the daemon died before the parent's next send.
+        parent_sid = "sess-parent-1"
+        ibx.append_report(parent_sid, "child-1", "Child", "Did the work")
+        assert ibx.has_undelivered(parent_sid) is True
+
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            parent_sid: {
+                "name": "Parent",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+            },
+        }
+        _write_registry(registry_file, sessions)
+
+        start_fn = MagicMock(return_value={"ok": True})
+        mark_dirty_fn = MagicMock(return_value=True)
+        store = self._make_mock_store()
+
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(
+                start_fn, store, mark_inbox_dirty_fn=mark_dirty_fn
+            )
+
+        # start_session was called for our parent.
+        start_fn.assert_called_once()
+        # mark_inbox_dirty was called with the parent SID.
+        mark_dirty_fn.assert_called_once_with(parent_sid)
+
+    def test_parent_deleted_at_round_trips_through_recovery(self, tmp_path):
+        """Phase 6.5 P1-1 — the parent_deleted_at tombstone written to
+        the registry snapshot must survive a recovery cycle.  Previously
+        recover_sessions silently dropped the field (start_session didn't
+        accept the kwarg), so a daemon restart erased the orphan state.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        tombstone = "2026-05-28T19:00:00Z"
+        sessions = {
+            "orphan-child": {
+                "name": "Orphan",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+                # Subsession state at restart: child's parent was
+                # deleted before we crashed.  Tombstone field carries
+                # the deletion timestamp through recovery.
+                "parent_session_id": None,
+                "subsession_origin_turn": 5,
+                "parent_deleted_at": tombstone,
+            },
+        }
+        _write_registry(registry_file, sessions)
+
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+
+        start_fn.assert_called_once()
+        kwargs = start_fn.call_args.kwargs
+        assert kwargs["session_id"] == "orphan-child"
+        # Phase 6.5 P1-1 contract: tombstone is in the start_session call.
+        assert kwargs["parent_deleted_at"] == tombstone
+
+    def test_legacy_registry_without_tombstone_recovers_cleanly(
+        self, tmp_path
+    ):
+        """A registry written by a pre-tombstone daemon (no
+        parent_deleted_at field) must still recover; missing key
+        defaults to None — never raises."""
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "legacy-sess": {
+                "name": "Legacy",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+                # No parent_deleted_at key at all.
+            },
+        }
+        _write_registry(registry_file, sessions)
+
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+
+        start_fn.assert_called_once()
+        # Default is None for legacy registries.
+        assert start_fn.call_args.kwargs["parent_deleted_at"] is None
+
+    def test_no_rehydration_when_inbox_empty(self, tmp_path, monkeypatch):
+        """If a recovered session has NO on-disk undelivered reports,
+        mark_inbox_dirty_fn must NOT be called — otherwise every
+        recovered session would needlessly flip inbox_dirty=True on boot
+        and force a wasteful disk read on the next turn."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-clean": {
+                "name": "Parent",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+            },
+        }
+        _write_registry(registry_file, sessions)
+
+        start_fn = MagicMock(return_value={"ok": True})
+        mark_dirty_fn = MagicMock(return_value=True)
+        store = self._make_mock_store()
+
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(
+                start_fn, store, mark_inbox_dirty_fn=mark_dirty_fn
+            )
+
+        start_fn.assert_called_once()
+        # No undelivered entries => no rehydration call.
+        mark_dirty_fn.assert_not_called()
+
+
+# =========================================================================
+# Section 5: cancel_timer
+# =========================================================================
+
+
+class TestCancelTimer:
+    """Test timer cancellation."""
+
+    def test_cancel_pending_timer(self, monkeypatch):
+        """cancel_timer stops a pending save from firing.
+
+        WHY: During shutdown, we cancel the debounce timer and do
+        a final synchronous save instead.
+        """
+        # The window has to be shorter than the wait below: under the real 3s
+        # window this test passed whether or not cancel_timer did anything.
+        monkeypatch.setattr(SessionRegistry, "_SAVE_DEBOUNCE_S", 0.05)
+        reg = SessionRegistry()
+        save_called = [False]
+
+        def fake_save():
+            save_called[0] = True
+
+        reg.schedule_registry_save(fake_save)
+        reg.cancel_timer()
+        # Wait long enough for the timer to have fired if not cancelled
+        time.sleep(0.2)
+        assert save_called[0] is False
+
+    def test_cancel_when_no_timer(self):
+        """cancel_timer is safe to call when no timer is pending.
+
+        WHY: Defensive -- code may cancel without checking if a timer
+        was ever scheduled.
+        """
+        reg = SessionRegistry()
+        # Should not raise
+        reg.cancel_timer()
+        assert reg._registry_timer is None
+
+
+# =========================================================================
+# Section 6: load_last_known_states (restart memory)
+# =========================================================================
+
+
+class TestLoadLastKnownStates:
+    """Test the restart-memory snapshot.
+
+    load_last_known_states() is read ONCE at daemon startup, before the first
+    save overwrites the registry with only live sessions.  It preserves the
+    idle/working state of every session that was open before the restart so
+    the UI can restore it (show idle as idle, working as working) instead of
+    collapsing everything to "sleeping".  It is display memory only -- it
+    never launches a process, so (unlike recover_sessions) it applies no age
+    filter and keeps idle sessions.
+    """
+
+    def test_idle_session_remembered_as_idle(self, tmp_path):
+        """An idle session is remembered with last_state 'idle' plus metadata.
+
+        WHY: This is the core case -- idle sessions are NOT auto-recovered, so
+        without this snapshot they collapse to "sleeping" after a restart.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {
+            "s-idle": {"name": "Idle One", "state": "idle", "cwd": "/tmp",
+                       "session_type": "normal", "last_activity": 123.0},
+        })
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            out = reg.load_last_known_states()
+        assert out["s-idle"]["last_state"] == "idle"
+        assert out["s-idle"]["name"] == "Idle One"
+        assert out["s-idle"]["cwd"] == "/tmp"
+
+    def test_active_states_collapse_to_working(self, tmp_path):
+        """working/waiting/starting all remember as 'working'.
+
+        WHY: A mid-task session that failed to auto-recover is accurately
+        described to the user as "working" (where they left off), and we don't
+        want three near-identical display states.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {
+            "s-w": {"state": "working"},
+            "s-wait": {"state": "waiting"},
+            "s-start": {"state": "starting"},
+        })
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            out = reg.load_last_known_states()
+        assert out["s-w"]["last_state"] == "working"
+        assert out["s-wait"]["last_state"] == "working"
+        assert out["s-start"]["last_state"] == "working"
+
+    def test_stopped_session_excluded(self, tmp_path):
+        """Stopped sessions are not remembered.
+
+        WHY: The user explicitly ended them -- they should stay "sleeping".
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {"s-stop": {"state": "stopped"}})
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            out = reg.load_last_known_states()
+        assert "s-stop" not in out
+
+    def test_planner_session_excluded(self, tmp_path):
+        """Planner/utility sessions are never remembered.
+
+        WHY: They are transient orchestration sessions, not user-tracked work.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {
+            "s-plan": {"state": "working", "session_type": "planner"},
+        })
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            out = reg.load_last_known_states()
+        assert "s-plan" not in out
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        """No registry file -> empty snapshot (first launch, clean state)."""
+        reg = SessionRegistry()
+        with patch('engine.session_registry.REGISTRY_PATH',
+                   tmp_path / "nonexistent.json"):
+            out = reg.load_last_known_states()
+        assert out == {}
+
+    def test_old_idle_session_still_remembered(self, tmp_path):
+        """Age does NOT filter restart memory (unlike recovery).
+
+        WHY: This is only a display label, not a relaunch, so a session being
+        old is irrelevant -- the user still wants to see where they left off.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {
+            "s-old": {"state": "idle", "last_activity": 1.0},  # ancient
+        })
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            out = reg.load_last_known_states()
+        assert "s-old" in out
+        assert out["s-old"]["last_state"] == "idle"
+
+    def test_model_included_when_present(self, tmp_path):
+        """Restart memory carries the last-confirmed model.
+
+        WHY: without this, /api/sessions renders stopped/dormant sessions
+        with the client's system default in the model badge, which
+        frequently disagrees with what the session actually last ran on.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {
+            "s-with-model": {"state": "idle", "model": "claude-opus-5"},
+            "s-with-1m": {"state": "idle", "model": "claude-opus-5[1m]"},
+            "s-no-model": {"state": "idle"},
+        })
+        with patch('engine.session_registry.REGISTRY_PATH', registry_file):
+            out = reg.load_last_known_states()
+        assert out["s-with-model"]["model"] == "claude-opus-5"
+        assert out["s-with-1m"]["model"] == "claude-opus-5[1m]"
+        # Missing model in the registry surfaces as an empty string, never a
+        # KeyError — /api/sessions treats "" as "no info" and falls through
+        # to the system-default fallback rather than crashing.
+        assert out["s-no-model"]["model"] == ""

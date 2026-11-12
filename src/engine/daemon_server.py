@@ -1,0 +1,760 @@
+"""
+Session Daemon — TCP server wrapping the SessionManager.
+
+Listens on localhost:5051 for JSON-line IPC from the Web UI.
+Push events from SessionManager are forwarded to the connected client.
+"""
+
+# ---------------------------------------------------------------------------
+# Boot hardening.  This daemon is spawned as its OWN process, so it does not
+# inherit run.py's hardening — it must apply it itself, before any third-party
+# import.  _early_boot makes platform.uname() WMI-free (the aiohttp import
+# chain via session_manager calls platform.system(), which hangs forever when
+# the Windows WMI service is wedged) and arms a faulthandler autopsy.  We add
+# the repo root to sys.path here so this top-level module is importable before
+# the daemon's own path setup below.  See _early_boot.py.
+# ---------------------------------------------------------------------------
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from launcher import _early_boot
+_early_boot.arm_hang_dump(120, "daemon-boot")
+
+import json
+import logging
+import os
+import signal
+import socket
+import sys
+import threading
+import time
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Add parent dir to path so we can import engine.session_manager
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from engine.session_manager import SessionManager
+
+DAEMON_PORT = int(os.environ.get("VIBENODE_DAEMON_PORT", 5051))
+PID_FILE = Path.home() / ".claude" / (f"gui_daemon_{DAEMON_PORT}.pid" if DAEMON_PORT != 5051 else "gui_daemon.pid")
+
+
+def _enable_tcp_keepalive(sock):
+    """Enable SO_KEEPALIVE with aggressive Linux/macOS timing.
+
+    Mirrors app.daemon_client._enable_tcp_keepalive — kept duplicated
+    here because the daemon module must be importable without
+    pulling in any Flask/app dependencies.
+
+    Without keepalive on this side, a Linux sleep/resume cycle leaves
+    the daemon-side socket blocked in recv() forever.  Even after
+    the web server reconnects, the daemon is still holding the dead
+    socket and refuses to give up its slot until something probes it.
+    Enabling keepalive lets the daemon detect and release a dead
+    peer in roughly 30 seconds.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    keepidle = getattr(socket, "TCP_KEEPIDLE", None)
+    keepintvl = getattr(socket, "TCP_KEEPINTVL", None)
+    keepcnt = getattr(socket, "TCP_KEEPCNT", None)
+    try:
+        if keepidle is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, keepidle, 15)
+        if keepintvl is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, keepintvl, 5)
+        if keepcnt is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, keepcnt, 3)
+    except OSError:
+        pass
+    if keepidle is None:
+        keepalive = getattr(socket, "TCP_KEEPALIVE", None)
+        if keepalive is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, keepalive, 15)
+            except OSError:
+                pass
+
+
+# Upper bound on simultaneous Web UI IPC connections.  Normal operation uses
+# exactly one; a web restart can briefly overlap two.  Anything beyond this is
+# a connection leak, not real usage, so the daemon trims the oldest rather than
+# accumulating sockets forever.
+MAX_IPC_CLIENTS = 8
+
+
+# ---------------------------------------------------------------------------
+# IPC protocol.  The web server and the engine are restarted independently
+# (the engine rarely: restarting it ends every session), so the web routinely
+# talks to an engine older or newer than itself.  ``ping`` advertises what this
+# engine speaks; ``src/web/daemon_client.py`` reads it on connect and answers a
+# method the engine does not list with a typed "unavailable" result instead of
+# a raw "Unknown method" string.  Bump PROTOCOL_VERSION when a method's
+# parameters or result shape change incompatibly; adding a method needs no
+# bump (it shows up in METHODS).
+# ---------------------------------------------------------------------------
+PROTOCOL_VERSION = 1
+ENGINE_STARTED_AT = time.time()
+
+# Answered by _dispatch_blocking, not the handler table.
+_BLOCKING_METHODS = ("hook_pre_tool",)
+
+
+def ping_payload() -> dict:
+    """``ping``'s reply: liveness (``ok``, read by the web heartbeat) plus the
+    protocol the engine speaks."""
+    return {
+        "ok": True,
+        "pid": os.getpid(),
+        "protocol_version": PROTOCOL_VERSION,
+        "methods": list(METHODS),
+        "engine_started_at": ENGINE_STARTED_AT,
+    }
+
+
+def build_handlers(sm):
+    """The IPC method table: method name -> callable(**params).
+
+    The single source of the protocol's method list (``METHODS``).  Built per
+    dispatch, exactly as before, so a test that patches a SessionManager
+    method after the daemon was constructed is still honoured.
+    """
+    handlers = {
+        "start_session": sm.start_session,
+        "send_message": sm.send_message,
+        "resolve_permission": sm.resolve_permission_unified,
+        "interrupt_session": sm.interrupt_session,
+        "set_session_model": sm.set_session_model,
+        "set_session_effort": sm.set_session_effort,
+        "cancel_auto_retry": sm.cancel_auto_retry,
+        "retry_now": sm.retry_now,
+        "close_session": sm.close_session,
+        "close_session_sync": sm.close_session_sync,
+        "remove_session": lambda **kw: sm.remove_session(**kw) or {"ok": True},
+        "save_registry_now": lambda **kw: sm._save_registry_now() or {"ok": True},
+        "get_all_states": lambda **kw: sm.get_all_states(),
+        "get_entries": sm.get_entries,
+        "get_entry_count": lambda **kw: sm.get_entry_count(kw["session_id"]),
+        # Companion to get_entry_count that also reports the sticky
+        # ``_entries_trimmed`` flag.  Consumed by ws_events fast path so
+        # it can refuse to trust daemon count as an authoritative total
+        # once in-memory entries have been trimmed (JSONL is never trimmed).
+        "get_entry_trim_status": lambda **kw: sm.get_entry_trim_status(kw["session_id"]),
+        "has_session": sm.has_session,
+        "get_session_state": sm.get_session_state,
+        "get_dormant_states": lambda **kw: sm.get_dormant_states(),
+        "get_permission_policy": lambda **kw: sm.get_permission_policy(),
+        "set_permission_policy": sm.set_permission_policy,
+        "get_ui_prefs": lambda **kw: sm.get_ui_prefs(),
+        "set_ui_prefs": lambda **kw: sm.set_ui_prefs(kw.get("prefs", {})),
+        "resolve_hook_permission": sm.resolve_hook_permission,
+        "queue_message": sm.queue_message,
+        "get_queue": lambda **kw: sm.get_queue(**kw),
+        "remove_queue_item": sm.remove_queue_item,
+        "edit_queue_item": sm.edit_queue_item,
+        "clear_queue": sm.clear_queue,
+        "get_aliases": lambda **kw: dict(sm._id_aliases),
+        # ── Subsessions (spec §4.2/§4.3/§6) ──
+        # get_subsession_meta normalizes None → {} so the falsy result
+        # survives IPC: the reader stores msg["result"], and _send_request
+        # treats a None result as a timeout.  {} is both non-None (IPC-safe)
+        # and correctly falsy for the route's "not daemon-managed" check.
+        "get_subsession_meta": lambda **kw: sm.get_subsession_meta(kw["session_id"]) or {},
+        "mark_inbox_dirty": lambda **kw: sm.mark_inbox_dirty(kw["session_id"]),
+        "orphan_children_of": lambda **kw: sm.orphan_children_of(kw["parent_sid"]),
+        "detect_rewind_orphans": lambda **kw: sm.detect_rewind_orphans(kw["parent_sid"], kw["new_line_count"]),
+        "reanchor_subsession": lambda **kw: sm.reanchor_subsession(kw["child_sid"], kw["new_origin_turn"]),
+        "detach_subsession": lambda **kw: sm.detach_subsession(kw["child_sid"]),
+        "set_auto_report_on_idle": lambda **kw: sm.set_auto_report_on_idle(kw["session_id"], kw["on"]),
+        "ping": lambda **kw: ping_payload(),
+    }
+    return handlers
+
+
+class _MethodNamesOnly:
+    """Stand-in SessionManager: lets METHODS be read off the real table
+    without constructing one (attribute reads return a placeholder)."""
+
+    def __getattr__(self, name):
+        return None
+
+
+METHODS = tuple(sorted(set(build_handlers(_MethodNamesOnly())) | set(_BLOCKING_METHODS)))
+
+
+class SessionDaemon:
+    """Long-lived process that manages Claude Code SDK sessions via TCP IPC."""
+
+    def __init__(self, port=DAEMON_PORT):
+        self.port = port
+        self.session_manager = SessionManager()
+        self._server_socket = None
+        # Every live Web UI connection, in accept order: sock -> write lock.
+        #
+        # This used to be a SINGLE ``_client_socket`` slot that each new
+        # connection overwrote, closing whoever held it.  That made the daemon
+        # hostile to its own callers: any second connection silently killed the
+        # first one's IPC link.  With two web servers alive (the failure the
+        # singleton gate in run.py now prevents) the two of them evicted each
+        # other on a 2-second reconnect cycle indefinitely, so ``/api/health``
+        # reported daemon:false about half the time and the UI sat in a
+        # permanent "VibeNode Engine Stopped" flap that Restart could not
+        # clear.  Nothing was actually down -- the daemon was healthy and every
+        # session kept running the whole time.
+        #
+        # Connections are now additive: a new client never disturbs an existing
+        # one.  Dead peers are reaped where they are actually detected (recv
+        # EOF, send failure, TCP keepalive) instead of guessed at on accept.
+        self._clients = {}                    # sock -> per-connection write lock
+        self._client_lock = threading.Lock()  # guards _clients
+        self._running = False
+
+    def start(self):
+        """Start the SessionManager and TCP server. Blocks forever."""
+        # Write PID file
+        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PID_FILE.write_text(str(os.getpid()))
+
+        # Start SessionManager with our push callback
+        self.session_manager.start(push_callback=self._push_event)
+        self._running = True
+
+        # Listen for Web UI connections
+        self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if sys.platform == "win32":
+            # SO_EXCLUSIVEADDRUSE: hard guarantee no other process can bind this port
+            self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            # SO_REUSEADDR: let us rebind to a port whose previous owner left
+            # it in TIME_WAIT.  This is the common case during ``/api/restart
+            # → scope=daemon``: the old daemon was kill -9'd, the port is in
+            # TIME_WAIT for ~60 seconds, and without REUSEADDR the new daemon
+            # bind() fails with EADDRINUSE → daemon exits → web stays up
+            # without a daemon, so a restart would leave no engine running.
+            self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # SO_REUSEPORT: belt-and-suspenders.  Linux 3.9+ supports it.
+            # Allows binding even when a sibling process briefly held the
+            # same port (e.g. a stale daemon dying during the restart's
+            # kill loop).  Wrapped because not all kernels have the
+            # constant defined.
+            _reuseport = getattr(socket, "SO_REUSEPORT", None)
+            if _reuseport is not None:
+                try:
+                    self._server_socket.setsockopt(
+                        socket.SOL_SOCKET, _reuseport, 1
+                    )
+                except OSError:
+                    # Old kernel without SO_REUSEPORT support — fall back
+                    # to SO_REUSEADDR alone (which is set above).
+                    pass
+        try:
+            self._server_socket.bind(("127.0.0.1", self.port))
+        except OSError as e:
+            logger.error("Port %d already in use — another daemon is running? %s", self.port, e)
+            print(f"ERROR: Port {self.port} already in use. Kill the existing daemon first.", flush=True)
+            sys.exit(1)
+        self._server_socket.listen(MAX_IPC_CLIENTS)
+        self._server_socket.settimeout(1.0)  # Allow periodic check for shutdown
+
+        logger.info("Session daemon listening on port %d", self.port)
+        print(f"Session daemon listening on port {self.port}", flush=True)
+
+        # Bound successfully — past the import phase that hangs on a wedged
+        # WMI service.  Stand the hang autopsy down.
+        _early_boot.disarm_hang_dump()
+
+        while self._running:
+            try:
+                client, addr = self._server_socket.accept()
+                client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # Detect zombie peers (e.g. host sleep/resume) without
+                # waiting for the kernel's 2-hour default keepalive.
+                _enable_tcp_keepalive(client)
+                logger.info("Web UI connected from %s", addr)
+                # Handle client in a thread so we can accept new connections
+                # (e.g., when Web UI restarts)
+                threading.Thread(
+                    target=self._handle_client, args=(client,),
+                    daemon=True, name="ipc-client"
+                ).start()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._running:
+                    logger.exception("Accept error")
+                break
+
+    def stop(self):
+        """Gracefully shut down."""
+        self._running = False
+        self.session_manager.stop()
+        if self._server_socket:
+            try:
+                self._server_socket.close()
+            except Exception:
+                pass
+        # Clean up PID file
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        logger.info("Session daemon stopped")
+
+    def _send(self, sock, line):
+        """Write one framed line to one client.  False if the peer is gone.
+
+        The write lock is PER CONNECTION, not global: a wedged client must not
+        be able to stall delivery to a healthy one.  A failed write is proof
+        the peer is gone, so the connection is dropped here rather than left in
+        the registry for the next push to trip over again.
+        """
+        with self._client_lock:
+            wlock = self._clients.get(sock)
+        if wlock is None:
+            return False   # already dropped
+        try:
+            with wlock:
+                sock.sendall(line.encode("utf-8"))
+            return True
+        except Exception as send_err:
+            logger.info("Client send failed, dropping connection: %s", send_err)
+            self._drop_client(sock)
+            return False
+
+    def _drop_client(self, sock):
+        """Deregister and close one client.  Idempotent."""
+        with self._client_lock:
+            known = self._clients.pop(sock, None) is not None
+            remaining = len(self._clients)
+        if known:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            logger.info("Web UI disconnected (%d still connected)", remaining)
+        return known
+
+    def _push_event(self, event_name, data):
+        """Called by SessionManager to push events to every connected Web UI."""
+        with self._client_lock:
+            socks = list(self._clients)
+        if not socks:
+            return  # No client connected, discard event
+        msg = json.dumps({"event": event_name, "data": data}) + "\n"
+        for sock in socks:
+            self._send(sock, msg)
+
+    def _handle_client(self, sock):
+        """Handle one Web UI TCP connection.
+
+        Registers the connection alongside any existing ones.  It deliberately
+        does NOT evict the incumbent -- see the ``_clients`` comment in
+        ``__init__`` for the "Engine Stopped" flap that eviction caused.
+        """
+        # Backstop against a caller that leaks connections.  At the cap the
+        # NEWCOMER is refused -- an already-established client is never thrown
+        # out to make room.
+        #
+        # An earlier version of this trimmed the OLDEST connection instead, on
+        # the reasoning that a leak accumulates at the young end.  That is
+        # exactly backwards: the oldest connection is the long-lived real web
+        # server, so a burst of short-lived connections (the test suite opening
+        # clients against the running daemon) evicted the one client that
+        # mattered, over and over.  The web server logged "Lost connection to
+        # daemon" every 10 seconds and the UI went unusable -- the same
+        # eviction failure this registry exists to prevent, reintroduced under
+        # another name.  Refusing the newcomer keeps the invariant honest:
+        # connecting to the daemon can never disturb a client already on it.
+        with self._client_lock:
+            at_capacity = len(self._clients) >= MAX_IPC_CLIENTS
+            if not at_capacity:
+                self._clients[sock] = threading.Lock()
+            count = len(self._clients)
+        if at_capacity:
+            logger.warning(
+                "Refusing IPC client: already at the %d-connection cap. "
+                "Something is leaking daemon connections.", MAX_IPC_CLIENTS)
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return
+        logger.info("IPC client registered (%d connected)", count)
+
+        # Send initial state snapshot (includes all queues).
+        # Queues + lock moved into SessionManager._mq (a MessageQueue) during
+        # the queue refactor; older direct attribute access on session_manager
+        # itself raised AttributeError and silently dropped the snapshot — the
+        # UI still recovered via periodic get_all_states polling, but a fresh
+        # browser tab would briefly show empty queues until the next poll.
+        try:
+            states = self.session_manager.get_all_states()
+            mq = self.session_manager._mq
+            with mq._queue_lock:
+                queues = {k: list(v) for k, v in mq._queues.items() if v}
+            self._push_event("state_snapshot", {"sessions": states, "queues": queues})
+        except Exception as e:
+            logger.warning("Failed to send state snapshot: %s", e)
+
+        # Read requests
+        buffer = b""
+        try:
+            while self._running:
+                try:
+                    data = sock.recv(65536)
+                except (ConnectionResetError, ConnectionAbortedError) as e:
+                    logger.info("Client recv error: %s", e)
+                    break
+                if not data:
+                    logger.info("Client sent EOF (empty recv)")
+                    break
+                buffer += data
+                last_nl = buffer.rfind(b"\n")
+                if last_nl == -1:
+                    continue
+                decodable = buffer[:last_nl + 1]
+                buffer = buffer[last_nl + 1:]
+                try:
+                    text = decodable.decode("utf-8")
+                except UnicodeDecodeError:
+                    logger.warning("UTF-8 decode error in client handler, skipping chunk")
+                    continue
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                        self._dispatch(sock, msg)
+                    except json.JSONDecodeError:
+                        logger.warning("Invalid JSON from client: %s", line[:200])
+        except Exception as e:
+            logger.warning("Client connection ended with exception: %s", e, exc_info=True)
+        finally:
+            self._drop_client(sock)
+
+    def _dispatch(self, sock, msg):
+        """Route a JSON request to the appropriate SessionManager method."""
+        req_id = msg.get("req_id", "")
+        method = msg.get("method", "")
+        params = msg.get("params", {})
+
+        # For hook_pre_tool, run in a separate thread since it blocks
+        if method == "hook_pre_tool":
+            threading.Thread(
+                target=self._dispatch_blocking,
+                args=(sock, req_id, method, params),
+                daemon=True
+            ).start()
+            return
+
+        # Run ALL dispatches in threads so one slow/blocked handler can
+        # never stall the entire request pipeline.  _send() holds that
+        # connection's write lock for the duration of each sendall, so
+        # concurrent dispatches can never interleave a half-written frame.
+        threading.Thread(
+            target=self._dispatch_sync,
+            args=(sock, req_id, method, params),
+            daemon=True,
+        ).start()
+
+    def _dispatch_sync(self, sock, req_id, method, params):
+        """Synchronous dispatch — returns response immediately."""
+        handlers = build_handlers(self.session_manager)
+
+        handler = handlers.get(method)
+        if not handler:
+            resp = {"req_id": req_id, "error": f"Unknown method: {method}"}
+        else:
+            try:
+                result = handler(**params) if params else handler()
+                resp = {"req_id": req_id, "result": result}
+            except Exception as e:
+                logger.exception("Dispatch error for %s", method)
+                resp = {"req_id": req_id, "error": str(e)}
+
+        self._send(sock, json.dumps(resp) + "\n")
+
+    def _dispatch_blocking(self, sock, req_id, method, params):
+        """Blocking dispatch — for long-running calls like hook_pre_tool."""
+        try:
+            result = self.session_manager.hook_pre_tool(**params)
+            resp = {"req_id": req_id, "result": result}
+        except Exception as e:
+            resp = {"req_id": req_id, "error": str(e)}
+
+        self._send(sock, json.dumps(resp) + "\n")
+
+
+def _cmdline_of(pid: int) -> str:
+    """Read /proc/<pid>/cmdline.  Returns '<unknown>' if not readable."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read().replace(b"\x00", b" ").strip()
+        return raw.decode("utf-8", errors="replace") or "<empty>"
+    except FileNotFoundError:
+        return "<pid gone>"
+    except Exception as e:
+        return f"<err: {e}>"
+
+
+def _proc_name_of(pid: int) -> str:
+    """Read /proc/<pid>/comm.  Returns '<unknown>' if not readable."""
+    try:
+        with open(f"/proc/{pid}/comm") as fh:
+            return fh.read().strip()
+    except Exception:
+        return "<unknown>"
+
+
+def _ppid_of(pid: int) -> int:
+    """Read PPid from /proc/<pid>/status.  Returns -1 if not readable."""
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    return -1
+
+
+def _install_signal_forensics_watcher(daemon):
+    """Install a thread that captures the actual sender PID of every shutdown signal.
+
+    Why this exists: Python's standard `signal.signal()` handler runs in the
+    main thread without access to `siginfo_t.si_pid`, so by the time the
+    handler fires we have no way to know *who* killed us: the logs would
+    only say "Received signal 15", with no information about the source.
+
+    The trick: block SIGTERM / SIGINT / SIGHUP at the thread level, then
+    have a dedicated thread loop on `signal.sigwaitinfo()`.  `sigwaitinfo()`
+    DOES preserve `si_pid`, so when the signal fires we get a definitive
+    "PID N (cmdline ...) killed us" record before exiting.
+
+    POSIX-only.  On Windows this is a no-op — Windows uses TerminateProcess,
+    not POSIX signals.
+
+    Returns True if installed, False on non-POSIX or hostile environments.
+    """
+    if os.name == "nt":
+        return False
+
+    # Signals we want forensic detail for.  SIGPIPE is intentionally
+    # excluded — it's a normal consequence of a dead socket peer.
+    watched = {signal.SIGTERM, signal.SIGINT}
+    if hasattr(signal, "SIGHUP"):
+        watched.add(signal.SIGHUP)
+
+    # Block at the process level so the kernel queues the signal for
+    # sigwaitinfo() to pick up, instead of running the default disposition
+    # (= terminate the process before we can log anything).  Threads created
+    # after this inherit the mask.
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+    except Exception as e:
+        logger.warning("Could not block signals for forensics watcher: %s", e)
+        return False
+
+    def _watcher():
+        while True:
+            try:
+                si = signal.sigwaitinfo(watched)
+            except InterruptedError:
+                continue
+            except Exception as e:
+                # If sigwaitinfo dies for some reason, fall back to the
+                # default disposition so the process doesn't become
+                # unkillable.  Best-effort log.
+                logger.error("sigwaitinfo failed (%s) — restoring default disposition", e)
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, watched)
+                return
+
+            sender = getattr(si, "si_pid", -1) or -1
+            sig = si.si_signo
+            try:
+                sig_name = signal.Signals(sig).name
+            except (ValueError, AttributeError):
+                sig_name = f"signal{sig}"
+
+            logger.warning(
+                "=" * 78
+            )
+            logger.warning(
+                "DAEMON KILLED BY EXTERNAL SIGNAL — full forensic record below."
+            )
+            logger.warning(
+                "  signal:  %s (%d)   si_code=%s   si_uid=%s",
+                sig_name, sig, getattr(si, "si_code", "?"),
+                getattr(si, "si_uid", "?"),
+            )
+            logger.warning(
+                "  sender:  pid=%s  ppid=%s  name=%s",
+                sender, _ppid_of(sender), _proc_name_of(sender),
+            )
+            logger.warning(
+                "  sender cmdline: %s", _cmdline_of(sender),
+            )
+            logger.warning(
+                "  self:    pid=%s  pgid=%s  sid=%s  ppid=%s",
+                os.getpid(),
+                os.getpgrp() if hasattr(os, "getpgrp") else "?",
+                os.getsid(0) if hasattr(os, "getsid") else "?",
+                os.getppid(),
+            )
+
+            # Interpret the sender for the user.  The most important case
+            # is "killed by myself" — that means a buggy os.kill() /
+            # os.killpg() call inside this very process targeted us.
+            self_pid = os.getpid()
+            if sender == self_pid:
+                logger.warning(
+                    "  DIAGNOSIS: sender == self.  The daemon killed ITSELF "
+                    "via os.kill()/os.killpg() — a bug inside the daemon's "
+                    "own session-cleanup code.  Inspect _kill_process_tree "
+                    "and _close_session for an os.killpg() / os.kill() "
+                    "call whose target pgid/pid resolved to ours."
+                )
+            elif sender > 0 and _proc_name_of(sender) in ("python", "python3", "python3.12"):
+                logger.warning(
+                    "  DIAGNOSIS: sender is a Python process.  Likely the "
+                    "VibeNode web server (run.py) or a daemon-launcher "
+                    "running a restart endpoint.  Check app/routes/main.py "
+                    "/api/restart and /api/shutdown for whether scope="
+                    "'daemon' or scope='both' was triggered."
+                )
+            else:
+                logger.warning(
+                    "  DIAGNOSIS: sender is NOT this daemon and NOT a known "
+                    "VibeNode component.  External source — could be "
+                    "systemd, OOM killer, the user's terminal, or a "
+                    "wrapper script.  Inspect ps/journalctl for context."
+                )
+            logger.warning("=" * 78)
+
+            # Hand off to the normal shutdown path.  Unblock just this
+            # signal, then re-raise it to ourselves so the existing
+            # signal.signal() handler (registered below) runs engine.stop()
+            # + sys.exit(0) on the main thread.
+            try:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, {sig})
+                os.kill(self_pid, sig)
+            except Exception as e:
+                logger.error("Failed to forward signal to main thread: %s", e)
+                # Last resort — exit directly so the daemon doesn't hang.
+                daemon.stop()
+                os._exit(0)
+            # Re-block for any future signal.
+            try:
+                signal.pthread_sigmask(signal.SIG_BLOCK, {sig})
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_watcher, daemon=True, name="signal-forensics")
+    t.start()
+    return True
+
+
+def _open_engine_log():
+    """Open logs/daemon_debug.log as a size-capped stream this process owns.
+
+    The engine used to log to the stdout/stderr handle its spawner passed
+    down.  Nothing capped it, and on Windows an outside trim made it grow
+    back padded with NULs (see src/shared/logfiles.py).  Prints and tracebacks
+    are routed here too.  The inherited handle (logs/daemon_console.log)
+    now only receives output from before this point and native crash dumps.
+    Returns None when the file cannot be opened, so the engine still starts.
+    """
+    try:
+        from shared.logfiles import open_capped
+        stream = open_capped(
+            Path(__file__).resolve().parents[2] / "logs" / "daemon_debug.log")
+    except Exception as exc:
+        print("engine log: could not open capped log (%s); using stderr" % exc,
+              flush=True)
+        return None
+    if not (getattr(sys.stdout, "isatty", None) and sys.stdout.isatty()):
+        sys.stdout = stream
+    if not (getattr(sys.stderr, "isatty", None) and sys.stderr.isatty()):
+        sys.stderr = stream
+    return stream
+
+
+def main():
+    _engine_log = _open_engine_log()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [daemon] %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+        stream=_engine_log if _engine_log is not None else sys.stderr,
+    )
+
+    # Label this process so a resource-hunting human or AI sees a "do not kill"
+    # marker (the daemon is the most catastrophic process to kill — it parents
+    # every active session CLI).  Best-effort; never raises.  See process_label.
+    try:
+        from launcher import process_label
+        process_label.label_current_process("session-daemon")
+    except Exception:
+        pass
+
+    # Singleton gate: only one daemon allowed system-wide
+    from shared.singleton import acquire_daemon_singleton
+    if not acquire_daemon_singleton():
+        # Double-check: is the port actually in use? If not, mutex is stale.
+        try:
+            _chk = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            _chk.settimeout(1)
+            _chk.connect(("127.0.0.1", DAEMON_PORT))
+            _chk.close()
+            print("Session daemon already running (mutex held). Exiting.", flush=True)
+            sys.exit(0)
+        except (ConnectionRefusedError, OSError):
+            print("Stale daemon mutex detected (port not listening). Starting anyway.", flush=True)
+
+    daemon = SessionDaemon()
+
+    # Safety net: reap runaway external search processes (e.g. ugrep) that the
+    # Claude CLI can leave pinning every core after an interrupted turn. They
+    # otherwise drive load average into the 20s and starve every other session.
+    # See src/engine/runaway_reaper.py. Best-effort; never blocks daemon startup.
+    try:
+        from engine import runaway_reaper
+        runaway_reaper.start()
+    except Exception:
+        logger.warning("Failed to start runaway-reaper", exc_info=True)
+
+    def shutdown(sig, frame):
+        # The forensics watcher (_install_signal_forensics_watcher) already
+        # logged the full sender PID / cmdline / diagnosis before forwarding
+        # the signal here.  This handler just performs the graceful stop.
+        # We still emit one short line so an ungraceful exit (forensics
+        # watcher misfired) is still visible in the log.
+        try:
+            logger.info(
+                "Daemon shutdown handler running (signal=%s pid=%s).",
+                sig, os.getpid(),
+            )
+        except Exception:
+            pass
+        daemon.stop()
+        sys.exit(0)
+
+    # Install the forensics watcher BEFORE registering the regular handlers.
+    # The watcher blocks the signals at the process level and re-delivers
+    # them to the main thread after logging — the signal.signal() handlers
+    # below catch the re-delivered copy.
+    _install_signal_forensics_watcher(daemon)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    daemon.start()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,297 @@
+"""Abstract base class for session persistence.
+
+This module defines the ``ChatStore`` abstract class that encapsulates all
+session storage operations (reading, writing, discovering, and mutating
+session data files).
+
+The Claude implementation reads/writes Claude Code's native JSONL format
+(one JSON object per line, stored under ``~/.claude/projects/``).
+Other backends could use SQLite, API-based storage, or any other format.
+
+Current JSONL access points in the codebase (to be consolidated behind
+this abstraction in Phase 2):
+
++----------------------------+------------------------------------------+
+| File                       | Operations                               |
++============================+==========================================+
+| session_manager.py L3326   | ``_find_session_jsonl()`` -- locate file  |
+| session_manager.py L254    | ``_repair_incomplete_jsonl()`` -- repair  |
+| session_manager.py L3072   | ``_prepopulate_tracked_files()`` -- scan  |
+| session_manager.py L3262   | ``_write_file_snapshot()`` -- tail read   |
+| session_manager.py L3313   | ``_write_file_snapshot()`` -- append      |
+| src/web/sessions.py L44-505    | Load summaries, full sessions, timelines  |
+| src/web/code_extraction.py     | Extract code blocks from messages         |
+| src/web/routes/sessions_api.py | CRUD operations on session files          |
++----------------------------+------------------------------------------+
+"""
+
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Optional
+
+
+class ChatStore(ABC):
+    """Abstract interface for session persistence.
+
+    Encapsulates all session file reading, writing, and management.
+    The Claude implementation reads/writes Claude Code's native JSONL
+    format.  Other backends could use SQLite, API storage, etc.
+
+    All methods accept string identifiers (session_id, cwd) rather than
+    ``Path`` objects so the interface is storage-format-agnostic.
+    """
+
+    # ── Session Discovery ────────────────────────────────────────────
+
+    @abstractmethod
+    def find_session_path(
+        self, session_id: str, cwd: str = ""
+    ) -> Optional[Path]:
+        """Locate the storage file/resource for a session.
+
+        Args:
+            session_id: The session identifier.
+            cwd: Working directory hint for faster lookup.  The Claude
+                implementation encodes this to find the project
+                directory.
+
+        Returns:
+            Path to the session file, or None if not found.
+
+        Claude implementation (session_manager.py L3326-3348):
+            Encodes ``cwd`` with ``_encode_cwd()``, checks
+            ``~/.claude/projects/<encoded>/<session_id>.jsonl``.
+            Falls back to scanning all project directories.
+        """
+        ...
+
+    # ── Read Operations ──────────────────────────────────────────────
+
+    @abstractmethod
+    def read_tracked_files(
+        self, session_id: str, cwd: str = ""
+    ) -> tuple:
+        """Scan session storage for tracked files and metadata.
+
+        Extracts file paths that were edited by tools (Edit, Write,
+        MultiEdit, NotebookEdit) and file-history-snapshot entries.
+
+        Args:
+            session_id: The session identifier.
+            cwd: Working directory for locating the session file.
+
+        Returns:
+            A tuple of ``(tracked_files, file_versions,
+            last_user_uuid, last_asst_uuid)`` where:
+
+            - ``tracked_files`` (set): File paths modified by tools.
+            - ``file_versions`` (dict): Highest version number per file
+              from snapshot entries.
+            - ``last_user_uuid`` (str): UUID of the last user message.
+            - ``last_asst_uuid`` (str): UUID of the last assistant
+              message.
+
+        Claude implementation (session_manager.py L3060-3137,
+        ``_prepopulate_tracked_files`` scan logic):
+            Full JSONL scan for ``tool_use`` blocks in assistant
+            messages and ``file-history-snapshot`` entries.  Also
+            caches user/assistant UUIDs encountered during the scan.
+        """
+        ...
+
+    def read_tracked_files_cached(
+        self, session_id: str, cwd: str = ""
+    ) -> tuple:
+        """Ordered + sidecar-cached variant of ``read_tracked_files``.
+
+        The daemon calls this on the hot path (session recovery, daemon
+        restart, first open of a stale session).  Backends that support
+        caching override this method to consult a next-to-storage
+        sidecar; the default implementation below wraps
+        ``read_tracked_files`` to preserve the ORDERED-list contract
+        the caller expects, at no performance benefit.
+
+        Returns:
+            ``(found_ordered_list, max_version_dict,
+            last_user_uuid, last_asst_uuid)``.
+
+            ``found_ordered_list`` is a list (NOT a set) so callers can
+            drive an LRU-bounded collection with insertion-order
+            semantics.  Iteration order of a plain set is
+            implementation-defined; a list is not.
+        """
+        found_set, max_version, u, a = self.read_tracked_files(session_id, cwd)
+        # Fallback: no ordering info available; deterministic sort.
+        return sorted(found_set), max_version, u, a
+
+    @abstractmethod
+    def read_tail_uuids(
+        self, session_id: str, cwd: str = ""
+    ) -> tuple:
+        """Read the last user and assistant UUIDs from the session tail.
+
+        Used for linking ``file-history-snapshot`` entries to the
+        correct user/assistant message pair.  Reads only the tail of
+        the file for performance (the Claude implementation reads the
+        last 64KB).
+
+        Args:
+            session_id: The session identifier.
+            cwd: Working directory for locating the session file.
+
+        Returns:
+            A tuple of ``(last_user_uuid, last_asst_uuid)``.  Both
+            are empty strings if not found.
+
+        Claude implementation (session_manager.py L3262-3286):
+            Seeks to ``max(0, file_size - 65536)``, reads the tail,
+            scans for user/assistant entries with ``uuid`` fields.
+        """
+        ...
+
+    # ── Write Operations ─────────────────────────────────────────────
+
+    @abstractmethod
+    def write_snapshot(
+        self, session_id: str, snapshot: dict, cwd: str = ""
+    ) -> None:
+        """Append a file-history-snapshot entry to session storage.
+
+        Args:
+            session_id: The session identifier.
+            snapshot: The snapshot dict to write.  For Claude JSONL,
+                this is a complete entry with ``type``,
+                ``messageId``, ``snapshot``, and
+                ``isSnapshotUpdate`` keys.
+            cwd: Working directory for locating the session file.
+
+        Claude implementation (session_manager.py L3313-3314):
+            ``json.dumps(snapshot_entry) + "\\n"`` appended to the
+            JSONL file.
+        """
+        ...
+
+    # ── Repair Operations ────────────────────────────────────────────
+
+    @abstractmethod
+    def repair_incomplete_turn(
+        self, session_id: str, cwd: str = ""
+    ) -> bool:
+        """Repair a session that ends with an incomplete assistant turn.
+
+        When the daemon is killed mid-response, the session may end
+        with an incomplete entry.  This method patches it so the
+        session can be resumed.
+
+        Args:
+            session_id: The session identifier.
+            cwd: Working directory for locating the session file.
+
+        Returns:
+            True if the session was repaired, False if no repair was
+            needed or the session was not found.
+
+        Claude implementation (session_manager.py L254-302,
+        ``_repair_incomplete_jsonl``):
+            Detects assistant messages with ``stop_reason=null``,
+            patches to ``stop_reason="end_turn"``, and appends an
+            interruption notice text block.
+        """
+        ...
+
+    def prepare_for_resume(
+        self, session_id: str, cwd: str = "", evict_media: bool = True,
+        keep_recent_turns: int = 4, dedup_recent_tooluseresult: bool = True,
+    ) -> bool:
+        """Make a session safe AND cheap for ``--resume`` to replay.
+
+        Combined, change-gated pre-``--resume`` pass: repair (Pass 1 + Pass 2)
+        plus optional lossless stale-media eviction, in ONE read and AT MOST ONE
+        conditional rewrite.  Runs ONLY on resume/reconnect, never per-turn, and
+        never rewrites when nothing changed.  
+
+        This is a CONCRETE method (not abstract) so existing ``ChatStore``
+        implementations and the ABC abstract-method set are unchanged.  The
+        default implementation falls back to ``repair_incomplete_turn`` (pure
+        repair, no eviction) so any backend that does not externalize media still
+        works correctly.  Backends that support media eviction (Claude JSONL)
+        override this.
+
+        Args:
+            session_id: The session identifier.
+            cwd: Working directory for locating the session file.
+            evict_media: When True, externalize OLD inline images + de-dup
+                ``toolUseResult`` duplicates.  When False, behaves exactly like
+                ``repair_incomplete_turn``.
+            keep_recent_turns: Number of recent user turns whose images stay
+                inline for the model (K).
+            dedup_recent_tooluseresult: Also de-dup the redundant
+                ``toolUseResult.file.base64`` of images still inside recent-K.
+
+        Returns:
+            True if the session file was rewritten, False otherwise.
+        """
+        return self.repair_incomplete_turn(session_id, cwd)
+
+    # ── Summary / Display Operations ─────────────────────────────────
+
+    @abstractmethod
+    def load_summary(self, session_id: str, cwd: str = "") -> dict:
+        """Load a lightweight session summary for the session list UI.
+
+        Returns a dict with enough metadata to display in the sidebar
+        without loading all messages.
+
+        Args:
+            session_id: The session identifier.
+            cwd: Working directory for locating the session file.
+
+        Returns:
+            Dict with at minimum ``id``, ``display_title``, ``date``,
+            ``preview``, ``message_count``.  Exact keys depend on the
+            backend implementation.
+
+        Claude implementation (src/web/sessions.py L44-81,
+        ``load_session_summary``):
+            Full JSONL parse extracting metadata fields from each line.
+        """
+        ...
+
+    def read_log_entries(
+        self, session_id: str, cwd: str = "", max_entries: int = 200,
+        until_ts: float = 0.0,
+    ) -> list:
+        """The session's last ``max_entries`` timeline entries, for the engine
+        to put back in memory after a restart (``LogEntry.from_transcript``).
+
+        Each row is a dict with ``kind`` (user / asst / tool_use / tool_result
+        / system), ``text``, ``name``, ``desc``, ``id``, ``tool_use_id``,
+        ``is_error``, ``timestamp`` (epoch) and ``uuid`` (the transcript
+        line's id, "" if none).  ``until_ts`` > 0 drops rows written after it.
+        Reads only the tail of the transcript.  The default knows no format and
+        returns ``[]``; a backend overrides it.  Never raises.
+        """
+        return []
+
+    @abstractmethod
+    def read_entries(
+        self, session_id: str, since: int = 0, cwd: str = ""
+    ) -> list:
+        """Read chat entries for display, optionally from a given index.
+
+        Args:
+            session_id: The session identifier.
+            since: Entry index to start from (0 = beginning).
+                Allows incremental loading for long sessions.
+            cwd: Working directory for locating the session file.
+
+        Returns:
+            List of entry dicts, each containing at minimum ``type``
+            and relevant content fields.
+
+        Claude implementation (src/web/sessions.py L128-196,
+        ``load_session``):
+            Full JSONL parse, each line becomes an entry dict with
+            ``type``, message content, ``uuid``, tool use details, etc.
+        """
+        ...

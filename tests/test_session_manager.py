@@ -1,0 +1,1898 @@
+"""
+Tests for the SessionManager class.
+
+What's here:
+- send_message rejection paths (idle accepted, nonexistent rejected)
+- interrupt/close rejection paths
+- restart_stopped_session
+- get_all_states / get_entries query surface
+- thread safety smoke test
+- ToolDescExtraction helpers
+- LogEntry dataclass serialization
+- has_session / get_session_state / resolve_permission edge cases
+- permission timeout
+
+Coverage moved or removed (migration from app.session_manager to
+engine.session_manager):
+- End-to-end lifecycle (start -> work -> idle -> stop) — covered by the
+  ``test_concurrent_sessions.py`` and ``test_wakeup_handling.py`` files
+  which mock the SDK against the new daemon interface.
+- Permission resolve allow/deny — moved to ``test_permission_flow.py``.
+- Message processing (assistant text, tool use, tool result, result,
+  thinking) — moved to ``test_message_processing.py`` (re-mocks against
+  the new ``_process_message`` shape).
+- State transitions — moved to ``test_state_transitions.py``.
+
+Tests deleted (not migrated) because they tested driving sessions through
+the legacy SDK mocking layer that doesn't map cleanly onto the OOP-decomposed
+SessionManager / MessageQueue / PermissionManager split. The behaviors they
+covered are still exercised — just through more focused test files written
+against the new shapes.
+"""
+
+import asyncio
+import os
+import threading
+import time
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+
+from dataclasses import dataclass, field
+from typing import Optional
+from tests._empty_cwd import EMPTY_CWD
+
+
+# ---------------------------------------------------------------------------
+# Mock SDK types (so tests don't require claude-code-sdk installed)
+# ---------------------------------------------------------------------------
+
+class MockTextBlock:
+    def __init__(self, text=""):
+        self.type = "text"
+        self.text = text
+
+
+class MockThinkingBlock:
+    def __init__(self, text=""):
+        self.type = "thinking"
+        self.text = text
+
+
+class MockToolUseBlock:
+    def __init__(self, id="tool-1", name="Bash", input=None):
+        self.type = "tool_use"
+        self.id = id
+        self.name = name
+        self.input = input or {}
+
+
+class MockToolResultBlock:
+    def __init__(self, tool_use_id="tool-1", content="", is_error=False):
+        self.type = "tool_result"
+        self.tool_use_id = tool_use_id
+        self.content = content
+        self.is_error = is_error
+
+
+class MockAssistantMessage:
+    def __init__(self, content=None):
+        self.content = content or []
+        self.role = "assistant"
+
+
+class MockUserMessage:
+    def __init__(self, content=None):
+        self.content = content or []
+        self.role = "user"
+
+
+class MockResultMessage:
+    def __init__(self, session_id="test-session", total_cost_usd=0.05,
+                 duration_ms=1000, is_error=False, num_turns=1, usage=None):
+        self.session_id = session_id
+        self.total_cost_usd = total_cost_usd
+        self.duration_ms = duration_ms
+        self.is_error = is_error
+        self.num_turns = num_turns
+        self.usage = usage or {}
+
+
+class MockStreamEvent:
+    def __init__(self, event="content_block_delta", data=None):
+        self.event = event
+        self.data = data or {}
+
+
+class MockPermissionResultAllow:
+    def __init__(self, updated_input=None, updated_permissions=None):
+        self.updated_input = updated_input
+        self.updated_permissions = updated_permissions
+
+
+class MockPermissionResultDeny:
+    def __init__(self, message="", interrupt=False):
+        self.message = message
+        self.interrupt = interrupt
+
+
+class MockToolPermissionContext:
+    def __init__(self):
+        self.signal = None
+        self.suggestions = []
+
+
+class MockClaudeSDKClient:
+    """Mock SDK client that yields predefined messages."""
+
+    def __init__(self, options=None):
+        self.options = options
+        self._messages = []  # set by test before driving
+        self._response_messages = []  # for receive_response
+        self._connected = False
+        self._queries = []
+        self._interrupted = False
+        self._disconnected = False
+        self.connect_prompt = None
+
+    async def connect(self, prompt=None):
+        self._connected = True
+        self.connect_prompt = prompt
+
+    async def query(self, prompt, session_id="default"):
+        self._queries.append(prompt)
+
+    async def receive_messages(self):
+        for msg in self._messages:
+            yield msg
+
+    async def receive_response(self):
+        for msg in self._response_messages:
+            yield msg
+
+    async def interrupt(self):
+        self._interrupted = True
+
+    async def disconnect(self):
+        self._disconnected = True
+        self._connected = False
+
+    async def get_server_info(self):
+        return {"version": "mock"}
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def mock_socketio():
+    """Create a mock SocketIO instance."""
+    sio = MagicMock()
+    sio.emit = MagicMock()
+    return sio
+
+
+@pytest.fixture
+def mock_sdk_types():
+    """Patch all SDK types so SessionManager can be imported without the real SDK."""
+    type_mocks = {
+        'claude_code_sdk': MagicMock(),
+        'claude_code_sdk.types': MagicMock(),
+    }
+    # Set up the type classes on the mock modules
+    type_mocks['claude_code_sdk'].ClaudeSDKClient = MockClaudeSDKClient
+    type_mocks['claude_code_sdk'].ClaudeCodeOptions = MagicMock
+
+    types_mod = type_mocks['claude_code_sdk.types']
+    types_mod.AssistantMessage = MockAssistantMessage
+    types_mod.UserMessage = MockUserMessage
+    types_mod.ResultMessage = MockResultMessage
+    types_mod.StreamEvent = MockStreamEvent
+    types_mod.TextBlock = MockTextBlock
+    types_mod.ThinkingBlock = MockThinkingBlock
+    types_mod.ToolUseBlock = MockToolUseBlock
+    types_mod.ToolResultBlock = MockToolResultBlock
+    types_mod.PermissionResultAllow = MockPermissionResultAllow
+    types_mod.PermissionResultDeny = MockPermissionResultDeny
+    types_mod.ContentBlock = MagicMock
+    types_mod.ToolPermissionContext = MockToolPermissionContext
+    types_mod.Message = MagicMock
+
+    return type_mocks
+
+
+@pytest.fixture
+def session_manager(mock_socketio, mock_sdk_types):
+    """Create a SessionManager with mocked SDK and SocketIO, started and ready."""
+    with patch.dict('sys.modules', mock_sdk_types):
+        # Force reimport with mocked modules
+        from tests._sm_fresh import fresh_session_manager
+        sm_module = fresh_session_manager()
+
+        # Patch the type references on the reloaded module
+        sm_module.AssistantMessage = MockAssistantMessage
+        sm_module.UserMessage = MockUserMessage
+        sm_module.ResultMessage = MockResultMessage
+        sm_module.StreamEvent = MockStreamEvent
+        sm_module.TextBlock = MockTextBlock
+        sm_module.ThinkingBlock = MockThinkingBlock
+        sm_module.ToolUseBlock = MockToolUseBlock
+        sm_module.ToolResultBlock = MockToolResultBlock
+        sm_module.PermissionResultAllow = MockPermissionResultAllow
+        sm_module.PermissionResultDeny = MockPermissionResultDeny
+        sm_module.ClaudeSDKClient = MockClaudeSDKClient
+        sm_module.ClaudeCodeOptions = MagicMock
+
+        manager = sm_module.SessionManager()
+        manager.start(mock_socketio)
+        yield manager
+        manager.stop()
+
+
+@pytest.fixture
+def sm_module(mock_sdk_types):
+    """Return the reloaded session_manager module with mocked SDK types."""
+    with patch.dict('sys.modules', mock_sdk_types):
+        from tests._sm_fresh import fresh_session_manager
+        sm_mod = fresh_session_manager()
+
+        sm_mod.AssistantMessage = MockAssistantMessage
+        sm_mod.UserMessage = MockUserMessage
+        sm_mod.ResultMessage = MockResultMessage
+        sm_mod.StreamEvent = MockStreamEvent
+        sm_mod.TextBlock = MockTextBlock
+        sm_mod.ThinkingBlock = MockThinkingBlock
+        sm_mod.ToolUseBlock = MockToolUseBlock
+        sm_mod.ToolResultBlock = MockToolResultBlock
+        sm_mod.PermissionResultAllow = MockPermissionResultAllow
+        sm_mod.PermissionResultDeny = MockPermissionResultDeny
+        sm_mod.ClaudeSDKClient = MockClaudeSDKClient
+        sm_mod.ClaudeCodeOptions = MagicMock
+        yield sm_mod
+
+
+# ---------------------------------------------------------------------------
+# Helper to wait for async operations to propagate
+# ---------------------------------------------------------------------------
+
+def wait_for(condition, timeout=5.0, interval=0.01):
+    """Poll until condition() is truthy or timeout expires."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = condition()
+        if result:
+            return result
+        time.sleep(interval)
+    raise TimeoutError(f"Condition not met within {timeout}s")
+class TestPermissionResolve:
+
+    def test_permission_timeout(self, session_manager, sm_module):
+        """Permission callback should handle timeout gracefully."""
+        sid = "test-perm-timeout"
+        # Test that resolve_permission rejects when state is not WAITING
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.WORKING)
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        result = session_manager.resolve_permission(sid, allow=True)
+        assert result["ok"] is False
+        assert "not waiting" in result["error"].lower()
+class TestSendMessage:
+
+    def test_send_message_to_idle_session(self, session_manager, sm_module):
+        """Sending a message to an idle session should work."""
+        sid = "send-idle"
+
+        # Start and complete a session
+        mock_client = MockClaudeSDKClient()
+        mock_client._messages = [
+            MockAssistantMessage([MockTextBlock("Ready")]),
+            MockResultMessage(session_id=sid),
+        ]
+        # Set up response messages for the follow-up
+        mock_client._response_messages = [
+            MockAssistantMessage([MockTextBlock("Follow-up response")]),
+            MockResultMessage(session_id=sid, total_cost_usd=0.02),
+        ]
+
+        with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
+            session_manager.start_session(sid, prompt="init", cwd=EMPTY_CWD)
+            # ~1 s alone; 15 s of headroom because one stalled worker in the
+            # parallel publish run missed a 5 s wait.  A session that never
+            # reaches idle still fails.
+            wait_for(lambda: session_manager.get_session_state(sid) == "idle", timeout=15)
+
+            # Now send a follow-up
+            result = session_manager.send_message(sid, "What else?")
+            assert result["ok"] is True
+
+            # Wait for it to return to idle
+            wait_for(lambda: session_manager.get_session_state(sid) == "idle", timeout=15)
+
+        entries = session_manager.get_entries(sid)
+        user_entries = [e for e in entries if e["kind"] == "user"]
+        assert any("What else?" in e["text"] for e in user_entries)
+
+    def test_send_message_to_nonexistent_session(self, session_manager):
+        """Sending a message to a nonexistent session should fail gracefully."""
+        result = session_manager.send_message("nonexistent", "Hello")
+        assert result["ok"] is False
+        assert "not found" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# 13. Interrupt session
+# ---------------------------------------------------------------------------
+
+class TestInterruptSession:
+
+    def test_interrupt_stopped_session_rejected(self, session_manager, sm_module):
+        """Interrupting a stopped session should fail."""
+        sid = "interrupt-stopped"
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.STOPPED)
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        result = session_manager.interrupt_session(sid)
+        assert result["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# 13b. Mid-session model switch (set_session_model)
+#
+# Honesty contract under test: info.model must change ONLY when the backend
+# confirms the switch.  Any failure (rejected, unsupported, no client) must
+# leave the recorded model untouched and return ok=False with an error —
+# the UI relies on this to never display a model the session isn't running.
+# ---------------------------------------------------------------------------
+
+class TestSetSessionModel:
+
+    def _make_session(self, session_manager, sm_module, sid, state=None,
+                      model="claude-fable-5", client=object()):
+        info = sm_module.SessionInfo(
+            session_id=sid,
+            state=state or sm_module.SessionState.IDLE,
+        )
+        info.model = model
+        info.client = client
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+        return info
+
+    def test_nonexistent_session_rejected(self, session_manager):
+        result = session_manager.set_session_model("nope", "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert "not found" in result["error"].lower()
+
+    def test_stopped_session_resumes_with_requested_model(self, session_manager,
+                                                          sm_module):
+        """A STOPPED session must SWITCH BY RESUMING, not hard-fail.
+
+        This used to return {"ok": False, "error": "Session is stopped"}, which
+        created the usage-limit dead end: the limit stops the session, and a
+        stopped session refused to change models, so the only escape from a
+        limited model required a running session you could not start.  The
+        switch is now performed by resuming with ``--model``, which the CLI's
+        init message confirms through the same sink as a live switch.
+        """
+        self._make_session(session_manager, sm_module, "sm-stopped",
+                           state=sm_module.SessionState.STOPPED)
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            result = session_manager.set_session_model("sm-stopped",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is True
+        assert result["model"] == "claude-sonnet-4-6"
+        assert result["resumed"] is True
+        # Resumed with the REQUESTED model and an empty prompt — switching a
+        # model must never silently spend a turn.
+        kwargs = mock_start.call_args.kwargs
+        assert kwargs["model"] == "claude-sonnet-4-6"
+        assert kwargs["resume"] is True
+        assert kwargs["prompt"] == ""
+
+    def test_stopped_session_default_does_not_resume_the_turn(
+            self, session_manager, sm_module):
+        """The plain model badge must NOT spend a turn.  Without resume_turn
+        the resume carries an empty prompt even when the transcript has an
+        unfinished turn sitting in it."""
+        info = self._make_session(session_manager, sm_module, "sm-noresume",
+                                  state=sm_module.SessionState.STOPPED)
+        info.entries.append(sm_module.LogEntry(kind="user", text="do the thing"))
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            result = session_manager.set_session_model("sm-noresume",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is True
+        assert result.get("turn_resumed") is False
+        assert mock_start.call_args.kwargs["prompt"] == ""
+
+    def test_stopped_session_resume_turn_resends_original(self, session_manager,
+                                                          sm_module):
+        """The usage-limit CTA's promise: switching models also re-runs the turn
+        the limit ate, so the user never retypes it.  No tool ran, so the
+        original request is re-sent rather than a meaningless "continue"."""
+        info = self._make_session(session_manager, sm_module, "sm-resume",
+                                  state=sm_module.SessionState.STOPPED)
+        info.entries.append(sm_module.LogEntry(kind="user", text="do the thing"))
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            result = session_manager.set_session_model(
+                "sm-resume", "claude-sonnet-4-6", resume_turn=True)
+        assert result["ok"] is True
+        assert result["turn_resumed"] is True
+        assert mock_start.call_args.kwargs["prompt"] == "do the thing"
+        assert mock_start.call_args.kwargs["model"] == "claude-sonnet-4-6"
+
+    def test_resume_turn_continues_when_a_tool_already_ran(self, session_manager,
+                                                           sm_module):
+        """If the interrupted turn already ran a tool, re-sending the request
+        would duplicate side effects (edits, commits).  Continue instead."""
+        info = self._make_session(session_manager, sm_module, "sm-resume-tool",
+                                  state=sm_module.SessionState.STOPPED)
+        info.entries.append(sm_module.LogEntry(kind="user", text="edit the file"))
+        info.entries.append(sm_module.LogEntry(kind="tool_use", text="Edit"))
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            session_manager.set_session_model(
+                "sm-resume-tool", "claude-sonnet-4-6", resume_turn=True)
+        assert (mock_start.call_args.kwargs["prompt"]
+                == sm_module.SessionManager._API_RETRY_CONTINUE_PROMPT)
+
+    def test_resume_turn_with_empty_transcript_resumes_cold(self, session_manager,
+                                                            sm_module):
+        """Nothing to resume → resume cold rather than sending a bogus prompt."""
+        self._make_session(session_manager, sm_module, "sm-resume-empty",
+                           state=sm_module.SessionState.STOPPED)
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            result = session_manager.set_session_model(
+                "sm-resume-empty", "claude-sonnet-4-6", resume_turn=True)
+        assert result["turn_resumed"] is False
+        assert mock_start.call_args.kwargs["prompt"] == ""
+
+    def test_resume_turn_clears_the_retry_budget(self, session_manager, sm_module):
+        """The resumed turn is a fresh start — it must not inherit the failed
+        turn's consumed attempts, or a later genuine outage gets a short chain."""
+        info = self._make_session(session_manager, sm_module, "sm-resume-budget",
+                                  state=sm_module.SessionState.STOPPED)
+        info.entries.append(sm_module.LogEntry(kind="user", text="go"))
+        info._api_retry_count = 4
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}):
+            session_manager.set_session_model(
+                "sm-resume-budget", "claude-sonnet-4-6", resume_turn=True)
+        assert info._api_retry_count == 0
+
+    def test_stopped_session_resume_failure_surfaces_error(self, session_manager,
+                                                           sm_module):
+        """If the resume itself fails, the switch must report ok=False rather
+        than claiming a model change that never happened (honesty contract)."""
+        info = self._make_session(session_manager, sm_module, "sm-stopped-fail",
+                                  state=sm_module.SessionState.STOPPED)
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": False, "error": "boom"}):
+            result = session_manager.set_session_model("sm-stopped-fail",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert "boom" in result["error"]
+        assert info.model == "claude-fable-5"  # untouched
+
+    def test_empty_model_rejected(self, session_manager, sm_module):
+        self._make_session(session_manager, sm_module, "sm-empty")
+        result = session_manager.set_session_model("sm-empty", "   ")
+        assert result["ok"] is False
+
+    def test_session_without_client_resumes_with_requested_model(
+            self, session_manager, sm_module):
+        """An in-memory session whose transport died has no CLI to accept a
+        control request, so it takes the same resume-with-``--model`` path as a
+        STOPPED session rather than dead-ending."""
+        self._make_session(session_manager, sm_module, "sm-noclient",
+                           client=None)
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            result = session_manager.set_session_model("sm-noclient",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is True
+        assert result["resumed"] is True
+        assert mock_start.call_args.kwargs["model"] == "claude-sonnet-4-6"
+
+    def test_resume_switch_broadcasts_session_model_changed(
+            self, session_manager, sm_module):
+        """The NOT-LIVE resume path must broadcast ``session_model_changed``
+        just like the live path does.
+
+        This is the desktop→phone bug: a session started on the computer goes
+        idle/slept, then its model is switched from the phone through this
+        resume path.  The live-switch path broadcasts so other devices update
+        their badge; the resume path used to stay silent, leaving the desktop
+        (and the sidebar model column) showing the OLD model.  The broadcast
+        must carry the REQUESTED model — ``info.model`` still holds the old id
+        here until the CLI's init message reconciles it.
+        """
+        info = self._make_session(session_manager, sm_module, "sm-bcast",
+                                  state=sm_module.SessionState.STOPPED)
+        pushes = []
+        session_manager._push_callback = lambda name, data: pushes.append((name, data))
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}):
+            result = session_manager.set_session_model("sm-bcast",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is True
+        model_events = [d for name, d in pushes if name == "session_model_changed"]
+        assert len(model_events) == 1
+        assert model_events[0]["session_id"] == "sm-bcast"
+        # The REQUESTED model, not the stale mirror (still "claude-fable-5").
+        assert model_events[0]["model"] == "claude-sonnet-4-6"
+
+    def test_failed_resume_does_not_broadcast_model_change(
+            self, session_manager, sm_module):
+        """If the resume itself fails, no ``session_model_changed`` may go out —
+        broadcasting a switch that never happened would make other devices lie
+        (the honesty contract that governs the whole feature)."""
+        self._make_session(session_manager, sm_module, "sm-bcast-fail",
+                           state=sm_module.SessionState.STOPPED)
+        pushes = []
+        session_manager._push_callback = lambda name, data: pushes.append((name, data))
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": False, "error": "boom"}):
+            result = session_manager.set_session_model("sm-bcast-fail",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert not [d for name, d in pushes if name == "session_model_changed"]
+
+    # ── Hardening: the model must STICK across devices/reloads ──
+
+    def test_broadcast_carries_resumed_hint(self, session_manager, sm_module):
+        """Both broadcast origins must say whether the switch RESUMED the
+        session, so a client forced to treat the broadcast as its confirmation
+        (lost socket reply on mobile) can act exactly as it would on the reply
+        — the usage-limit CTA must not nudge a session that is already coming
+        back up on its own."""
+        # Live path → resumed False
+        self._make_session(session_manager, sm_module, "sm-hint-live")
+        pushes = []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(return_value=None)):
+            session_manager.set_session_model("sm-hint-live", "claude-sonnet-4-6")
+        ev = [d for n, d in pushes if n == "session_model_changed"]
+        assert len(ev) == 1 and ev[0]["resumed"] is False
+        # Resume path → resumed True
+        info = self._make_session(session_manager, sm_module, "sm-hint-resume",
+                                  state=sm_module.SessionState.STOPPED)
+        info.entries.append(sm_module.LogEntry(kind="user", text="go"))
+        pushes.clear()
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}):
+            session_manager.set_session_model("sm-hint-resume",
+                                              "claude-sonnet-4-6",
+                                              resume_turn=True)
+        ev = [d for n, d in pushes if n == "session_model_changed"]
+        assert len(ev) == 1
+        assert ev[0]["resumed"] is True
+        assert ev[0]["turn_resumed"] is True
+
+    def test_bare_wake_pins_registry_model_on_cli(self, session_manager):
+        """A bare wake (resume, no explicit model) must launch the CLI on the
+        model the registry recorded — not just paint it on the badge.
+
+        ``claude --resume`` does not remember a session's model; without
+        ``--model`` it comes back on the CLI default.  Seeding only
+        ``info.model`` made the badge claim one model while the session ran on
+        another; a switch then only held when the initiating tab still had
+        the choice in memory and re-sent it.
+        ``[1m]`` is KEPT on the launch id: it is the session's 1M context
+        choice and a valid ``--model`` value, so dropping it would wake a 1M
+        session on 200K.
+        """
+        sid = "sm-wake-pin"
+        with patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {sid: {
+                              "cwd": EMPTY_CWD, "name": "Pinned",
+                              "model": "claude-opus-5[1m]"}}}), \
+             patch.object(session_manager, '_drive_session',
+                          new=AsyncMock(return_value=None)) as mock_drive:
+            result = session_manager.start_session(sid, prompt="", cwd=EMPTY_CWD,
+                                                   resume=True)
+            assert result["ok"] is True
+            wait_for(lambda: mock_drive.await_count == 1, timeout=5)
+        assert mock_drive.call_args.kwargs["model"] == "claude-opus-5[1m]"
+        assert session_manager._sessions[sid].model == "claude-opus-5[1m]"
+
+    def test_resume_without_cwd_uses_transcript_cwd(self, session_manager, tmp_path):
+        """A resume with no cwd must run in the folder the transcript records.
+
+        A session whose registry entry has an empty cwd can be woken by a
+        model switch.  With no cwd the CLI would start in the daemon's own
+        directory (the VibeNode repo), so the session would run in the wrong
+        folder and show up under VibeNode as "New Session".
+        """
+        import json as _json
+        from web.config import _encode_cwd
+        proj = tmp_path / "AcmeWeb"
+        sub = proj / "subprojects" / "migration"
+        wrong = tmp_path / "VibeNode"
+        sub.mkdir(parents=True)
+        wrong.mkdir()
+        sid = "sm-no-cwd"
+        # The transcript lives in the home project's directory, like Claude
+        # Code stores it.  Its lines record cd's into a subfolder and lines
+        # written after a bad wake in the wrong folder; neither is home.
+        home_dir = tmp_path / "projects" / _encode_cwd(str(proj))
+        home_dir.mkdir(parents=True)
+        tx = home_dir / f"{sid}.jsonl"
+        tx.write_text("\n".join([
+            _json.dumps({"type": "user", "cwd": str(sub)}),
+            _json.dumps({"type": "assistant", "cwd": str(proj)}),
+            _json.dumps({"type": "user", "cwd": str(wrong)}),
+            _json.dumps({"type": "assistant", "cwd": str(sub)}),
+        ]) + "\n", encoding="utf-8")
+        with patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {sid: {"cwd": "", "name": ""}}}), \
+             patch.object(session_manager._store, 'find_session_path', return_value=tx), \
+             patch.object(session_manager, '_drive_session',
+                          new=AsyncMock(return_value=None)) as mock_drive:
+            result = session_manager.start_session(sid, prompt="", cwd="", resume=True)
+            assert result["ok"] is True
+            wait_for(lambda: mock_drive.await_count == 1, timeout=5)
+        assert mock_drive.call_args.args[2] == os.path.normpath(str(proj))
+
+    def test_transcript_cwd_skips_missing_dirs_and_no_transcript(self, session_manager, tmp_path):
+        import json as _json
+        from web.config import _encode_cwd
+        gone = tmp_path / "deleted-folder"
+        d = tmp_path / "projects" / _encode_cwd(str(gone))
+        d.mkdir(parents=True)
+        tx = d / "t.jsonl"
+        tx.write_text(_json.dumps({"cwd": str(gone)}) + "\n", encoding="utf-8")
+        with patch.object(session_manager._store, 'find_session_path', return_value=tx):
+            assert session_manager._transcript_cwd("x") == ""
+        with patch.object(session_manager._store, 'find_session_path', return_value=None):
+            assert session_manager._transcript_cwd("x") == ""
+
+    def test_explicit_wake_model_beats_registry(self, session_manager):
+        """A caller-supplied model always wins over the registry seed."""
+        sid = "sm-wake-explicit"
+        with patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {sid: {
+                              "cwd": EMPTY_CWD, "model": "claude-opus-5"}}}), \
+             patch.object(session_manager, '_drive_session',
+                          new=AsyncMock(return_value=None)) as mock_drive:
+            session_manager.start_session(sid, prompt="", cwd=EMPTY_CWD,
+                                          resume=True, model="claude-sonnet-4-6")
+            wait_for(lambda: mock_drive.await_count == 1, timeout=5)
+        assert mock_drive.call_args.kwargs["model"] == "claude-sonnet-4-6"
+
+    def test_cli_model_id_keeps_1m_and_strips_the_rest(self, session_manager):
+        f = session_manager._cli_model_id
+        # [1m] is the 1M context choice and a valid --model for Opus/Sonnet.
+        assert f("claude-opus-5[1m]") == "claude-opus-5[1m]"
+        assert f("claude-sonnet-5[1m]") == "claude-sonnet-5[1m]"
+        # Haiku rejects [1m] with an API 400, so it is stripped there.
+        assert f("claude-haiku-4-5[1m]") == "claude-haiku-4-5"
+        # Any other bracketed marker is not a launch id.
+        assert f("claude-opus-5[beta]") == "claude-opus-5"
+        assert f("claude-opus-5[beta][1m]") == "claude-opus-5[1m]"
+        assert f("  claude-sonnet-4-6 ") == "claude-sonnet-4-6"
+        assert f("") == "" and f(None) == ""
+
+    def test_init_model_change_broadcasts_and_persists(self, session_manager,
+                                                        sm_module):
+        """When the CLI's init resolves a DIFFERENT model than the mirror,
+        every client must be told (otherwise other devices wait for the next
+        state transition) and the registry seed must be updated (otherwise the
+        next bare wake pins a stale model).  A steady-state init that reports
+        the same model must stay silent."""
+        from engine.backends.messages import VibeNodeMessage, MessageKind
+        info = self._make_session(session_manager, sm_module, "sm-init-bcast",
+                                  model="claude-fable-5")
+        pushes = []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+
+        def _init(model):
+            msg = VibeNodeMessage(kind=MessageKind.SYSTEM, subtype="init",
+                                  data={"model": model})
+            asyncio.run_coroutine_threadsafe(
+                session_manager._process_message("sm-init-bcast", msg),
+                session_manager._loop,
+            ).result(timeout=5)
+
+        _init("claude-fable-5")            # unchanged → silent
+        assert not [d for n, d in pushes if n == "session_model_changed"]
+        # Persistence: the sink must be asked to save when the id changes.
+        # (The init branch schedules registry saves for other reasons too, so
+        # spy on the sink's kwargs rather than counting save calls.)
+        with patch.object(session_manager, '_set_confirmed_model',
+                          wraps=session_manager._set_confirmed_model) as spy:
+            _init("claude-sonnet-4-6")     # changed → broadcast + persist
+        assert spy.call_args.kwargs.get("save_registry") is True
+        ev = [d for n, d in pushes if n == "session_model_changed"]
+        assert len(ev) == 1
+        assert ev[0]["model"] == "claude-sonnet-4-6"
+        assert info.model == "claude-sonnet-4-6"
+
+    # ── init-time remap prevents the phantom-duplicate session ─────────────
+    # A session launched under a client temp id must adopt the CLI's real id
+    # as soon as the init message announces it — NOT only on a completed
+    # RESULT.  A first turn that crashed before RESULT otherwise stranded the
+    # temp id as a fileless "working" row while the real transcript lived
+    # under the CLI id, so the session showed up twice in the sidebar.
+
+    def _send(self, session_manager, sid, msg):
+        asyncio.run_coroutine_threadsafe(
+            session_manager._process_message(sid, msg),
+            session_manager._loop,
+        ).result(timeout=5)
+
+    def test_init_remaps_temp_id_to_cli_id(self, session_manager, sm_module):
+        from engine.backends.messages import VibeNodeMessage, MessageKind
+        info = self._make_session(session_manager, sm_module, "temp-x")
+        pushes = []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+        # init with no "model" key keeps the test to the remap alone.
+        self._send(session_manager, "temp-x", VibeNodeMessage(
+            kind=MessageKind.SYSTEM, subtype="init",
+            data={"session_id": "real-x"}))
+        assert session_manager._id_aliases.get("temp-x") == "real-x"
+        assert "real-x" in session_manager._sessions
+        assert "temp-x" not in session_manager._sessions
+        assert info.session_id == "real-x"
+        assert any(n == "session_id_remapped"
+                   and d == {"old_id": "temp-x", "new_id": "real-x"}
+                   for n, d in pushes)
+
+    def test_phantom_not_stranded_when_turn_crashes_before_result(
+            self, session_manager, sm_module):
+        """init remaps; then NO result arrives (the CLI crashed).  There must
+        be exactly one session, under the CLI id — no temp-id phantom."""
+        from engine.backends.messages import VibeNodeMessage, MessageKind
+        self._make_session(session_manager, sm_module, "temp-c")
+        session_manager._push_callback = lambda n, d: None
+        self._send(session_manager, "temp-c", VibeNodeMessage(
+            kind=MessageKind.SYSTEM, subtype="init",
+            data={"session_id": "real-c"}))
+        # (no RESULT — the turn died)
+        assert "real-c" in session_manager._sessions
+        assert "temp-c" not in session_manager._sessions
+
+    def test_result_after_init_remap_is_idempotent(self, session_manager, sm_module):
+        """The RESULT backstop re-fires the remap; it must be a no-op, not a
+        second remap or a duplicate push."""
+        from engine.backends.messages import VibeNodeMessage, MessageKind
+        info = self._make_session(session_manager, sm_module, "temp-i")
+        pushes = []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+        self._send(session_manager, "temp-i", VibeNodeMessage(
+            kind=MessageKind.SYSTEM, subtype="init",
+            data={"session_id": "real-i"}))
+        self._send(session_manager, "temp-i", VibeNodeMessage(
+            kind=MessageKind.RESULT, subtype="success",
+            is_error=False, session_id="real-i"))
+        remaps = [d for n, d in pushes if n == "session_id_remapped"]
+        assert len(remaps) == 1
+        assert info.session_id == "real-i"
+        assert "temp-i" not in session_manager._sessions
+
+    def test_init_without_new_id_or_same_id_is_noop(self, session_manager, sm_module):
+        from engine.backends.messages import VibeNodeMessage, MessageKind
+        self._make_session(session_manager, sm_module, "keep-id")
+        session_manager._push_callback = lambda n, d: None
+        for data in ({}, {"session_id": ""}, {"session_id": "keep-id"}):
+            self._send(session_manager, "keep-id", VibeNodeMessage(
+                kind=MessageKind.SYSTEM, subtype="init", data=data))
+        assert "keep-id" in session_manager._sessions
+        assert "keep-id" not in session_manager._id_aliases
+
+    def test_model_switch_flag_self_expires(self, session_manager, sm_module):
+        """A live switch arms ``_model_switch_in_progress`` so the CLI's
+        side-effect init isn't mistaken for an auto-resume.  If that init never
+        comes, the flag must not linger and swallow the NEXT real auto-resume
+        signal (session shown IDLE while working)."""
+        info = self._make_session(session_manager, sm_module, "sm-flag")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(return_value=None)):
+            session_manager.set_session_model("sm-flag", "claude-sonnet-4-6")
+        assert info._model_switch_in_progress is True
+        assert session_manager._model_switch_pending(info) is True   # fresh
+        info._model_switch_at = time.time() - (
+            session_manager._MODEL_SWITCH_INIT_WINDOW_S + 1)
+        assert session_manager._model_switch_pending(info) is False  # stale
+        assert info._model_switch_in_progress is False               # cleared
+
+    def test_failed_live_switch_clears_flag(self, session_manager, sm_module):
+        """No switch → no side-effect init is coming → the flag must not stay
+        armed, or the next genuine auto-resume gets misfiled."""
+        info = self._make_session(session_manager, sm_module, "sm-flag-fail")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(side_effect=Exception("nope"))):
+            session_manager.set_session_model("sm-flag-fail", "claude-sonnet-4-6")
+        assert getattr(info, '_model_switch_in_progress', False) is False
+
+    def test_success_updates_model_and_logs(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sm-ok")
+        pushes = []
+        session_manager._push_callback = lambda name, data: pushes.append((name, data))
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(return_value=None)) as mock_set, \
+             patch.object(session_manager, '_emit_state') as mock_emit:
+            result = session_manager.set_session_model("sm-ok", "claude-sonnet-4-6")
+        assert result["ok"] is True
+        assert result["model"] == "claude-sonnet-4-6"
+        # Recorded model updated ONLY after confirmed success
+        assert info.model == "claude-sonnet-4-6"
+        mock_set.assert_awaited_once()
+        # Transcript records the switch
+        assert any(e.kind == "system" and "claude-sonnet-4-6" in e.text
+                   for e in info.entries)
+        # Must NOT call _emit_state — doing so on an IDLE session fires
+        # _try_dispatch_queue which causes a surprise WORKING state immediately
+        # after the switch.  Badge updates go via the socket result instead.
+        mock_emit.assert_not_called()
+        # But MUST broadcast a queue-neutral session_model_changed so other
+        # tabs / devices see the switch without needing a state transition.
+        model_events = [d for name, d in pushes if name == "session_model_changed"]
+        assert len(model_events) == 1
+        assert model_events[0]["session_id"] == "sm-ok"
+        assert model_events[0]["model"] == "claude-sonnet-4-6"
+
+    def test_1m_is_a_literal_choice_in_both_directions(self, session_manager, sm_module):
+        """[1m] is the context-window choice, taken literally.
+
+        The picker offers 1M as its own chip and sends ``claude-opus-5[1m]``
+        for it.  A BARE same-base id is recorded as bare: the old carry-forward
+        re-attached [1m] by guesswork, while the CLI's own init report (same
+        sink) is what says which window the session actually got.
+        """
+        info = self._make_session(session_manager, sm_module, "sm-1m",
+                                  model="claude-opus-5[1m]")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(return_value=None)) as mock_set, \
+             patch.object(session_manager, '_emit_state'):
+            result = session_manager.set_session_model("sm-1m", "claude-opus-5")
+        assert result["ok"] is True
+        assert info.model == "claude-opus-5"           # recorded as asked, no guess
+        assert result["model"] == "claude-opus-5"
+
+        # 200K -> 1M: the marker reaches the CLI and the mirror.
+        info_up = self._make_session(session_manager, sm_module, "sm-1m-up",
+                                     model="claude-opus-5")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(return_value=None)) as mock_set_up, \
+             patch.object(session_manager, '_emit_state'):
+            result_up = session_manager.set_session_model("sm-1m-up", "claude-opus-5[1m]")
+        assert result_up["ok"] is True
+        assert mock_set_up.await_args.args[1] == "claude-opus-5[1m]"
+        assert info_up.model == "claude-opus-5[1m]"
+
+        # A different base id genuinely drops the marker.
+        info2 = self._make_session(session_manager, sm_module, "sm-1m-2",
+                                   model="claude-opus-5[1m]")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(return_value=None)), \
+             patch.object(session_manager, '_emit_state'):
+            result2 = session_manager.set_session_model("sm-1m-2", "claude-sonnet-5")
+        assert info2.model == "claude-sonnet-5"
+        assert result2["model"] == "claude-sonnet-5"
+
+    @pytest.mark.parametrize("data", [
+        # Current SDK shape (from the daemon log): the payload
+        # dict is in ``event`` and ``data`` is empty.
+        {"event": {"type": "message_start", "message": {"model": "claude-opus-5-5",
+            "usage": {"input_tokens": 2, "cache_creation_input_tokens": 496,
+                      "cache_read_input_tokens": 171979}}}, "data": {}},
+        # Older shape: string ``event`` plus the payload in ``data``.
+        {"event": "message_start", "data": {"type": "message_start", "message": {
+            "usage": {"input_tokens": 2, "cache_creation_input_tokens": 496,
+                      "cache_read_input_tokens": 171979}}}},
+    ])
+    def test_message_start_usage_pushed_for_both_sdk_shapes(
+            self, session_manager, sm_module, data):
+        """Per-call usage feeds every context readout.  The string-only match
+        missed the current SDK shape, so no context number ever reached the UI."""
+        from engine.backends.messages import VibeNodeMessage, MessageKind
+        self._make_session(session_manager, sm_module, "sm-usage")
+        pushes = []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+        asyncio.run(session_manager._process_message(
+            "sm-usage", VibeNodeMessage(kind=MessageKind.STREAM_EVENT, data=data)))
+        usage = [d for n, d in pushes if n == "session_usage"]
+        assert len(usage) == 1
+        assert usage[0]["usage"]["cache_read_input_tokens"] == 171979
+
+    def test_backend_rejection_leaves_model_untouched(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sm-reject")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(side_effect=Exception("CLI says no"))):
+            result = session_manager.set_session_model("sm-reject", "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert "CLI says no" in result["error"]
+        assert info.model == "claude-fable-5"  # NEVER updated on failure
+        assert not any("claude-sonnet-4-6" in e.text for e in info.entries)
+
+    def test_unsupported_backend_graceful(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sm-unsup")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(side_effect=NotImplementedError("no live switch"))):
+            result = session_manager.set_session_model("sm-unsup", "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert info.model == "claude-fable-5"
+
+    def test_dormant_session_resumed_with_requested_model(self, session_manager, tmp_path):
+        """After a daemon restart an idle session exists only on disk.
+        set_session_model must auto-resume it (like send_message does) with
+        the REQUESTED model instead of returning 'Session not found'."""
+        sid = "sm-dormant"
+        jsonl = tmp_path / f"{sid}.jsonl"
+        jsonl.write_text("{}\n")
+
+        with patch.object(session_manager._store, 'find_session_path',
+                          return_value=jsonl), \
+             patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {sid: {
+                              "cwd": str(tmp_path), "name": "Dormant",
+                              "model": "claude-fable-5"}}}), \
+             patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            result = session_manager.set_session_model(sid, "claude-sonnet-4-6")
+
+        assert result["ok"] is True
+        assert result["model"] == "claude-sonnet-4-6"
+        assert result.get("resumed") is True
+        kwargs = mock_start.call_args.kwargs
+        assert kwargs["session_id"] == sid
+        assert kwargs["resume"] is True
+        # The REQUESTED model, not the registry's stale one
+        assert kwargs["model"] == "claude-sonnet-4-6"
+        # cwd/name must come from the registry read.  This also guards the
+        # self._reg attribute name: a typo (e.g. self._registry) is swallowed
+        # by the except and resumes with empty cwd/name — the exact silent
+        # bug that once lived in send_message's fallback.
+        assert os.path.normpath(kwargs["cwd"]) == os.path.normpath(str(tmp_path))
+        assert kwargs["name"] == "Dormant"
+
+    def test_no_registry_attr_typo_in_source(self):
+        """``self._registry`` does not exist on SessionManager (it's
+        ``self._reg``); references to it inside try/except blocks fail
+        silently and gut the auto-resume fallbacks."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "src" / "engine" / "session_manager.py").read_text(encoding="utf-8")
+        assert "self._registry" not in src, \
+            "Use self._reg — self._registry silently breaks auto-resume"
+
+    # --- _set_confirmed_model: the single daemon write path ---------------
+    # The three previously-scattered writes to info.model (mid-session switch,
+    # CLI init message, and start) now funnel through one sink so their
+    # reconciliation order can never drift apart.
+
+    def test_confirmed_model_sink_updates_and_reports_change(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sink-1",
+                                  model="claude-fable-5")
+        with patch("shared.models.record_confirmed_model") as rec:
+            changed = session_manager._set_confirmed_model(info, "claude-opus-4-7")
+        assert changed is True
+        assert info.model == "claude-opus-4-7"
+        rec.assert_called_once_with("claude-opus-4-7")
+
+    def test_confirmed_model_sink_noop_when_unchanged(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sink-2",
+                                  model="claude-opus-4-7")
+        assert session_manager._set_confirmed_model(info, "claude-opus-4-7") is False
+        assert info.model == "claude-opus-4-7"
+
+    def test_confirmed_model_sink_ignores_empty(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sink-3",
+                                  model="claude-fable-5")
+        assert session_manager._set_confirmed_model(info, "   ") is False
+        assert info.model == "claude-fable-5"
+
+    def test_confirmed_model_sink_init_is_ground_truth(self, session_manager, sm_module):
+        """The CLI init message's resolved id (e.g. a dated variant) overwrites
+        a previously recorded base id — init is the ultimate authority."""
+        info = self._make_session(session_manager, sm_module, "sink-4",
+                                  model="claude-sonnet-4-6")
+        changed = session_manager._set_confirmed_model(
+            info, "claude-sonnet-4-6-20251022")
+        assert changed is True
+        assert info.model == "claude-sonnet-4-6-20251022"
+
+    def test_confirmed_model_sink_saves_registry_only_when_requested(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sink-5",
+                                  model="claude-fable-5")
+        with patch.object(session_manager, "_schedule_registry_save") as save:
+            # Default (init path): no extra disk write per turn.
+            session_manager._set_confirmed_model(info, "claude-opus-4-7")
+            save.assert_not_called()
+            # Explicit switch path: persist the change.
+            session_manager._set_confirmed_model(info, "claude-sonnet-4-6",
+                                                 save_registry=True)
+            save.assert_called_once()
+
+    def test_dormant_session_without_jsonl_rejected(self, session_manager):
+        """No in-memory session AND no .jsonl on disk → honest not-found."""
+        with patch.object(session_manager._store, 'find_session_path',
+                          return_value=None):
+            result = session_manager.set_session_model("sm-ghost",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert "not found" in result["error"].lower()
+
+    def test_dormant_resume_failure_propagates(self, session_manager, tmp_path):
+        """If the resume launch fails, the error must reach the caller —
+        never a fake ok."""
+        sid = "sm-dormant-fail"
+        jsonl = tmp_path / f"{sid}.jsonl"
+        jsonl.write_text("{}\n")
+
+        with patch.object(session_manager._store, 'find_session_path',
+                          return_value=jsonl), \
+             patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {}}), \
+             patch.object(session_manager, 'start_session',
+                          return_value={"ok": False, "error": "spawn failed"}):
+            result = session_manager.set_session_model(sid, "claude-sonnet-4-6")
+
+        assert result["ok"] is False
+        assert "spawn failed" in result["error"]
+
+    def test_startup_init_drain_prevents_stuck_working(self, session_manager, sm_module):
+        """Regression: dormant bare resume must drain the CLI startup init.
+
+        When set_session_model resumes a dormant session via start_session(prompt="",
+        resume=True), the CLI emits a ``system.init`` message immediately after
+        connecting.  Without the ``_drain_startup_init()`` call in the else branch of
+        _drive_session, that init sits in the SDK buffer.  _post_turn_compact_drain then
+        reads it in its 100 ms peek window, mistakes it for an auto-resume signal,
+        calls _enter_auto_resume (→ WORKING), and waits for a RESULT that never arrives
+        — the session is stuck in WORKING indefinitely.
+
+        Fix: before declaring IDLE in the empty-prompt else branch,
+        _drive_session now drains up to one init within a 3-second window.  This test
+        verifies that a session started with an empty prompt whose mock SDK yields one
+        init on the first receive_response() call resolves to IDLE, not WORKING.
+        """
+        from engine.backends.messages import VibeNodeMessage, MessageKind
+
+        sid = "sm-startup-drain-regression"
+        call_count = [0]
+
+        async def _mock_receive(client):
+            """First receive_response call yields the startup init; later calls empty."""
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # The startup init the CLI emits right after connect --resume.
+                yield VibeNodeMessage(kind=MessageKind.SYSTEM, subtype="init")
+            # Subsequent calls (from _post_turn_compact_drain and
+            # _extended_post_turn_listener) yield nothing — no buffered content.
+
+        mock_client = MockClaudeSDKClient()
+
+        with patch.object(session_manager._sdk, 'create_session',
+                          new=AsyncMock(return_value=mock_client)), \
+             patch.object(session_manager._sdk, 'receive_response',
+                          new=_mock_receive):
+            session_manager.start_session(sid, prompt="", cwd=EMPTY_CWD, resume=True,
+                                          model="claude-sonnet-4-6")
+            # Without the drain fix the session would be stuck in WORKING
+            # indefinitely; with the fix it resolves to IDLE quickly.
+            wait_for(
+                lambda: session_manager.get_session_state(sid) == "idle",
+                timeout=10,
+            )
+
+        assert session_manager.get_session_state(sid) == "idle", (
+            "Session stuck in WORKING — _drain_startup_init regression in _drive_session"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 14. Close session
+# ---------------------------------------------------------------------------
+
+class TestCloseSession:
+
+    def test_close_nonexistent_session(self, session_manager):
+        """Closing a nonexistent session should fail gracefully."""
+        result = session_manager.close_session("nonexistent")
+        assert result["ok"] is False
+
+    def test_close_forgets_restart_memory_for_live_session(self, session_manager, sm_module):
+        """Stopping a session must erase its restart-memory entry.
+
+        ``_last_known_states`` is snapshotted once at daemon startup and served
+        to the UI as ``last_state`` by get_dormant_states().  If a stop leaves
+        it behind, /api/sessions keeps tagging the session "idle" and the very
+        next page refresh shows it idle again — the stop silently un-does
+        itself, forever, until the daemon restarts.
+        """
+        sid = "close-forgets-memory"
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+        session_manager._last_known_states = {sid: {"last_state": "idle"}}
+
+        session_manager.close_session(sid)
+
+        assert sid not in session_manager._last_known_states
+        assert session_manager.get_dormant_states() == {}
+
+    def test_close_forgets_restart_memory_when_not_live(self, session_manager):
+        """The dormant-only case — the one that produced the bug.
+
+        A session the daemon knows ONLY as restart memory is displayed as idle,
+        so the UI offers Stop for it.  close_session returns "Session not
+        found", but it must still drop the memory entry, otherwise the stop is
+        a pure no-op and the session pops back to idle on every refresh.
+        """
+        sid = "dormant-only"
+        session_manager._last_known_states = {sid: {"last_state": "idle"}}
+
+        result = session_manager.close_session(sid)
+
+        assert result["ok"] is False  # nothing live to disconnect
+        assert sid not in session_manager._last_known_states
+        assert session_manager.get_dormant_states() == {}
+class TestErrorHandling:
+
+    def test_restart_stopped_session(self, session_manager, sm_module):
+        """Starting a session that was stopped should succeed."""
+        sid = "restart-stopped"
+
+        # Create a stopped session
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.STOPPED)
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        mock_client = MockClaudeSDKClient()
+        mock_client._messages = [
+            MockAssistantMessage([MockTextBlock("Restarted")]),
+            MockResultMessage(session_id=sid),
+        ]
+
+        with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
+            result = session_manager.start_session(sid, prompt="restart", cwd=EMPTY_CWD)
+            assert result["ok"] is True
+            wait_for(lambda: session_manager.get_session_state(sid) == "idle")
+
+
+# ---------------------------------------------------------------------------
+# 17. Get all states
+# ---------------------------------------------------------------------------
+
+class TestGetAllStates:
+
+    def test_get_all_states(self, session_manager, sm_module):
+        """get_all_states should return snapshot of all sessions."""
+        # Add some sessions manually
+        with session_manager._lock:
+            session_manager._sessions["s1"] = sm_module.SessionInfo(
+                session_id="s1", state=sm_module.SessionState.WORKING, name="Session 1"
+            )
+            session_manager._sessions["s2"] = sm_module.SessionInfo(
+                session_id="s2", state=sm_module.SessionState.IDLE, name="Session 2"
+            )
+
+        states = session_manager.get_all_states()
+        assert len(states) == 2
+
+        by_id = {s["session_id"]: s for s in states}
+        assert by_id["s1"]["state"] == "working"
+        assert by_id["s2"]["state"] == "idle"
+        assert by_id["s1"]["name"] == "Session 1"
+
+    def test_get_all_states_empty(self, session_manager):
+        """get_all_states with no sessions should return empty list."""
+        states = session_manager.get_all_states()
+        assert states == []
+
+
+# ---------------------------------------------------------------------------
+# 17b. Get dormant states (restart memory)
+# ---------------------------------------------------------------------------
+
+class TestGetDormantStates:
+    """get_dormant_states() surfaces the restart-memory snapshot so the UI can
+    show sessions that were idle/working before a restart with their real
+    state instead of "sleeping" -- but only while they remain dormant."""
+
+    def test_returns_snapshot_for_dormant_sessions(self, session_manager):
+        """Sessions in the snapshot that aren't live are returned as-is."""
+        session_manager._last_known_states = {
+            "s-idle": {"last_state": "idle", "name": "Idle"},
+            "s-work": {"last_state": "working", "name": "Work"},
+        }
+        out = session_manager.get_dormant_states()
+        assert out["s-idle"]["last_state"] == "idle"
+        assert out["s-work"]["last_state"] == "working"
+
+    def test_omits_sessions_that_went_live(self, session_manager, sm_module):
+        """A session that has since gone live must be omitted -- its live state
+        from get_all_states() is authoritative and must win."""
+        session_manager._last_known_states = {
+            "s-idle": {"last_state": "idle"},
+            "s-live": {"last_state": "working"},
+        }
+        with session_manager._lock:
+            session_manager._sessions["s-live"] = sm_module.SessionInfo(
+                session_id="s-live", state=sm_module.SessionState.IDLE
+            )
+        out = session_manager.get_dormant_states()
+        assert "s-idle" in out
+        assert "s-live" not in out
+
+    def test_empty_when_no_snapshot(self, session_manager):
+        """No captured snapshot -> empty dict (nothing to restore)."""
+        session_manager._last_known_states = {}
+        assert session_manager.get_dormant_states() == {}
+
+
+# ---------------------------------------------------------------------------
+# 17c. Registry save carries forward dormant restart-memory
+# ---------------------------------------------------------------------------
+
+class TestRegistrySaveCarriesDormant:
+    """_save_registry_now() must re-persist dormant restart-memory, not just
+    live sessions.  Otherwise idle-session display state has a one-restart
+    lifespan: recover_sessions() never relaunches idle sessions, so the first
+    save after a reboot erases them from disk and the NEXT reboot shows them as
+    "sleeping" instead of "idle" (the reported bug)."""
+
+    def _capture_snapshot(self, session_manager):
+        """Call _save_registry_now with the registry write mocked; return the
+        snapshot dict it would have written to disk."""
+        captured = {}
+        with patch.object(
+            session_manager._reg, "save_registry_now",
+            side_effect=lambda data: captured.update({"data": data}),
+        ):
+            session_manager._save_registry_now()
+        return captured.get("data", {})
+
+    def test_dormant_idle_persisted_alongside_live(self, session_manager, sm_module):
+        """A live session AND a dormant idle session both land in the snapshot,
+        so the idle marker survives to the next boot."""
+        with session_manager._lock:
+            session_manager._sessions["s-live"] = sm_module.SessionInfo(
+                session_id="s-live", state=sm_module.SessionState.WORKING, name="Live"
+            )
+        session_manager._last_known_states = {
+            "s-dormant": {
+                "last_state": "idle", "name": "Dormant",
+                "cwd": "/tmp/x", "model": "opus", "last_activity": 123.0,
+            }
+        }
+
+        data = self._capture_snapshot(session_manager)
+
+        assert "s-live" in data
+        assert data["s-live"]["state"] == "working"
+        assert "s-dormant" in data, "dormant idle session was dropped from disk"
+        assert data["s-dormant"]["state"] == "idle"
+        # Original last_activity is preserved (not restamped to now) so
+        # recover_sessions' max_age guard stays honest.
+        assert data["s-dormant"]["last_activity"] == 123.0
+
+    def test_live_wins_over_dormant_same_id(self, session_manager, sm_module):
+        """When a session is both live and in the dormant snapshot, the live
+        state is authoritative — the dormant copy must not overwrite it."""
+        with session_manager._lock:
+            session_manager._sessions["s1"] = sm_module.SessionInfo(
+                session_id="s1", state=sm_module.SessionState.WORKING, name="Live"
+            )
+        session_manager._last_known_states = {"s1": {"last_state": "idle"}}
+
+        data = self._capture_snapshot(session_manager)
+
+        assert data["s1"]["state"] == "working"
+
+    def test_dormant_survives_repeated_saves(self, session_manager):
+        """Idempotence: carrying forward must not lose the entry across
+        successive saves (the multi-reboot case)."""
+        session_manager._last_known_states = {
+            "s-dormant": {"last_state": "idle", "name": "D", "last_activity": 50.0}
+        }
+        first = self._capture_snapshot(session_manager)
+        second = self._capture_snapshot(session_manager)
+        assert "s-dormant" in first
+        assert "s-dormant" in second
+        assert second["s-dormant"]["state"] == "idle"
+
+
+# ---------------------------------------------------------------------------
+# 18. Get entries with since
+# ---------------------------------------------------------------------------
+
+class TestGetEntries:
+
+    def test_get_entries_with_since(self, session_manager, sm_module):
+        """get_entries(since=N) should skip first N entries."""
+        sid = "entries-since"
+        info = sm_module.SessionInfo(session_id=sid)
+        info.entries = [
+            sm_module.LogEntry(kind="user", text="First"),
+            sm_module.LogEntry(kind="asst", text="Second"),
+            sm_module.LogEntry(kind="user", text="Third"),
+        ]
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        all_entries = session_manager.get_entries(sid)
+        assert len(all_entries) == 3
+
+        since_1 = session_manager.get_entries(sid, since=1)
+        assert len(since_1) == 2
+        assert since_1[0]["text"] == "Second"
+
+        since_2 = session_manager.get_entries(sid, since=2)
+        assert len(since_2) == 1
+        assert since_2[0]["text"] == "Third"
+
+        since_3 = session_manager.get_entries(sid, since=3)
+        assert len(since_3) == 0
+
+    def test_get_entries_nonexistent(self, session_manager):
+        """get_entries for nonexistent session returns empty list."""
+        entries = session_manager.get_entries("nonexistent")
+        assert entries == []
+
+
+# ---------------------------------------------------------------------------
+# 19. Thread safety
+# ---------------------------------------------------------------------------
+
+class TestThreadSafety:
+
+    def test_thread_safety_concurrent_operations(self, session_manager, sm_module):
+        """Multiple threads calling session manager methods should not corrupt state."""
+        errors = []
+
+        def worker(thread_id):
+            try:
+                sid = f"thread-{thread_id}"
+                info = sm_module.SessionInfo(
+                    session_id=sid, state=sm_module.SessionState.IDLE
+                )
+                with session_manager._lock:
+                    session_manager._sessions[sid] = info
+
+                # Read operations
+                session_manager.get_all_states()
+                session_manager.get_entries(sid)
+                session_manager.has_session(sid)
+                session_manager.get_session_state(sid)
+            except Exception as e:
+                errors.append((thread_id, e))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert len(errors) == 0, f"Thread errors: {errors}"
+class TestToolDescExtraction:
+
+    def test_extract_command(self, sm_module):
+        desc = sm_module.SessionManager._extract_tool_desc({"command": "ls -la /home"})
+        assert desc == "ls -la /home"
+
+    def test_extract_path_with_content(self, sm_module):
+        desc = sm_module.SessionManager._extract_tool_desc(
+            {"path": "/foo/bar.py", "content": "hello world"}
+        )
+        assert "/foo/bar.py" in desc
+        assert "write" in desc.lower()
+
+    def test_extract_pattern(self, sm_module):
+        desc = sm_module.SessionManager._extract_tool_desc({"pattern": "*.py"})
+        assert desc == "*.py"
+
+    def test_extract_other(self, sm_module):
+        desc = sm_module.SessionManager._extract_tool_desc({"url": "https://example.com"})
+        assert "url" in desc
+        assert "example.com" in desc
+
+    def test_extract_empty(self, sm_module):
+        desc = sm_module.SessionManager._extract_tool_desc({})
+        assert desc == ""
+
+
+# ---------------------------------------------------------------------------
+# LogEntry serialization
+# ---------------------------------------------------------------------------
+
+class TestLogEntry:
+
+    def test_to_dict_minimal(self, sm_module):
+        entry = sm_module.LogEntry(kind="asst", text="Hello")
+        d = entry.to_dict()
+        assert d["kind"] == "asst"
+        assert d["text"] == "Hello"
+        assert "name" not in d  # empty string fields should be excluded
+        assert "timestamp" in d
+
+    def test_to_dict_tool_use(self, sm_module):
+        entry = sm_module.LogEntry(
+            kind="tool_use", name="Bash", desc="echo hi", id="t-123"
+        )
+        d = entry.to_dict()
+        assert d["kind"] == "tool_use"
+        assert d["name"] == "Bash"
+        assert d["desc"] == "echo hi"
+        assert d["id"] == "t-123"
+
+    def test_to_dict_error(self, sm_module):
+        entry = sm_module.LogEntry(kind="system", text="Error!", is_error=True)
+        d = entry.to_dict()
+        assert d["is_error"] is True
+class TestSessionQueries:
+
+    def test_has_session_true(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="exists")
+        with session_manager._lock:
+            session_manager._sessions["exists"] = info
+        assert session_manager.has_session("exists") is True
+
+    def test_has_session_false(self, session_manager):
+        assert session_manager.has_session("does-not-exist") is False
+
+    def test_get_session_state_none(self, session_manager):
+        assert session_manager.get_session_state("no-such") is None
+
+    def test_resolve_permission_wrong_session(self, session_manager):
+        """Resolving permission for nonexistent session should fail."""
+        result = session_manager.resolve_permission("nobody", allow=True)
+        assert result["ok"] is False
+        assert "not found" in result["error"].lower()
+
+    def test_resolve_permission_no_pending(self, session_manager, sm_module):
+        """Resolving when no future is pending should fail."""
+        sid = "no-pending"
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.WAITING)
+        info.pending_permission = None
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        result = session_manager.resolve_permission(sid, allow=True)
+        assert result["ok"] is False
+        assert "no pending" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Regression: project-switch bleed — get_all_states cwd fill-in
+# ---------------------------------------------------------------------------
+
+class TestGetAllStatesCwdFillIn:
+    """Regression tests for the project-switch cross-project bleed fix.
+
+    Root cause: sessions auto-resumed before the _reg typo fix had info.cwd=""
+    which caused _filter_sessions_for_project to include them in EVERY project's
+    snapshot.  get_all_states() now fills in cwd from the registry for empty-cwd
+    sessions so the filter can exclude them correctly.
+    """
+
+    def test_empty_cwd_session_gets_registry_fallback(self, session_manager, sm_module):
+        """A session with cwd='' in daemon memory should get cwd filled from registry."""
+        sid = "bleed-test-session"
+        real_cwd = "C:/Users/test/code/ProjectA"
+
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+        info.cwd = ""  # simulate pre-fix auto-resume
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        reg_data = {"sessions": {sid: {"cwd": real_cwd, "name": "test", "state": "idle"}}}
+        session_manager._reg.load_registry = MagicMock(return_value=reg_data)
+
+        states = session_manager.get_all_states()
+        by_id = {s["session_id"]: s for s in states}
+        assert sid in by_id
+        # cwd must be filled in from the registry
+        assert by_id[sid]["cwd"] == real_cwd, (
+            "get_all_states must fill in cwd from registry for empty-cwd sessions "
+            "so _filter_sessions_for_project can exclude them from wrong projects"
+        )
+
+    def test_session_with_real_cwd_is_unchanged(self, session_manager, sm_module):
+        """Sessions that already have a cwd set must not have it overwritten."""
+        sid = "has-cwd-session"
+        original_cwd = "C:/Users/test/code/ProjectB"
+        reg_cwd = "C:/Users/test/code/SomethingElse"
+
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+        info.cwd = original_cwd
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        reg_data = {"sessions": {sid: {"cwd": reg_cwd, "name": "test"}}}
+        session_manager._reg.load_registry = MagicMock(return_value=reg_data)
+
+        states = session_manager.get_all_states()
+        by_id = {s["session_id"]: s for s in states}
+        assert by_id[sid]["cwd"] == original_cwd, (
+            "Sessions with a real cwd must not have it overwritten by the registry"
+        )
+        # Registry should not even be read when no empty-cwd sessions exist
+        session_manager._reg.load_registry.assert_not_called()
+
+    def test_registry_read_failure_is_silently_ignored(self, session_manager, sm_module):
+        """If the registry read raises, get_all_states() must still return normally."""
+        sid = "fail-reg-session"
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+        info.cwd = ""
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        session_manager._reg.load_registry = MagicMock(side_effect=OSError("disk error"))
+
+        # Must not raise
+        states = session_manager.get_all_states()
+        by_id = {s["session_id"]: s for s in states}
+        assert sid in by_id
+        # cwd stays empty (no crash, just permissive)
+        assert by_id[sid]["cwd"] == ""
+
+    def test_no_registry_read_when_all_cwds_populated(self, session_manager, sm_module):
+        """Registry must not be read at all when every session already has a cwd."""
+        for i in range(3):
+            sid = f"cwd-session-{i}"
+            info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+            info.cwd = f"C:/Users/test/proj{i}"
+            with session_manager._lock:
+                session_manager._sessions[sid] = info
+
+        session_manager._reg.load_registry = MagicMock()
+
+        session_manager.get_all_states()
+        session_manager._reg.load_registry.assert_not_called()
+
+    def test_filter_sessions_excludes_other_project(self):
+        """Server-side _filter_sessions_for_project must exclude sessions with a
+        non-matching cwd now that get_all_states() fills in the registry cwd."""
+        from web.routes.ws_events import register_ws_events
+        from unittest.mock import MagicMock
+        # Reconstruct the filter function the same way ws_events defines it
+        # (it's a closure, so we re-implement the same logic inline)
+        from web.config import cwd_matches_active_project
+
+        def _filter(sessions, project=""):
+            return [s for s in sessions
+                    if not s.get("cwd") or cwd_matches_active_project(s["cwd"], project=project)]
+
+        project_a_cwd = "C:/Users/test/ProjectA"
+        project_b_encoded = "C--Users-test-ProjectB"
+        sessions = [
+            {"session_id": "s1", "cwd": project_a_cwd, "state": "working"},
+            {"session_id": "s2", "cwd": "", "state": "idle"},  # new session, no cwd yet
+        ]
+        filtered = _filter(sessions, project=project_b_encoded)
+        ids = {s["session_id"] for s in filtered}
+        assert "s1" not in ids, (
+            "Session from ProjectA must be excluded when filtering for ProjectB"
+        )
+        assert "s2" in ids, (
+            "Brand-new session with empty cwd must still pass through (may belong to active project)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Effort (thinking level) is pinned across resumes
+# ---------------------------------------------------------------------------
+
+class TestResumeEffortPinning:
+    """``claude --resume`` does not remember ``--effort``, just as it does not
+    remember ``--model``.  Before this, every wake, auto-resume, and
+    resume-with-``--model`` silently dropped a session to the CLI default
+    effort.  The daemon now records the launch effort and re-pins it."""
+
+    def _start(self, session_manager, sid, registry=None, **kw):
+        with patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": registry or {}}), \
+             patch.object(session_manager, '_drive_session',
+                          new=AsyncMock(return_value=None)) as mock_drive:
+            result = session_manager.start_session(sid, prompt="", cwd=EMPTY_CWD, **kw)
+            assert result["ok"] is True
+            wait_for(lambda: mock_drive.await_count == 1, timeout=5)
+        return (mock_drive.call_args.kwargs.get("extra_args") or {}), \
+            session_manager._sessions[session_manager._resolve_id(sid)]
+
+    def _stopped(self, session_manager, sm_module, sid, effort):
+        info = sm_module.SessionInfo(session_id=sid,
+                                     state=sm_module.SessionState.STOPPED)
+        info.effort = effort
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+    def test_new_session_records_explicit_effort(self, session_manager):
+        args, info = self._start(session_manager, "ef-new",
+                                 extra_args={"effort": "xhigh"})
+        assert args == {"effort": "xhigh"}
+        assert info.effort == "xhigh"
+        assert info.to_state_dict()["effort"] == "xhigh"
+
+    def test_new_session_without_effort_sends_no_flag(self, session_manager):
+        args, info = self._start(session_manager, "ef-none")
+        assert "effort" not in args
+        assert info.effort == ""
+        assert info.to_state_dict()["effort"] == ""
+
+    def test_wake_repins_effort_of_slept_session(self, session_manager, sm_module):
+        """A slept session is STOPPED and absent from the registry snapshot;
+        its in-memory effort is the record that must survive the wake."""
+        self._stopped(session_manager, sm_module, "ef-wake", "max")
+        args, info = self._start(session_manager, "ef-wake", resume=True)
+        assert args["effort"] == "max"
+        assert info.effort == "max"
+
+    def test_dormant_resume_uses_registry_effort(self, session_manager):
+        args, info = self._start(session_manager, "ef-dormant", resume=True,
+                                 registry={"ef-dormant": {"cwd": EMPTY_CWD,
+                                                          "effort": "high"}})
+        assert args["effort"] == "high"
+        assert info.effort == "high"
+
+    def test_explicit_effort_beats_remembered(self, session_manager, sm_module):
+        self._stopped(session_manager, sm_module, "ef-explicit", "max")
+        args, info = self._start(session_manager, "ef-explicit", resume=True,
+                                 extra_args={"effort": "low"})
+        assert args["effort"] == "low"
+        assert info.effort == "low"
+
+    def test_effort_reset_drops_remembered(self, session_manager, sm_module):
+        """The live switch to "Default" must not be undone by re-pinning."""
+        self._stopped(session_manager, sm_module, "ef-reset", "xhigh")
+        args, info = self._start(session_manager, "ef-reset", resume=True,
+                                 effort_reset=True)
+        assert "effort" not in args
+        assert info.effort == ""
+
+    def test_invalid_effort_never_reaches_cli(self, session_manager, sm_module):
+        """The CLI silently ignores an unknown --effort value, so forwarding
+        one would record a level the session is not actually running at."""
+        args, info = self._start(session_manager, "ef-bad-explicit",
+                                 extra_args={"effort": "auto"})
+        assert "effort" not in args and info.effort == ""
+        self._stopped(session_manager, sm_module, "ef-bad-mem", "none")
+        args, info = self._start(session_manager, "ef-bad-mem", resume=True)
+        assert "effort" not in args and info.effort == ""
+
+    def test_other_extra_args_preserved(self, session_manager, sm_module):
+        self._stopped(session_manager, sm_module, "ef-keep", "medium")
+        args, _ = self._start(session_manager, "ef-keep", resume=True,
+                              extra_args={"verbose": None})
+        assert args == {"verbose": None, "effort": "medium"}
+
+    def test_registry_snapshot_persists_effort(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="ef-reg",
+                                     state=sm_module.SessionState.IDLE)
+        info.effort = "xhigh"
+        with session_manager._lock:
+            session_manager._sessions["ef-reg"] = info
+        with patch.object(session_manager._reg, 'save_registry_now') as save:
+            session_manager._save_registry_now()
+        assert save.call_args.args[0]["ef-reg"]["effort"] == "xhigh"
+
+    def test_wake_under_pre_remap_id_finds_effort(self, session_manager, sm_module):
+        """After the first RESULT the daemon remaps temp id -> CLI id.  A wake
+        that still uses the temp id (stale tab, other device) must find the
+        level stored on the remapped session."""
+        self._stopped(session_manager, sm_module, "real-cli-id", "xhigh")
+        session_manager._id_aliases["temp-id"] = "real-cli-id"
+        args, info = self._start(session_manager, "temp-id", resume=True)
+        assert args["effort"] == "xhigh"
+        assert info.effort == "xhigh"
+
+    def test_dormant_registry_lookup_follows_alias(self, session_manager):
+        session_manager._id_aliases["temp-2"] = "real-2"
+        args, _ = self._start(session_manager, "temp-2", resume=True,
+                              registry={"real-2": {"effort": "max"}})
+        assert args["effort"] == "max"
+
+
+# ---------------------------------------------------------------------------
+# Live thinking-level change (set_session_effort)
+#
+# Changing thinking used to restart the CLI, and a busy session refused it:
+# "Session is busy. Change thinking once the current turn finishes."  The CLI's
+# apply_flag_settings control request changes the level in place, mid-turn
+# included.  Same honesty contract as set_session_model: info.effort changes
+# only after the backend confirmed.
+# ---------------------------------------------------------------------------
+
+class TestSetSessionEffort:
+
+    def _make(self, session_manager, sm_module, sid, state=None, effort="medium",
+              client=object()):
+        info = sm_module.SessionInfo(session_id=sid,
+                                     state=state or sm_module.SessionState.WORKING)
+        info.effort = effort
+        info.client = client
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+        return info
+
+    def _pushes(self, session_manager):
+        pushes = []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+        return pushes
+
+    def test_busy_session_switches_in_place(self, session_manager, sm_module):
+        """The reported case: a WORKING session takes the change at once, with
+        no restart and no refusal."""
+        info = self._make(session_manager, sm_module, "ef-live")
+        pushes = self._pushes(session_manager)
+        with patch.object(session_manager._sdk, 'set_effort',
+                          new=AsyncMock(return_value="high")) as mock_set, \
+             patch.object(session_manager, '_emit_state') as mock_emit, \
+             patch.object(session_manager, 'close_session') as mock_close:
+            result = session_manager.set_session_effort("ef-live", "high")
+        assert result == {"ok": True, "effort": "high", "applied": "high"}
+        mock_set.assert_awaited_once()
+        assert mock_set.await_args.args[1] == "high"
+        assert info.effort == "high"                     # re-pinned on every later resume
+        mock_close.assert_not_called()
+        # No _emit_state: on an IDLE session it dispatches the queue.
+        mock_emit.assert_not_called()
+        ev = [d for n, d in pushes if n == "session_effort_changed"]
+        assert ev == [{"session_id": "ef-live", "effort": "high", "applied": "high"}]
+        assert any(e.kind == "system" and e.text == "Thinking set to High"
+                   for e in info.entries)
+
+    def test_default_resets_and_records_no_level(self, session_manager, sm_module):
+        info = self._make(session_manager, sm_module, "ef-def", effort="max")
+        with patch.object(session_manager._sdk, 'set_effort',
+                          new=AsyncMock(return_value="medium")) as mock_set:
+            result = session_manager.set_session_effort("ef-def", "default")
+        assert result["ok"] is True and result["effort"] == ""
+        assert mock_set.await_args.args[1] is None       # the CLI's reset value
+        assert info.effort == ""
+
+    def test_clamped_level_is_recorded_as_chosen_and_noted(self, session_manager,
+                                                           sm_module):
+        """Sonnet 4.6 runs xHigh as High.  The chosen level is what --effort
+        would pin too, so it is recorded; the transcript says what runs."""
+        info = self._make(session_manager, sm_module, "ef-clamp", state=sm_module.SessionState.IDLE)
+        with patch.object(session_manager._sdk, 'set_effort',
+                          new=AsyncMock(return_value="high")):
+            result = session_manager.set_session_effort("ef-clamp", "xhigh")
+        assert result == {"ok": True, "effort": "xhigh", "applied": "high"}
+        assert info.effort == "xhigh"
+        assert any("runs as High" in e.text for e in info.entries)
+
+    def test_unknown_level_rejected_without_touching_the_cli(self, session_manager,
+                                                             sm_module):
+        info = self._make(session_manager, sm_module, "ef-bad")
+        with patch.object(session_manager._sdk, 'set_effort', new=AsyncMock()) as mock_set:
+            result = session_manager.set_session_effort("ef-bad", "auto")
+        assert result["ok"] is False and "auto" in result["error"]
+        mock_set.assert_not_awaited()
+        assert info.effort == "medium"
+
+    @pytest.mark.parametrize("shape", ["missing", "stopped"])
+    def test_asleep_session_asks_caller_to_resume(self, session_manager,
+                                                  sm_module, shape):
+        if shape == "stopped":
+            self._make(session_manager, sm_module, "ef-nl", state=sm_module.SessionState.STOPPED)
+        with patch.object(session_manager._sdk, 'set_effort', new=AsyncMock()) as mock_set:
+            result = session_manager.set_session_effort("ef-nl", "high")
+        assert result["ok"] is False and result["not_live"] is True
+        mock_set.assert_not_awaited()
+
+    def test_connectionless_session_asks_for_a_relaunch_not_a_resume(
+            self, session_manager, sm_module):
+        """In memory, not STOPPED, no client: start_session would refuse a
+        bare resume as "already running", so the caller must close first."""
+        self._make(session_manager, sm_module, "ef-nc", state=sm_module.SessionState.IDLE,
+                   client=None)
+        with patch.object(session_manager._sdk, 'set_effort', new=AsyncMock()) as mock_set:
+            result = session_manager.set_session_effort("ef-nc", "high")
+        assert result["ok"] is False and result["live_unavailable"] is True
+        assert not result.get("not_live")
+        mock_set.assert_not_awaited()
+
+    @pytest.mark.parametrize("client", [object(), None])
+    def test_starting_session_is_not_ready(self, session_manager, sm_module, client):
+        """Starting, with or without its client yet: not dead, just early."""
+        self._make(session_manager, sm_module, "ef-start",
+                   state=sm_module.SessionState.STARTING, client=client)
+        with patch.object(session_manager._sdk, 'set_effort', new=AsyncMock()) as mock_set:
+            result = session_manager.set_session_effort("ef-start", "high")
+        assert result["ok"] is False and result["not_ready"] is True
+        mock_set.assert_not_awaited()
+
+    @pytest.mark.parametrize("exc", [
+        Exception("Unsupported control request subtype: apply_flag_settings"),
+        NotImplementedError("no live effort"),
+        RuntimeError("did not report its thinking level"),
+    ])
+    def test_failure_records_nothing_and_reports_live_unavailable(
+            self, session_manager, sm_module, exc):
+        """An old CLI, a backend without the capability, or an unconfirmed
+        change: nothing recorded, nothing broadcast, and the caller is told to
+        relaunch with --effort instead."""
+        info = self._make(session_manager, sm_module, "ef-fail")
+        pushes = self._pushes(session_manager)
+        with patch.object(session_manager._sdk, 'set_effort',
+                          new=AsyncMock(side_effect=exc)):
+            result = session_manager.set_session_effort("ef-fail", "high")
+        assert result["ok"] is False and result["live_unavailable"] is True
+        assert info.effort == "medium"
+        assert not [d for n, d in pushes if n == "session_effort_changed"]
+        assert not any("Thinking set" in e.text for e in info.entries)
+
+    def test_resolves_pre_remap_id(self, session_manager, sm_module):
+        info = self._make(session_manager, sm_module, "ef-real")
+        session_manager._id_aliases["ef-temp"] = "ef-real"
+        with patch.object(session_manager._sdk, 'set_effort',
+                          new=AsyncMock(return_value="low")):
+            result = session_manager.set_session_effort("ef-temp", "low")
+        assert result["ok"] is True
+        assert info.effort == "low"
+
+    def test_later_wake_repins_the_live_level(self, session_manager, sm_module):
+        """`claude --resume` forgets the effort, so the level set live must be
+        what the next wake (or self-heal reconnect) pins."""
+        info = self._make(session_manager, sm_module, "ef-wake2", effort="low")
+        with patch.object(session_manager._sdk, 'set_effort',
+                          new=AsyncMock(return_value="max")):
+            session_manager.set_session_effort("ef-wake2", "max")
+        info.state = sm_module.SessionState.STOPPED
+        with patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {}}), \
+             patch.object(session_manager, '_drive_session',
+                          new=AsyncMock(return_value=None)) as mock_drive:
+            assert session_manager.start_session(
+                "ef-wake2", prompt="", cwd=EMPTY_CWD, resume=True)["ok"] is True
+            wait_for(lambda: mock_drive.await_count == 1, timeout=5)
+        assert mock_drive.call_args.kwargs["extra_args"]["effort"] == "max"
+
+
+# ---------------------------------------------------------------------------
+# Pre-remap ids resolve to the real session
+# ---------------------------------------------------------------------------
+
+class TestRemapAliasEntryPoints:
+    """After the first RESULT a session lives under the CLI's id and the
+    client's temp id is an alias.  start_session and remove_session must
+    follow the alias like every other entry point already did."""
+
+    def test_wake_under_temp_id_reuses_real_session(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="real-id",
+                                     state=sm_module.SessionState.STOPPED)
+        with session_manager._lock:
+            session_manager._sessions["real-id"] = info
+        session_manager._id_aliases["temp-id"] = "real-id"
+        with patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {}}), \
+             patch.object(session_manager, '_drive_session',
+                          new=AsyncMock(return_value=None)) as mock_drive:
+            assert session_manager.start_session("temp-id", prompt="", cwd=EMPTY_CWD,
+                                                 resume=True)["ok"] is True
+            wait_for(lambda: mock_drive.await_count == 1, timeout=5)
+        # No duplicate under the temp id; the CLI resumes the REAL transcript.
+        assert "temp-id" not in session_manager._sessions
+        assert "real-id" in session_manager._sessions
+        assert mock_drive.call_args.args[0] == "real-id"
+
+    def test_message_to_live_session_via_temp_id_is_delivered(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="live-real",
+                                     state=sm_module.SessionState.IDLE)
+        with session_manager._lock:
+            session_manager._sessions["live-real"] = info
+        session_manager._id_aliases["live-temp"] = "live-real"
+        with patch.object(session_manager, 'send_message',
+                          return_value={"ok": True}) as send:
+            session_manager.start_session("live-temp", prompt="hi", cwd=EMPTY_CWD)
+        send.assert_called_once()
+        assert send.call_args.args[0] == "live-real"
+
+    def test_remove_session_follows_alias(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="rm-real")
+        with session_manager._lock:
+            session_manager._sessions["rm-real"] = info
+        session_manager._id_aliases["rm-temp"] = "rm-real"
+        session_manager.remove_session("rm-temp")
+        assert "rm-real" not in session_manager._sessions

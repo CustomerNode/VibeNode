@@ -1,0 +1,19 @@
+/* Weekly usage pace pop-ups (src/web/static/js/usage-pace.js). */
+.vn-up { width: 440px; max-width: calc(100vw - 32px); }
+.vn-up-center { text-align: center; }
+.vn-up-big { font-size: 40px; font-weight: 700; line-height: 1; color: var(--text-primary); }
+.vn-up-green { color: #4caf7d; }
+.vn-up-sub { color: var(--text-secondary); margin: 6px 0 10px; }
+.vn-up-spark { width: 100%; height: 64px; display: block; }
+.vn-up-axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-faint); margin-top: 2px; }
+.vn-up-note { font-size: 12px; color: var(--text-faint); margin-top: 10px; }
+.vn-up-pair { display: flex; gap: 28px; justify-content: center; text-align: center; margin-bottom: 8px; }
+.vn-up-pair small { color: var(--text-secondary); font-size: 12px; }
+.vn-up-fld { display: block; font-size: 12px; color: var(--text-secondary); margin: 12px 0 4px; text-align: left; }
+.vn-up select, .vn-up textarea {
+  width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 7px 9px;
+  border-radius: 8px; border: 1px solid var(--border, rgba(127,127,127,.3));
+  background: var(--bg-input, transparent); color: var(--text-primary);
+}
+.vn-up textarea { min-height: 60px; resize: vertical; }
+.vn-up-off { display: flex; gap: 6px; align-items: center; justify-content: center; font-size: 12px; color: var(--text-faint); margin-top: 14px; cursor: pointer; }

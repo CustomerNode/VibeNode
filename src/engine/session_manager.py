@@ -1,0 +1,10486 @@
+"""
+SessionManager -- manages Claude Code SDK sessions with a dedicated asyncio event loop.
+
+Runs in a daemon thread. External callers invoke via run_coroutine_threadsafe().
+Permission callbacks use anyio.Event to wait (natively compatible with the
+SDK's anyio task groups) and are resolved from the caller thread via
+loop.call_soon_threadsafe().
+"""
+
+import anyio
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import random
+import re
+import signal
+import subprocess as _subprocess
+import tempfile
+import threading
+import time
+import uuid as uuid_mod
+from collections import OrderedDict
+from datetime import datetime, timezone
+from enum import Enum
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+from engine.backends.base import (
+    AgentSDK,
+    SessionOptions,
+    PermissionResult,
+    PermissionAction,
+    TranscriptLayout,
+)
+# The default backend's vocabulary and disk layout (SDK-free).  Everything the
+# manager knows about Claude's spelling of things comes from these, never from
+# literals here (tests/test_backend_seam.py).
+from engine.backends.claude_layout import CLAUDE_KNOWLEDGE, ClaudeTranscriptLayout
+from engine.backends.messages import VibeNodeMessage, MessageKind, BlockKind
+from engine.backends.chat_store import ChatStore
+from engine.message_queue import MessageQueue
+from engine.permission_manager import PermissionManager
+from engine.session_registry import SessionRegistry
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Display-log capping for user messages.
+# ---------------------------------------------------------------------------
+# User messages are capped before being stored as a display LogEntry so a
+# runaway prompt can't bloat the in-memory log / IPC payload.  But an /invoke
+# message wraps the *entire* skill body in
+#     [[invoke::name::path=...]] ...skill... [[/invoke]] <user's own text>
+# and the web client renders that as a gradient pill keyed on the trailing
+# [[/invoke]] closing tag.  A blind prompt[:CAP] slice on a skill larger than
+# the cap chops off the closing tag, so the pill regex fails and the client
+# dumps the raw multi-thousand-char skill body into the chat (only skills
+# bigger than the cap break).  The entry text is ALSO what the self-heal
+# retry path re-sends to the SDK, so we must not mangle the block body either.
+# Fix: keep the invoke envelope whole (body included, regardless of size) and
+# cap only the user's own trailing text after [[/invoke]].
+_USER_DISPLAY_CAP = 20000
+
+
+def _cap_user_display_text(text: str, limit: int = _USER_DISPLAY_CAP) -> str:
+    """Cap a user message for the display log without ever splitting an
+    [[invoke]] block.  Non-invoke messages are simply truncated to ``limit``."""
+    if not text:
+        return text
+    if "[[invoke::" in text:
+        end = text.rfind("[[/invoke]]")
+        if end != -1:
+            end += len("[[/invoke]]")
+            # Preserve the full invoke envelope; cap only what follows it.
+            return text[:end] + text[end:end + limit]
+    return text[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Ensure Claude Code CLI is discoverable.
+# When the daemon is spawned with CREATE_NO_WINDOW the PATH may be stripped.
+# Add the standard install location so shutil.which("claude") always works.
+# ---------------------------------------------------------------------------
+# Wrapped in a function with a process-level guard so reloads (importlib.reload
+# from tests, dev hot-reload tooling, etc.) don't re-augment PATH every time.
+# Without the guard a fixture that varies Path.home() per test grows PATH past
+# the Windows 32767-char env block limit and subsequent reloads raise
+# ValueError (seen in test_state_transitions).
+#
+# The marker lives in os.environ — module-level globals get reset by reload,
+# but environment variables survive across reloads in the same process.
+_PATH_AUGMENTED_MARKER = "_VIBENODE_DAEMON_PATH_AUGMENTED"
+
+
+def _augment_path_for_cli() -> None:
+    """Idempotently add standard install dirs to PATH so the Claude CLI
+    is discoverable when the daemon was launched without a login shell.
+    Safe to call multiple times — only takes effect on the first call."""
+    if os.environ.get(_PATH_AUGMENTED_MARKER) == "1":
+        return
+    extra_path_dirs = [
+        str(Path.home() / ".local" / "bin"),      # Linux: pip --user, npm --prefix ~/.local
+        str(Path.home() / ".npm-global" / "bin"), # Linux: npm config set prefix ~/.npm-global
+        str(Path.home() / ".npm" / "bin"),        # Linux: some npm versions
+        str(Path.home() / ".volta" / "bin"),      # Volta node version manager
+        "/opt/homebrew/bin",                       # macOS Apple Silicon (Homebrew)
+        "/usr/local/bin",                          # macOS Intel (Homebrew) / Linux common
+        "/usr/bin",                                # Linux fallback for system-installed claude
+    ]
+    # nvm (Node Version Manager) installs node into versioned directories
+    # that can't be known statically. When launched from a .desktop file or
+    # other non-interactive shell, ~/.bashrc isn't sourced so nvm's shims
+    # are absent from PATH. Resolve the active version from NVM_BIN (set
+    # when nvm is live) or from ~/.nvm/alias/default.
+    nvm_dir = Path.home() / ".nvm"
+    if nvm_dir.is_dir():
+        nvm_bin = os.environ.get("NVM_BIN", "")
+        if nvm_bin and os.path.isdir(nvm_bin):
+            extra_path_dirs.append(nvm_bin)
+        else:
+            try:
+                alias_file = nvm_dir / "alias" / "default"
+                if alias_file.exists():
+                    version = alias_file.read_text(encoding="utf-8").strip().lstrip("v")
+                    # Resolve lts/* aliases (e.g. "lts/iron" -> ~/.nvm/alias/lts/iron)
+                    if "/" in version:
+                        lts_file = nvm_dir / "alias" / version
+                        if lts_file.exists():
+                            version = lts_file.read_text(encoding="utf-8").strip().lstrip("v")
+                    nvm_node_bin = nvm_dir / "versions" / "node" / ("v" + version) / "bin"
+                    if nvm_node_bin.is_dir():
+                        extra_path_dirs.append(str(nvm_node_bin))
+            except Exception:
+                pass  # Best-effort — never block startup
+
+    current_path = os.environ.get("PATH", "")
+    dirs_to_add = [d for d in extra_path_dirs if d not in current_path]
+    if dirs_to_add:
+        os.environ["PATH"] = os.pathsep.join(dirs_to_add) + os.pathsep + current_path
+    os.environ[_PATH_AUGMENTED_MARKER] = "1"
+
+
+_augment_path_for_cli()
+
+# ---------------------------------------------------------------------------
+# TTFT (time-to-first-token) wall-clock instrumentation.
+# Opt-in via VIBENODE_TIMING_TTFT=1 in the daemon's environment.
+# When disabled (default), every helper below is a fast no-op — zero cost.
+#
+# CLAUDE.md invariants respected (per stamp comment):
+#   #1 is_post_turn guard — not touched (no pre-turn _detect_changed_files call).
+#   #2 asyncio.gather — T2 stamps AFTER the gather completes, never between.
+#   #3 _turn_had_direct_edit reset placement — not touched.
+#   #4 mtime carry-forward — not touched.
+#   #5 First-turn mtime overlap — not touched (this file only instruments
+#      the follow-up-turn path; T1 stamp is a pure clock read).
+#   #6 get_entry_count semantics — we compute len(info.entries) directly, not
+#      via get_entries.
+#   #7 tracked_files snowball — we read len() of the LRU without mutating it.
+#
+# The log file lives at logs/first_token_timing.jsonl (repo root), gitignored
+# via the "logs/" line in .gitignore.
+# ---------------------------------------------------------------------------
+def _parse_env_flag(name: str) -> bool:
+    """Parse a boolean-ish env var without the ``bool(str)`` footgun.
+
+    ``bool(os.environ.get("X"))`` treats "0", "false", "no" as truthy simply
+    because they are non-empty strings, which silently INVERTS the user's
+    intent when they try to disable the flag by setting X=0.  This helper
+    accepts the standard on-tokens ("1", "true", "yes", "on"; case-insensitive)
+    and treats anything else — including unset, empty, "0", "false", "no" —
+    as False.
+    """
+    return (os.environ.get(name, "") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+_TTFT_TIMING_ENABLED = _parse_env_flag("VIBENODE_TIMING_TTFT")
+
+
+def _ttft_log_path() -> Path:
+    # Repo root == parent of the src/engine/ package directory (this file lives
+    # at src/engine/session_manager.py).
+    return Path(__file__).resolve().parents[2] / "logs" / "first_token_timing.jsonl"
+
+
+def _ttft_start_turn(info) -> None:
+    """Allocate the per-turn timing dict and stamp T1.
+
+    T1 = daemon entered _send_query (after the sleep(0) yield and interrupt
+    clear). Zero-cost no-op when disabled — one attribute-read + early return.
+    """
+    if not _TTFT_TIMING_ENABLED:
+        return
+    try:
+        info._ttft_turn_counter = getattr(info, "_ttft_turn_counter", 0) + 1
+        info._ttft_turn = {
+            "turn_no": info._ttft_turn_counter,
+            "t1_perf_ns": time.perf_counter_ns(),
+            "t0_wall_ns": int(getattr(info, "_ttft_pending_t0_ns", 0) or 0),
+            "t1_wall_ns": time.time_ns(),
+            "entry_count_pre": len(info.entries),  # CLAUDE.md #6 — plain len
+            "tracked_files_pre": len(info.tracked_files),  # CLAUDE.md #7 — read only
+            "project": os.path.basename(info.cwd or "") if info.cwd else "",
+            "notes": [],
+            "jsonl_bytes": 0,
+            "first_msg_kind": "",
+        }
+        info._ttft_pending_t0_ns = 0  # consumed
+        info._ttft_await_first_emit = False
+    except Exception:
+        # Instrumentation must never break the caller.
+        info._ttft_turn = None
+
+
+def _ttft_stamp(info, phase: str) -> None:
+    """Stamp a perf_counter_ns() timestamp on the current turn dict."""
+    if not _TTFT_TIMING_ENABLED:
+        return
+    d = getattr(info, "_ttft_turn", None)
+    if d is None:
+        return
+    d[phase] = time.perf_counter_ns()
+
+
+def _ttft_note(info, note: str) -> None:
+    """Append a short marker string to the current turn's notes."""
+    if not _TTFT_TIMING_ENABLED:
+        return
+    d = getattr(info, "_ttft_turn", None)
+    if d is None:
+        return
+    try:
+        d["notes"].append(note)
+    except Exception:
+        pass
+
+
+def _ttft_flush(info, session_id: str, status: str = "ok") -> None:
+    """Write ONE JSONL line + emit ONE INFO log line for the current turn.
+
+    Idempotent: after flush info._ttft_turn is None, so calling again is a
+    no-op (used by the _send_query finally to catch turns that never emit).
+    """
+    if not _TTFT_TIMING_ENABLED:
+        return
+    d = getattr(info, "_ttft_turn", None)
+    if d is None:
+        return
+    info._ttft_turn = None
+    info._ttft_await_first_emit = False
+
+    def _dms(a: str, b: str):
+        va, vb = d.get(a), d.get(b)
+        if va is None or vb is None:
+            return None
+        return round((vb - va) / 1_000_000.0, 3)
+
+    t0_wall = d.get("t0_wall_ns") or 0
+    t1_wall = d.get("t1_wall_ns") or 0
+    t0_t1_ms = round((t1_wall - t0_wall) / 1_000_000.0, 3) if t0_wall else None
+
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "sid": session_id,
+        "project": d.get("project", ""),
+        "turn_no": d.get("turn_no", 0),
+        "jsonl_bytes": int(d.get("jsonl_bytes", 0) or 0),
+        "entry_count_pre": int(d.get("entry_count_pre", 0) or 0),
+        "tracked_files_pre": int(d.get("tracked_files_pre", 0) or 0),
+        "T0_T1_ms": t0_t1_ms,
+        "T1_T2_ms": _dms("t1_perf_ns", "t2_perf_ns"),
+        "T2_T3_ms": _dms("t2_perf_ns", "t3_perf_ns"),
+        "T3_T4_ms": _dms("t3_perf_ns", "t4_perf_ns"),
+        "T4_T5_ms": _dms("t4_perf_ns", "t5_perf_ns"),
+        "status": status,
+        "first_msg_kind": d.get("first_msg_kind", ""),
+        "notes": ";".join(d.get("notes", []) or []),
+    }
+    try:
+        p = _ttft_log_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("TTFT flush failed for %s: %s", session_id, e)
+
+    pre_ms = (t0_t1_ms or 0.0) + (record["T1_T2_ms"] or 0.0) + (record["T2_T3_ms"] or 0.0)
+    model_ms = record["T3_T4_ms"] or 0.0
+    emit_ms = record["T4_T5_ms"] or 0.0
+    total_ms = pre_ms + model_ms + emit_ms
+    logger.info(
+        "[TTFT] sid=%s turn=%d status=%s T0->T5=%.1fms "
+        "(pre=%.1fms, model=%.1fms, emit=%.1fms) jsonl=%dB entries=%d tracked=%d%s",
+        session_id[:12], record["turn_no"], status,
+        total_ms, pre_ms, model_ms, emit_ms,
+        record["jsonl_bytes"], record["entry_count_pre"],
+        record["tracked_files_pre"],
+        (" notes=" + record["notes"]) if record["notes"] else "",
+    )
+
+
+# SDK Patches — now applied by AgentSDK.apply_patches() in SessionManager.__init__().
+# See src/engine/backends/claude.py for the Claude implementation.
+
+
+# ---------------------------------------------------------------------------
+# AskUserQuestion interception
+# ---------------------------------------------------------------------------
+# The Claude Agent SDK exposes an ``AskUserQuestion`` tool that pauses the turn
+# to present multiple-choice questions to the user.  VibeNode has NO interactive
+# UI to answer them — its permission flow is allow/deny only.  Whatever we do,
+# the tool is a trap:
+#
+#   • Auto-approve it (any policy other than "manual") → the CLI runs the tool
+#     with no answer source and hands the model a hollow result:
+#         "Your questions have been answered: . You can now continue ..."
+#     The model believes it got guidance, but the answer is EMPTY, so it ends
+#     the turn without doing the work it was about to ask about.  The session
+#     looks like it silently died.
+#   • Prompt for it manually → the user gets an allow/deny dialog with no way to
+#     actually pick an answer, so the turn stalls either way.
+#
+# Failure seen: the model proposed four concrete fixes via AskUserQuestion, was
+# auto-approved, got the empty "answered" result, and stopped without
+# implementing any of them.
+#
+# Fix: never let AskUserQuestion execute.  Intercept it in can_use_tool and DENY
+# it WITHOUT interrupt.  A non-interrupting deny message is fed back to the model
+# as the tool result, so instead of an empty answer the model receives a
+# directive telling it how to resolve the question without the tool.  The turn
+# keeps moving either way.
+#
+# Refinement: a plain directive ("just decide and keep going")
+# was correct for HOW questions but wrong for WHAT questions.
+#
+#   • HOW — "how should this be implemented?"  Which approach, which library,
+#     where the code lives, what to name it.  These are the model's job.  Pick
+#     the best option and finish the work.  The safety valve is REVERSIBILITY:
+#     a wrong reversible choice costs one follow-up message, so guessing is
+#     cheap.  An irreversible one (deleting data, force-push, dropping a table,
+#     rewriting history) is not, so that stops and gets described instead.
+#   • WHAT — "what should I do?"  Which task, which feature, what the user
+#     actually wants, scope and priority.  Guessing here burns a whole turn
+#     building the wrong thing.  The model must NOT silently pick; it ends the
+#     turn with a plain prose message listing the options and its recommendation.
+#     That is the AskUserQuestion UX, delivered as a normal reply the user can
+#     answer by simply typing back — which VibeNode's UI actually supports.
+#
+# The discriminator is what the answer changes: an implementation detail (HOW,
+# decide it) versus the direction of the work itself (WHAT, present options).
+INTERCEPT_ASK_USER_QUESTION = True
+ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
+ASK_USER_QUESTION_REDIRECT_MESSAGE = (
+    "This tool is unavailable — VibeNode has no interactive question UI, so it "
+    "can never be answered. You do not have the right to ask the user a question "
+    "until you have produced work. Resolve your question yourself, based on which "
+    "kind it is:\n"
+    "\n"
+    "1. A HOW question — how something gets implemented: which approach, which "
+    "library, where the code goes, what to call it. DO NOT ask. Choose the best "
+    "available option and carry the work all the way through to completion, so "
+    "long as the choice is REVERSIBLE. A reversible wrong guess costs one "
+    "follow-up message; asking costs the whole turn. Only if a step is genuinely "
+    "irreversible or destructive (deleting data, force-pushing, dropping a "
+    "table, rewriting history) do you stop short of it and describe it instead.\n"
+    "\n"
+    "2. A WHAT question — what to do: which task to take on, which feature to "
+    "build, what the user actually wants, scope or priority. Do NOT guess your "
+    "way through a large build, and do NOT use this tool. Instead, finish "
+    "whatever part of the work is already unambiguous, then end your turn with a "
+    "NORMAL text message that concisely lays out the options and states your "
+    "recommendation. No tool call, no multiple-choice widget — just prose the "
+    "user can reply to.\n"
+    "\n"
+    "If you are unsure which kind it is, treat it as a HOW question and proceed. "
+    "Continue with the task now."
+)
+
+
+class SessionState(str, Enum):
+    STARTING = "starting"
+    WORKING = "working"
+    WAITING = "waiting"
+    IDLE = "idle"
+    STOPPED = "stopped"
+
+
+# ---------------------------------------------------------------------------
+# PERF-CRITICAL: tracked_files LRU cap.
+# ---------------------------------------------------------------------------
+# _write_file_snapshot iterates ``info.tracked_files`` twice per turn (pre +
+# post) and pays at least one ``os.stat()`` per member (see 6881-6903 outer
+# early-exit).  Direct ``Edit``/``Write``/``MultiEdit``/``NotebookEdit`` tool
+# uses ``.add()`` to this set and never remove; a long session that touches
+# many unique files accumulates monotonically and every turn pays for the
+# whole history.  Baseline benchmark showed per-turn cost scaling roughly
+# linearly with the set size: N=200 → 63ms, N=500 → 129ms, N=1000 → 221ms
+# on Windows.
+#
+# ``_TrackedFilesLRU`` bounds the set at _TRACKED_FILES_LRU_CAP entries using
+# insertion-order semantics: ``.add(fp)`` re-touches an existing entry
+# (move_to_end) or appends a new one; when the cap is exceeded, the least-
+# recently-touched entry is evicted.  An evicted file is NOT permanently
+# forgotten — the JSONL still has its backup history, and the next direct
+# Edit/Write re-enters it.  Cache dicts (_last_mtime_size / _last_hashes /
+# file_versions) are NOT evicted in parallel: file_versions must remain
+# monotonic to prevent backup-file name collisions, and the two others are
+# pure caches whose stale entries have zero perf cost (only accessed while
+# iterating tracked_files itself).
+#
+# Related CLAUDE.md items (all preserved):
+#   #7 — fs_changed still separate from tracked_files (snapshot-only).
+#   #4 — mtime carry-forward is keyed by CWD-wide git ls-files, not by
+#        tracked_files, so LRU eviction does not touch _pre/_post_turn_mtimes.
+
+_TRACKED_FILES_LRU_CAP = 200
+
+
+class _TrackedFilesLRU:
+    """Insertion-ordered, LRU-bounded set of file paths.
+
+    Supports the set-like operations that current call sites use:
+    add / discard / update / __contains__ / __iter__ / __len__ / __bool__ /
+    __eq__ / __or__ / __ror__ / __repr__.
+
+    Internally an ``OrderedDict[str, None]``.  ``.add(fp)``:
+      - if fp already present: move to end (most-recently-touched).
+      - else: append; if len > cap, ``popitem(last=False)`` evicts LRU.
+
+    Iteration yields keys in insertion order (oldest first).  Union with a
+    set via ``|`` returns a plain ``set`` (unordered), so downstream behaviour
+    is unchanged.
+
+    Test tolerance: ``__eq__`` compares equal to a plain ``set`` with the same
+    contents, and ``iter``/``len``/``__contains__`` are transparent, so
+    existing tests that treat ``tracked_files`` set-like continue to pass.
+    """
+    __slots__ = ("_data", "_cap")
+
+    def __init__(self, iterable=None, cap: int = _TRACKED_FILES_LRU_CAP):
+        self._data: "OrderedDict[str, None]" = OrderedDict()
+        self._cap = cap
+        if iterable:
+            for x in iterable:
+                self.add(x)
+
+    def add(self, fp: str) -> None:
+        if fp in self._data:
+            self._data.move_to_end(fp, last=True)
+            return
+        self._data[fp] = None
+        if len(self._data) > self._cap:
+            self._data.popitem(last=False)
+
+    def discard(self, fp: str) -> None:
+        self._data.pop(fp, None)
+
+    def update(self, iterable) -> None:
+        for x in iterable:
+            self.add(x)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def __contains__(self, fp) -> bool:
+        return fp in self._data
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __bool__(self) -> bool:
+        return bool(self._data)
+
+    def __eq__(self, other):
+        if isinstance(other, _TrackedFilesLRU):
+            return set(self._data) == set(other._data)
+        if isinstance(other, (set, frozenset)):
+            return set(self._data) == other
+        return NotImplemented
+
+    def __ne__(self, other):
+        eq = self.__eq__(other)
+        if eq is NotImplemented:
+            return NotImplemented
+        return not eq
+
+    def __or__(self, other):  # info.tracked_files | fs_extras
+        if isinstance(other, _TrackedFilesLRU):
+            return set(self._data) | set(other._data)
+        return set(self._data) | (other if isinstance(other, (set, frozenset)) else set(other))
+
+    def __ror__(self, other):
+        if isinstance(other, _TrackedFilesLRU):
+            return set(other._data) | set(self._data)
+        return (other if isinstance(other, (set, frozenset)) else set(other)) | set(self._data)
+
+    def __repr__(self):
+        return f"_TrackedFilesLRU({list(self._data)!r}, cap={self._cap})"
+
+
+@dataclass
+class LogEntry:
+    """A single log entry for the session timeline."""
+    kind: str          # 'user', 'asst', 'tool_use', 'tool_result', 'system', 'stream'
+    text: str = ""
+    name: str = ""     # tool name (for tool_use)
+    desc: str = ""     # tool description/summary (for tool_use)
+    id: str = ""       # tool_use id
+    tool_use_id: str = ""  # for tool_result, references the tool_use
+    is_error: bool = False
+    timestamp: float = field(default_factory=time.time)
+    # True for an entry rebuilt from the transcript after an engine restart
+    # (``from_transcript``), not seen live.  Never serialized.  The self-heal
+    # resend paths skip these: they must re-send only a message the user sent
+    # to THIS engine, never an old one from history.
+    restored: bool = False
+    # Who sent a user entry the owner did not type ("Background job
+    # finished", "Scheduled check-in", ...; shared.transcripts.automated_source).
+    # '' for the owner's own messages.  Drawn as an "Automated session message".
+    auto: str = ""
+
+    @classmethod
+    def from_transcript(cls, rows) -> list:
+        """LogEntries from the store's transcript rows
+        (``ChatStore.read_log_entries``), flagged ``restored``."""
+        out = []
+        for r in rows or ():
+            if not isinstance(r, dict) or not r.get("kind"):
+                continue
+            out.append(cls(
+                kind=r["kind"], text=r.get("text", "") or "",
+                name=r.get("name", "") or "", desc=r.get("desc", "") or "",
+                id=r.get("id", "") or "", tool_use_id=r.get("tool_use_id", "") or "",
+                is_error=bool(r.get("is_error")),
+                timestamp=float(r.get("timestamp") or 0.0) or time.time(),
+                restored=True,
+                auto=r.get("auto", "") or "",
+            ))
+        return out
+
+    def to_dict(self) -> dict:
+        d = {"kind": self.kind}
+        if self.text:
+            d["text"] = self.text
+        if self.name:
+            d["name"] = self.name
+        if self.desc:
+            d["desc"] = self.desc
+        if self.id:
+            d["id"] = self.id
+        if self.tool_use_id:
+            d["tool_use_id"] = self.tool_use_id
+        if self.is_error:
+            d["is_error"] = True
+        if self.auto:
+            d["auto"] = self.auto
+        d["timestamp"] = self.timestamp
+        return d
+
+
+@dataclass
+class SessionInfo:
+    """Tracks the state and data of one SDK session."""
+    session_id: str
+    state: SessionState = SessionState.STARTING
+    name: str = ""
+    cwd: str = ""
+    model: str = ""
+    # CLI ``--effort`` level this session was launched with ('' == none sent,
+    # i.e. the model's own default).  Pinned again on every resume — see
+    # SessionManager._resolve_resume_effort.
+    effort: str = ""
+    session_type: str = ""  # "planner" for AI task planner sessions
+    cost_usd: float = 0.0
+    error: Optional[str] = None
+    entries: list = field(default_factory=list)
+    client: Optional[object] = None  # Opaque handle from AgentSDK.create_session()
+    task: Optional[asyncio.Task] = None
+    pending_permission: Optional[tuple] = None  # (anyio.Event, result_holder_list)
+    pending_tool_name: str = ""
+    pending_tool_input: dict = field(default_factory=dict)
+    always_allowed_tools: set = field(default_factory=set)
+    almost_always_allowed_tools: set = field(default_factory=set)
+    working_since: float = 0.0  # time.time() when state last became WORKING
+    substatus: str = ""  # e.g. "compacting" — sub-state shown in UI while WORKING
+    usage: dict = field(default_factory=dict)  # token usage from last ResultMessage
+    tracked_files: "_TrackedFilesLRU" = field(default_factory=_TrackedFilesLRU)  # absolute paths modified by tools (LRU-capped at _TRACKED_FILES_LRU_CAP)
+    file_versions: dict = field(default_factory=dict)    # file_path -> backup version counter
+    _last_hashes: dict = field(default_factory=dict)     # file_path -> last backed-up content hash
+    _last_mtime_size: dict = field(default_factory=dict) # file_path -> (mtime, size) when content was last hashed; lets _write_file_snapshot skip read+md5 for unchanged files (Windows file-IO is the bottleneck)
+    _pre_turn_mtimes: dict = field(default_factory=dict) # file_path -> mtime before turn
+    _post_turn_mtimes: dict = field(default_factory=dict) # carried forward from _detect_changed_files
+    _turn_had_direct_edit: bool = False                  # True if streaming saw Edit/Write this turn
+    _turn_content_started: bool = False                  # True once first ASSISTANT message arrives this turn
+    _awaiting_compact_drain: bool = False                # True when RESULT seen but IDLE emit deferred for post-turn compact check
+    _in_post_turn: bool = False                          # True while a post-turn listener owns the SDK buffer (suppresses queue auto-dispatch on IDLE emits so a buffered init/wake-up cycle can't race the dispatcher)
+    _wakeup_pending: bool = False                        # True if the most recent assistant turn scheduled a wake-up the SDK will deliver later (ScheduleWakeup, Bash run_in_background, etc.) — gates queue dispatch during the post-turn window
+    _wakeup_queue_blocked_since: float = 0.0             # time.time() when the starvation watchdog (_wakeup_queue_watchdog) first observed an undrained queue on this (alive, non-stopped) session.  0 == not armed.  Stays armed across the IDLE<->WORKING flicker of a wake-up loop and is reset only when the queue empties, so once the wait exceeds _WAKEUP_QUEUE_STARVATION_TIMEOUT the watchdog force-dispatches.  Guarantees a queued user message can NEVER be stranded indefinitely — whether behind a self-perpetuating wake-up loop OR a wake-up that never fires.
+    _force_queue_dispatch: bool = False                  # one-shot gate override set by the starvation watchdog.  When True, _emit_state / queue_message bypass the wake-up dispatch gate so the starved queued message is delivered at the next safe IDLE emit (or immediately, if already idle).  Cleared at user/dispatch-driven turn start (_send_query / _drive_session) and on interrupt/close; the watchdog re-sets it each sweep while a backlog remains.
+    _wakeup_deadline: float = 0.0                        # absolute time.time() by which the currently-pending wake-up MUST fire.  Set at RESULT when _wakeup_pending is applied (= now + expected wake delay + grace).  0 == none.  Past this instant the watchdog declares the wake-up PHANTOM and clears the "Awaiting wake-up…" state — guaranteeing the indicator can NEVER hang forever on a wake-up that never wakes.
+    _wakeup_max_delay: float = 0.0                       # per-turn accumulator: the longest expected wake delay among wake-up tools seen this turn (ScheduleWakeup.delaySeconds, or _WAKEUP_UNKNOWN_DELAY_WAIT for background Bash whose completion time is unknown).  Read at RESULT to compute _wakeup_deadline, then reset.
+    _wakeup_is_scheduled: bool = False                   # True only when the pending wake-up came from a REAL scheduled-wake tool (ScheduleWakeup), i.e. there is an actual timer that the CLI will fire at a known instant.  False when the only "wake-up" signal this turn was Bash(run_in_background=True) — a background process is NOT a scheduled wake-up (it resumes if/when the process exits, maybe never), so we must NOT show the "Awaiting wake-up…" label for it (that label promises a timer that doesn't exist, and would hang).  The queue is still briefly gated for race-safety, but the UI stays honest-Idle.
+    _post_compact_init_seen: bool = False                # True between the SDK's post-compact ``init`` and the first new-turn ASSISTANT — used to keep ``compacting`` substatus visible until the agent actually starts working in the new context (instead of flashing to "Working" the moment init lands)
+    _tracked_files_populated: bool = False               # True after first _prepopulate_tracked_files
+    _cached_git_files: list = field(default_factory=list) # cached git ls-files result
+    _cached_git_files_ts: float = 0.0                     # time.time() when _cached_git_files was set
+    _mtime_turn_count: int = 0                            # how many turns have used mtime carry-forward
+    _last_user_uuid: str = ""                            # cached from JSONL, updated by _process_message
+    _last_asst_uuid: str = ""                            # cached from JSONL, updated by _process_message
+    created_ts: float = 0.0  # time.time() when session was created
+    # ── Silent-wait backstop inputs (HealthMonitor job 5, src/engine/silent_wait.py) ──
+    # Plain timestamps, written on paths the daemon already runs (no I/O).
+    _task_started_at: float = 0.0  # time.time() of the last genuine send (user message, queue dispatch, watchdog nudge): where the current task begins.  Self-heal / auto-retry resends do not move it.
+    _bg_work_at: float = 0.0       # time.time() the daemon last saw background work for this session: a background launch (Agent/Task, run_in_background, Monitor) or any CLI task lifecycle event.  task_progress fires per tool use of a running agent, so this doubles as a stream heartbeat.
+    _cli_pid: int = 0  # PID of the CLI subprocess, for orphan cleanup
+    # ── API-error auto-retry (see SessionManager._API_RETRY_* + _arm_api_retry) ──
+    # When a turn ends with a *transient* API error (overload/429/529/5xx/network),
+    # the session automatically resumes ("Continue from where you left off") on an
+    # exponential backoff, spanning hours so overnight tasks survive long outages.
+    # These four fields are serialized in to_state_dict() so the UI can render a
+    # live "Auto-retrying in 12m… (attempt X/Y)" countdown with Cancel / Retry-now.
+    retry_at: float = 0.0          # epoch time.time() when the next auto-retry fires; 0 == none pending
+    retry_attempt: int = 0         # 1-based number of the retry currently being counted down
+    retry_max: int = 0             # total auto-retries that will be attempted before giving up
+    retry_reason: str = ""         # short human string for why we're retrying (e.g. "API overloaded")
+    _api_retry_count: int = 0                       # attempts already consumed; accumulates until _API_RETRY_MAX, reset on a genuine new user message
+    _api_retry_task: Optional[asyncio.Task] = None  # the pending backoff timer task (cancelled by Cancel / new message / interrupt / close)
+    _api_retry_needed: bool = False                 # set on a transient error (RESULT is_error, non-transport exception, or escalated stream-heal); consumed by the drive-loop finally to arm the timer
+    _limit_resume_at: float = 0.0                   # epoch at which a usage-limited turn should continue (reset instant + grace, or the next probe); when > 0, _arm_api_retry uses it instead of the exponential backoff.  Set by _schedule_limit_resume, consumed by _arm_api_retry.
+    _retry_needs_reconnect: bool = False            # True when the retry follows a dead transport (CLI crash / connectivity loss) so the timer must _reconnect_client before resending
+    _ever_got_result: bool = False                  # True once the session has produced at least one RESULT (so the SDK id was remapped to a real UUID and the session is --resume-able).  A transport crash BEFORE this can't reconnect, so we don't escalate it to the long backoff.
+    # ── Account usage limit (see _parse_usage_limit / _apply_usage_limit) ──
+    # A plan/quota limit is NOT a transient API hiccup: it does not clear on a
+    # backoff measured in seconds, and retrying the SAME model is guaranteed to
+    # fail again until the reset instant.  The only action that actually
+    # unblocks the user is switching to a model they still have headroom on,
+    # so these two fields are serialized in to_state_dict() to let the UI
+    # render a model-switch CTA instead of a useless "Retry" button.
+    limit_reset_at: float = 0.0    # epoch time.time() when the quota resets; 0 == unknown (banner then omits the countdown)
+    limited_model: str = ""        # the model id that hit the limit, so the CTA can exclude it from the offered alternatives
+    limit_switch_to: str = ""      # the model this limited session is about to switch to and continue on (SessionManager._limit_switch_plan); "" == waiting for the reset instead.  Serialized so the banner can say "switching to Opus 5.5 in 5s".
+    _limit_scope: str = ""         # what the last limit binds: "model" (e.g. "Fable limit", switching helps), "account" ("session limit", "weekly limit", credits: every model is out) or "" (wording not recognised).  Set by _apply_usage_limit.
+    _limit_until: dict = field(default_factory=dict)  # family -> epoch its own (model-specific) limit resets, as seen in this session.  Lets a later limit on the other side pick whichever model resets first.
+    _limit_origin: str = ""        # the model an auto-switch moved this session away from ("" == none); a later limit on the new model may switch back to it.  Cleared by a manual model switch.
+    # ── TTFT wall-clock instrumentation (opt-in) ──
+    # Populated only when VIBENODE_TIMING_TTFT=1; otherwise stays at defaults
+    # with zero allocations. See _ttft_* helpers near top of module.
+    _ttft_turn: Optional[dict] = None                    # per-turn timing dict, or None if not in a timed turn
+    _ttft_turn_counter: int = 0                          # per-session monotonic counter (correlation, not for uniqueness across sessions)
+    _ttft_await_first_emit: bool = False                 # set at T4; _emit_entry stamps T5 and flushes on the very next fire
+    _ttft_pending_t0_ns: int = 0                         # T0 wall-clock ns passed through from the server socket handler via send_message IPC
+    # ── Subsessions (spec §4.1) ────────────────────────────────────────────
+    # parent_session_id: None for top-level sessions; UUID of the parent
+    # session for subsessions.  subsession_origin_turn: parent JSONL line
+    # count captured at fork.  inbox_dirty: cached "has undelivered reports"
+    # flag for the in-memory fast path in send_message (spec §4.3.4).
+    parent_session_id: Optional[str] = None
+    subsession_origin_turn: int = 0
+    inbox_dirty: bool = False
+    # Set on children when their parent is deleted (spec §6.2).  An ISO8601
+    # timestamp surfaced in the UI as "Reports to: (parent deleted)".  None
+    # for non-orphans.  Persisted to the registry so a daemon restart
+    # preserves the tombstone.
+    parent_deleted_at: Optional[str] = None
+    # Phase 6.5 P1-4: when True, the subsession auto-reports its last
+    # assistant message to its parent's inbox on each IDLE transition that
+    # has a fresh assistant turn since the previous report (spec §4.3.3
+    # "Automatic" / §11 "Child IDLE with auto-report ON → IDLE again").
+    # ``_last_auto_report_entry_count`` is the entry-count snapshot taken
+    # at the last successful auto-report; on every IDLE we compare against
+    # the current count and report iff strictly greater AND the most-
+    # recent entry is an assistant message.  This makes the trigger
+    # idempotent across multiple IDLE emits per turn (PERF-CRITICAL guards
+    # may fire _emit_state more than once for a single user turn).
+    auto_report_on_idle: bool = False
+    _last_auto_report_entry_count: int = 0
+    # Patent 13 marker report: a subsession can explicitly push its
+    # conclusion up by emitting ``<!-- subsession:report -->`` in its
+    # assistant output.  Unlike auto_report_on_idle this is opt-in per
+    # turn by the child itself, so it fires regardless of the toggle.
+    # ``_last_marker_report_entry_count`` deduplicates the same way the
+    # auto-report counter does — one report per advancing turn that
+    # carries the marker, idempotent across repeated IDLE emits.
+    _last_marker_report_entry_count: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def __post_init__(self):
+        if not self.created_ts:
+            self.created_ts = time.time()
+
+    def to_state_dict(self) -> dict:
+        d = {
+            "session_id": self.session_id,
+            "state": self.state.value,
+            "cost_usd": self.cost_usd,
+            "error": self.error,
+            "name": self.name,
+            "cwd": self.cwd,
+            "model": self.model,
+            "effort": self.effort,
+            "session_type": self.session_type,
+            "working_since":self.working_since if self.state == SessionState.WORKING else 0,
+            "created_ts": self.created_ts,
+            "tracked_files": list(self.tracked_files)[-5:],
+        }
+        # Always include substatus so the frontend can distinguish
+        # "cleared" (empty string) from "not provided" (key absent).
+        d["substatus"] = self.substatus
+        # Auto-retry countdown fields — always present (like substatus) so the
+        # UI can tell "no retry pending" (retry_at == 0) from "key absent".
+        # The browser computes the live "Auto-retrying in Ns…" countdown from
+        # retry_at locally, so no per-second emit is needed.
+        d["retry_at"] = self.retry_at
+        d["retry_attempt"] = self.retry_attempt
+        d["retry_max"] = self.retry_max
+        d["retry_reason"] = self.retry_reason
+        # Usage-limit fields — always present (like retry_at) so the client can
+        # distinguish "not limited" (limited_model == "") from "key absent" on
+        # an older daemon.  limit_reset_at is an absolute epoch so the browser
+        # renders its own live countdown without a per-second emit.
+        d["limit_reset_at"] = self.limit_reset_at
+        d["limited_model"] = self.limited_model
+        d["limit_switch_to"] = self.limit_switch_to
+        if self.usage:
+            d["usage"] = self.usage
+        # Include permission details for WAITING sessions so reconnecting
+        # clients can display the permission prompt
+        if self.state == SessionState.WAITING and self.pending_tool_name:
+            d["permission"] = {
+                "tool_name": self.pending_tool_name,
+                "tool_input": self.pending_tool_input,
+            }
+        d["entry_count"] = len(self.entries)
+        # Subsessions (spec §4.4): expose parent pointer + inbox metadata
+        # so the sidebar can render child rows under their parent and
+        # show the envelope badge on parents with undelivered reports.
+        # Only emit when truthy to keep the dict compact for legacy
+        # top-level sessions.
+        if self.parent_session_id:
+            d["parent_session_id"] = self.parent_session_id
+            d["subsession_origin_turn"] = self.subsession_origin_turn
+        if self.inbox_dirty:
+            d["inbox_dirty"] = True
+        # Phase 6.5 P1-4: expose auto-report preference so the live-panel
+        # toggle can reflect the persisted server-side state on switch /
+        # reconnect.  Only emit when True to keep the dict compact.
+        if self.auto_report_on_idle:
+            d["auto_report_on_idle"] = True
+        return d
+
+
+# ---------------------------------------------------------------------------
+# Detect SDK-injected system content in UserMessage text blocks.
+# These include continuation summaries, local-command output, and
+# system-reminder tags that should NOT render as user chat bubbles.
+# ---------------------------------------------------------------------------
+# Implemented once in src/shared/transcripts.py.  The marker tuple is the CLI's:
+# the call site passes the backend's ``system_markers``.
+from shared.transcripts import (  # noqa: E402
+    is_system_content as _is_system_content,
+    system_content_label as _system_content_label,
+)
+
+
+# The genuine Anthropic 400 always points at the offending block with a
+# structured request path, e.g. ``messages.1.content.9``.  Ordinary prose that
+# paraphrases the error omits it; only the raw API envelope carries it.  Used
+# (together with the "API Error" prefix) to tell a real error apart from
+# assistant text that merely talks about one.
+_THINKING_400_PATH_RE = re.compile(r"messages\.\d+\.content\.\d+")
+
+
+def _is_thinking_block_modified_error(text: str) -> bool:
+    """Return True if text is the Anthropic "modified thinking block" 400.
+
+    When extended thinking is enabled and a session's stored transcript has a
+    tampered/partial thinking block (e.g. a turn force-completed by an older,
+    thinking-unsafe repair), ``--resume`` replays it and the API rejects the
+    request with, verbatim::
+
+        API Error: 400 messages.<i>.content.<j>: thinking or redacted_thinking
+        blocks in the latest assistant message cannot be modified. These blocks
+        must remain as they were in the original response.
+
+    The Claude CLI surfaces this as ordinary assistant text (the user sees the
+    raw "API Error: 400 ..." string) rather than raising a transport
+    exception, so nothing reconnects and every subsequent send hits the same
+    poisoned in-memory history.  Detecting it lets us trigger the existing
+    self-heal path: reconnect (which runs ``repair_incomplete_turn`` to strip
+    the bad blocks from disk) and auto-retry the last user message.
+
+    CRITICAL — must NOT fire on assistant prose that merely *discusses or
+    quotes* this error.  A loose keyword match ("cannot be modified" + the word
+    "thinking") matches a diagnosis, a summary, or a verbatim quote of the error
+    inside a larger answer — and the caller then SUPPRESSES that text and fires
+    a spurious heal, eating the model's real output (for example a session debugging this
+    very error would have its own explanation flagged and hidden).
+
+    The discriminator is structural, not lexical: the genuine error is the raw
+    API envelope, so the assistant message *is* the error string — it BEGINS
+    with "API Error" and carries the structured ``messages.<i>.content.<j>``
+    request path.  Prose that mentions the keywords does neither (it leads with
+    sentence text, and paraphrases drop the path).  We require both markers.
+    A live detection missed by this tightening is still backstopped by the
+    resume-time ``repair_incomplete_turn`` in ``_drive_session`` /
+    ``_reconnect_client``, which cleans the transcript before the next replay.
+
+    Perf: runs on every assistant text block of every turn, so it short-circuits
+    on the rare literal "cannot be modified" phrase BEFORE any case-folding or
+    regex — the common case is a single C-level substring scan with no copy.
+    """
+    if not text or "cannot be modified" not in text:
+        return False
+    low = text.lower()
+    if "thinking" not in low and "redacted_thinking" not in low:
+        return False
+    # Structural guard: a real CLI-surfaced error leads with "API Error" AND
+    # carries the messages.<i>.content.<j> request path.  Prose about the error
+    # satisfies neither reliably, so both are required.
+    if not low.lstrip().startswith("api error"):
+        return False
+    return bool(_THINKING_400_PATH_RE.search(text))
+
+
+# ---------------------------------------------------------------------------
+# Subsession report marker (Patent 13 — structured comment marker action)
+# ---------------------------------------------------------------------------
+#
+# A subsession can explicitly push its conclusion to the parent by emitting
+# an HTML-comment marker in its assistant output.  This mirrors the kanban
+# status marker pattern: invisible to the rendered transcript, parsed
+# out-of-band, and turned into an action.  The marker is stripped from the
+# extracted conclusion so the parent's inbox shows clean text.
+_SUBSESSION_REPORT_MARKER_RE = re.compile(
+    r"<!--\s*subsession:report\s*-->", re.IGNORECASE
+)
+
+
+def _scan_subsession_report_marker(text: str) -> tuple[bool, str]:
+    """Detect the subsession report marker in *text*.
+
+    Returns ``(found, conclusion)`` where ``conclusion`` is *text* with the
+    marker(s) removed and trimmed.  When the marker is absent, returns
+    ``(False, "")`` — callers only use the conclusion when ``found`` is
+    True.  Pure function so the trigger logic is unit-testable without a
+    running daemon.
+    """
+    if not text or "subsession:report" not in text.lower():
+        return (False, "")
+    if not _SUBSESSION_REPORT_MARKER_RE.search(text):
+        return (False, "")
+    conclusion = _SUBSESSION_REPORT_MARKER_RE.sub("", text).strip()
+    return (True, conclusion)
+
+
+# ---------------------------------------------------------------------------
+# Registry file for crash recovery — moved to src/engine/session_registry.py
+# ---------------------------------------------------------------------------
+
+
+# ── Stream Closed on Recovery Bug ──────────────────────────────────────
+# JSONL repair logic has been moved to ClaudeJsonlStore.repair_incomplete_turn()
+# in src/engine/backends/claude_store.py.  See that class for the implementation.
+
+
+class SessionManager:
+    """Manages all Claude Code SDK sessions on a dedicated asyncio event loop."""
+
+    def __init__(self, sdk: AgentSDK = None, store: ChatStore = None):
+        # ── Backend abstraction (Phase 2 OOP refactor) ──
+        # Dependency injection: defaults to Claude backend if not specified.
+        # This is backward-compatible — no callers need to change.
+        if sdk is None:
+            from engine.backends.claude import ClaudeAgentSDK
+            sdk = ClaudeAgentSDK()
+        if store is None:
+            from engine.backends.claude_store import ClaudeJsonlStore
+            store = ClaudeJsonlStore()
+        self._sdk: AgentSDK = sdk
+        self._store: ChatStore = store
+        # The backend's on-disk session layout, read by the watchdog jobs as
+        # ``getattr(sm, "backend_layout", None)``.  A backend that does not
+        # provide one (or a test double) gets Claude's, the default backend.
+        try:
+            layout = sdk.transcript_layout()
+        except Exception:
+            layout = None
+        self.backend_layout: TranscriptLayout = (
+            layout if isinstance(layout, TranscriptLayout) else ClaudeTranscriptLayout())
+
+        # Apply SDK-specific patches (moved from module-level L66-69)
+        try:
+            self._applied_patches = self._sdk.apply_patches()
+        except Exception as _patch_err:
+            logger.warning("Could not apply SDK patches: %s", _patch_err)
+            self._applied_patches = []
+
+        self._sessions: dict[str, SessionInfo] = {}
+        self._id_aliases: dict[str, str] = {}  # old_id -> new_id for SDK remaps
+        self._lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._push_callback = None
+        self._started = False
+        # Session registry (crash recovery) — delegated to SessionRegistry
+        self._reg = SessionRegistry()
+        # Restart memory: pre-restart states of sessions that were active
+        # (idle/working) before the last shutdown.  Captured once at start()
+        # from the registry file BEFORE the first save overwrites it, then
+        # served (minus any session that has since gone live) via
+        # get_dormant_states() so the UI can distinguish "was active before
+        # restart" from a never-touched "sleeping" session.  Display only —
+        # never triggers a process launch.
+        self._last_known_states: dict = {}
+        # Permission policy & UI prefs — delegated to PermissionManager
+        self._pm = PermissionManager(emit_entry_fn=self._emit_entry)
+        # Hook-based permission storage
+        self._hook_pending = {}  # {req_id: {"event": threading.Event, "result": str}}
+        self._hook_lock = threading.Lock()
+        # Reconnect throttle: limit concurrent CLI process spawns to prevent
+        # thundering-herd failures when multiple sessions die simultaneously.
+        # Created lazily on the event loop (asyncio.Semaphore is loop-bound).
+        self._reconnect_semaphore: Optional[asyncio.Semaphore] = None
+        # Server-side message queue (per-session, FIFO) — delegated to MessageQueue
+        self._mq = MessageQueue()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self, push_callback=None) -> None:
+        """Start the background event loop thread. Called once at app startup."""
+        if self._started:
+            return
+        self._push_callback = push_callback
+        self._mq.set_push_callback(push_callback)
+        # Account usage windows (session / weekly / Fable) from the CLI's
+        # rate_limit_event.  Seeded from disk so the last-seen Fable window
+        # survives a daemon restart.  See src/engine/usage_limits.py.
+        try:
+            from engine import usage_limits as _ul
+            from engine import sdk_patches as _sp
+            self._usage_lock = threading.Lock()
+            self._usage_state = _ul.load()
+            _sp.set_rate_limit_sink(self._on_rate_limit_info)
+        except Exception as _ul_err:
+            logger.warning("usage limits disabled: %s", _ul_err)
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run_loop, daemon=True, name="session-manager-loop"
+        )
+        self._thread.start()
+        self._started = True
+        logger.info("SessionManager started")
+
+        # Restart memory: snapshot previously-active sessions NOW, before the
+        # first debounced _save_registry_now() (triggered by recovery below)
+        # overwrites the registry file with only the sessions it re-launches.
+        # This is what lets the UI show idle/working sessions as
+        # "previously active" instead of "sleeping" after a reboot.
+        try:
+            self._last_known_states = self._reg.load_last_known_states()
+            if self._last_known_states:
+                logger.info(
+                    "Captured %d previously-active session(s) for restart memory",
+                    len(self._last_known_states),
+                )
+        except Exception:
+            logger.exception("Failed to capture restart-memory snapshot")
+            self._last_known_states = {}
+
+        # SessionDurable (src/engine/session_durable.py): the temp-id aliases the
+        # previous engine adopted, so a tab still holding a launch id keeps
+        # reaching its session after the restart.
+        try:
+            from engine import session_durable as _sd
+            if _sd.enabled():
+                from shared.session_names import load_engine_aliases
+                restored = {old: v.get("new_id") for old, v in load_engine_aliases().items()
+                            if isinstance(v, dict) and v.get("new_id")}
+                if restored:
+                    with self._lock:
+                        for old, new in restored.items():
+                            self._id_aliases.setdefault(old, new)
+                    logger.info("Restored %d session id alias(es) from the alias index",
+                                len(restored))
+        except Exception:
+            logger.exception("Failed to restore session id aliases")
+
+        # Session Host (src/engine/session_host_registry.py): reattach every live
+        # host a previous engine left running, BEFORE recovery and before the
+        # daemon binds its IPC port, so the web never sees those sessions as
+        # gone.  The ids attached here are skipped by recover_sessions below.
+        self._host_attached: set = set()
+        try:
+            from engine import session_host_registry as _shr
+        except ImportError:
+            _shr = None   # the Session Host is not built yet (spec steps 3-6)
+        if _shr is not None:
+            try:
+                self._host_attached = _shr.reconcile(self)
+            except Exception:
+                logger.exception("Session Host reconcile failed (hosted sessions "
+                                 "fall back to resume recovery)")
+                self._host_attached = set()
+
+        # Recover sessions from a previous crash (non-blocking background task)
+        #
+        # Phase 6.5 P0-3: also pass ``mark_inbox_dirty`` so recover_sessions
+        # can rehydrate the in-memory ``inbox_dirty`` flag from on-disk
+        # inbox.json files.  Without this, every recovered parent boots up
+        # with inbox_dirty=False and the fast-path drain at
+        # session_manager.py:595 skips the disk read forever — any
+        # ``delivered: false`` entries written before the daemon restart
+        # are stranded.
+        try:
+            from engine import session_durable as _sd
+            _armed = _sd.armed_session_ids()
+        except Exception:
+            _armed = set()
+        threading.Thread(
+            target=lambda: self._reg.recover_sessions(
+                self.start_session,
+                self._store,
+                mark_inbox_dirty_fn=self.mark_inbox_dirty,
+                skip_sids=set(self._host_attached),
+                armed_sids=_armed,
+            ),
+            daemon=True,
+            name="session-recovery"
+        ).start()
+
+        # Periodic orphan process cleanup (Windows-critical: child processes
+        # survive when parent claude.exe crashes).  Runs every 60s.
+        self._orphan_sweep_timer: Optional[threading.Timer] = None
+        self._schedule_orphan_sweep()
+
+        # Starvation watchdog: guarantees a queued user message can NEVER be
+        # stranded indefinitely behind a self-perpetuating wake-up loop.
+        # See _wakeup_queue_watchdog for the full rationale.  Runs every
+        # _WAKEUP_QUEUE_WATCHDOG_INTERVAL seconds.
+        self._wakeup_queue_watchdog_timer: Optional[threading.Timer] = None
+        self._schedule_wakeup_queue_watchdog()
+        # Session health monitor: stall auto-restart, sleep/wake healing,
+        # and keep-awake-while-working.  Lazy import avoids a module cycle
+        # (health_monitor imports LogEntry back from this module).
+        from engine.health_monitor import HealthMonitor
+        self._health_monitor = HealthMonitor(self)
+        self._health_monitor.start()
+        # Durable Jobs supervisor: one thread beside the health monitor that
+        # brings registered long jobs back after a restart
+        # (src/engine/job_supervisor.py).
+        self._job_supervisor = None
+        try:
+            from engine.job_supervisor import JobSupervisor, ENABLED as _jobs_enabled
+            if _jobs_enabled:
+                self._job_supervisor = JobSupervisor(self)
+                self._job_supervisor.start()
+        except Exception:
+            logger.exception("JobSupervisor failed to start (jobs will not be relaunched)")
+        # Record exactly which code this engine loaded, so the web can tell
+        # the user when fixes on disk are not running yet (src/engine/engine_code.py).
+        try:
+            from engine.engine_code import record_loaded_code
+            record_loaded_code()
+        except Exception:
+            logger.exception("Engine code record failed")
+
+    def _run_loop(self) -> None:
+        """Entry point for the background thread."""
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def stop(self) -> None:
+        """Stop the event loop and all sessions. Called on shutdown."""
+        if not self._started:
+            return
+        # Cancel any pending registry save timer
+        self._reg.cancel_timer()
+        # Cancel orphan sweep timer
+        if getattr(self, '_orphan_sweep_timer', None):
+            self._orphan_sweep_timer.cancel()
+            self._orphan_sweep_timer = None
+        # Cancel wake-up queue starvation watchdog timer
+        if getattr(self, '_wakeup_queue_watchdog_timer', None):
+            self._wakeup_queue_watchdog_timer.cancel()
+            self._wakeup_queue_watchdog_timer = None
+        # Stop the health monitor thread
+        if getattr(self, '_health_monitor', None):
+            self._health_monitor.stop()
+            self._health_monitor = None
+        if getattr(self, '_job_supervisor', None):
+            self._job_supervisor.stop()
+            self._job_supervisor = None
+        # Flush queue to disk
+        self._mq.flush()
+        # SessionDurable: every session's state as it is NOW (before the
+        # closes below flip them to STOPPED), so recovery puts it back.
+        with self._lock:
+            session_ids = list(self._sessions.keys())
+            infos = list(self._sessions.values())
+        for info in infos:
+            self._durable_save(info)
+        try:
+            from engine import session_durable as _sd
+            _sd.flush_all()
+        except Exception:
+            pass
+        # Hosted sessions (src/engine/session_host.py) are DETACHED, not closed:
+        # their CLI keeps running in its host and the next engine reattaches.
+        # The registry snapshot keeps their pre-detach state (hosted: true)
+        # instead of STOPPED.  In-process sessions close as before.
+        hosted_snapshot = {}
+        detach = getattr(self._sdk, "host_detach", None)
+        for info in infos:
+            if detach is None or not self._is_hosted(info):
+                continue
+            try:
+                hosted_snapshot[info.session_id] = self._reg_entry(info)
+                hosted_snapshot[info.session_id]["hosted"] = True
+                # From here the host owns the CLI: no self-heal, retry or
+                # reconnect in this engine may act on the session, and its
+                # driving task must not read the closing stream.
+                info._host_detached = True
+                info._listener_superseded = True
+                task = info.task
+                if task is not None and not task.done():
+                    self._loop.call_soon_threadsafe(task.cancel)
+                self._run_sync(detach(info.client), timeout=10)
+                info.client = None
+                with self._lock:
+                    self._sessions.pop(info.session_id, None)
+            except Exception:
+                logger.exception("Detaching hosted session %s failed", info.session_id)
+        for sid in session_ids:
+            if sid in hosted_snapshot:
+                continue
+            try:
+                self._run_sync(self._close_session(sid, forget=False))
+            except Exception:
+                pass
+        # Clear the registry since all sessions are intentionally stopped
+        # (hosted ones keep their entry: they are still running).
+        self._save_registry_now(extra=hosted_snapshot)
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread:
+            self._thread.join(timeout=5)
+        self._started = False
+
+    # ------------------------------------------------------------------
+    # Thread-safe bridge: Flask (sync) -> asyncio loop
+    # ------------------------------------------------------------------
+
+    def _run_sync(self, coro, timeout=30):
+        """Submit a coroutine to the event loop and wait for the result."""
+        if not self._loop or not self._loop.is_running():
+            raise RuntimeError("SessionManager event loop is not running")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=timeout)
+
+    # ------------------------------------------------------------------
+    # Public API (called from Flask routes / WS handlers)
+    # ------------------------------------------------------------------
+
+    async def _tracked_coro(self, info: SessionInfo, coro) -> None:
+        """Run *coro* while storing the asyncio.Task on *info* so interrupt can cancel it."""
+        info.task = asyncio.current_task()
+        try:
+            await coro
+        finally:
+            # Clear only if we're still the tracked task (a new query may have replaced us)
+            if info.task is asyncio.current_task():
+                info.task = None
+
+    def _resolve_id(self, session_id: str) -> str:
+        """Resolve a session ID through aliases (old_id -> new_id)."""
+        return self._id_aliases.get(session_id, session_id)
+
+    def _remap_session_id(self, old_id: str, new_id: Optional[str],
+                          info: "SessionInfo") -> None:
+        """Adopt the CLI's real session id for a session we launched under a
+        temporary client id, rewriting every reference to it.
+
+        Fired from TWO places: the RESULT handler (as before) AND the ``init``
+        handler, which runs seconds into the turn the moment the CLI announces
+        its id.  The ``init`` trigger is the fix: without it, a first turn that
+        CRASHED before any RESULT (for example Windows CLI exit code
+        3221225786) left the launch id stranded in ``_sessions`` as a fileless
+        "working" row, while the real transcript lived under the CLI's id — so
+        the same session showed up TWICE in the sidebar.
+
+        Idempotent: a no-op when there is nothing to remap or when this exact
+        remap already ran, so the later RESULT re-firing it costs nothing.
+        """
+        if not new_id or new_id == old_id:
+            return
+        if self._id_aliases.get(old_id) == new_id:
+            return  # already remapped (init did it; RESULT is re-firing)
+        logger.info(
+            "SDK assigned session_id %s (we used %s) — remapping",
+            new_id, old_id,
+        )
+        info.session_id = new_id
+        with self._lock:
+            self._sessions[new_id] = info
+            if old_id in self._sessions:
+                del self._sessions[old_id]
+            self._id_aliases[old_id] = new_id
+
+        # Remap queue to the new id
+        self._mq.remap_session_id(old_id, new_id)
+
+        # SessionDurable + Session Host: both are keyed by session id.  The
+        # alias goes into the session's own record and the engine-wide alias
+        # index (so a restarted engine still resolves the launch id), the
+        # durable record moves to the new id, and a hosted session's host
+        # record is renamed by its host.
+        try:
+            from engine import session_durable as _sd
+            if _sd.enabled():
+                if not isinstance(getattr(info, "_durable_aliases", None), set):
+                    info._durable_aliases = set()
+                info._durable_aliases.add(old_id)
+                _sd.rename(old_id, new_id)
+                from shared.session_names import record_engine_alias
+                record_engine_alias(old_id, new_id)
+                self._durable_save(info)
+        except Exception:
+            logger.exception("SessionDurable remap failed for %s -> %s", old_id, new_id)
+        try:
+            rename_host = getattr(self._sdk, "host_rename", None)
+            if rename_host is not None and self._loop is not None:
+                coro = rename_host(info.client, new_id)
+                if asyncio.iscoroutine(coro):
+                    try:
+                        running = asyncio.get_running_loop()
+                    except RuntimeError:
+                        running = None
+                    if running is self._loop:
+                        running.create_task(coro)
+                    elif self._loop.is_running():
+                        asyncio.run_coroutine_threadsafe(coro, self._loop)
+                    else:
+                        coro.close()
+        except Exception:
+            logger.exception("Session Host rename failed for %s -> %s", old_id, new_id)
+
+        # Remap user-set name to the new id (server-side, no race).  The name
+        # and remap files are owned by src/shared/session_names.py (the web reads
+        # them through the same module).
+        try:
+            from shared.session_names import remap_name
+            remap_name(old_id, new_id)
+        except Exception:
+            pass
+
+        # Persist the old temp id so all_sessions() filters it out even if
+        # in-memory aliases haven't synced yet on refresh.
+        try:
+            from shared.session_names import mark_remapped
+            mark_remapped(old_id, new_id)
+        except Exception:
+            pass
+
+        # Kanban task<->session links are the web's database: the web remaps
+        # them when it receives the session_id_remapped push below
+        # (DaemonClient._emit_socketio).  The engine no longer opens the
+        # kanban DB itself.
+
+        # Notify frontend to update its references (URL, activeId, etc.)
+        if self._push_callback:
+            self._push_callback(
+                'session_id_remapped',
+                {'old_id': old_id, 'new_id': new_id},
+            )
+
+    def start_session(
+        self, session_id: str, prompt: str = "", cwd: str = "",
+        name: str = "", resume: bool = False,
+        model: Optional[str] = None, system_prompt: Optional[str] = None,
+        max_turns: Optional[int] = None, allowed_tools: Optional[list] = None,
+        permission_mode: Optional[str] = None,
+        session_type: str = "",
+        extra_args: Optional[dict] = None,
+        parent_session_id: Optional[str] = None,
+        subsession_origin_turn: int = 0,
+        parent_deleted_at: Optional[str] = None,
+        auto_report_on_idle: bool = False,
+        effort_reset: bool = False,
+    ) -> dict:
+        """Start or resume an SDK session. Returns immediately.
+
+        ``effort_reset=True`` means the caller explicitly chose "model default"
+        effort: no ``--effort`` flag is sent and the session's remembered
+        effort is NOT re-pinned on this resume.
+        """
+        _forward_to_send = False
+        # Follow the temp-id -> CLI-id remap FIRST.  After a session's first
+        # RESULT it lives under the CLI's id and the client's temp id becomes an
+        # alias.  A start/wake that still carries the temp id (stale tab,
+        # another device, a reload racing the remap event) used to miss the
+        # existing SessionInfo entirely and create a SECOND session under the
+        # temp id, resuming a transcript that doesn't exist; the duplicate then
+        # self-healed into an orphan CLI no close could reach.  Every other entry point (send_message, close_session,
+        # get_session_state) already resolves; start_session was the gap.
+        session_id = self._resolve_id(session_id)
+        # Effort the session was running at before this (re)start, captured
+        # from the in-memory SessionInfo before it is replaced below.  A slept
+        # session is STOPPED and absent from the registry snapshot, so this is
+        # the only record of its effort within one daemon lifetime.
+        _prev_effort = ""
+        with self._lock:
+            if session_id in self._sessions:
+                existing = self._sessions[session_id]
+                _prev_effort = getattr(existing, "effort", "") or ""
+                # Detect zombie: task coroutine finished but state never
+                # transitioned to STOPPED/IDLE.  Force cleanup so the
+                # session can be restarted instead of stuck forever.
+                _is_zombie = (
+                    existing.state in (SessionState.WORKING, SessionState.STARTING)
+                    and existing.task is not None
+                    and existing.task.done()
+                )
+                if _is_zombie:
+                    logger.warning("Zombie session %s detected (state=%s, task done) — forcing cleanup",
+                                   session_id, existing.state.value)
+                    existing.state = SessionState.STOPPED
+                    del self._sessions[session_id]
+                elif existing.state not in (SessionState.STOPPED,):
+                    # Session is alive (IDLE/WORKING/WAITING/STARTING).
+                    # If a prompt was provided, deliver it via send_message()
+                    # instead of rejecting — this covers the common case where
+                    # the frontend thought the session was sleeping (stale
+                    # runningIds) and fell back to start_session.
+                    if prompt:
+                        _forward_to_send = True
+                    else:
+                        return {"ok": False, "error": "Session already running"}
+                else:
+                    # Allow restart of a stopped session
+                    del self._sessions[session_id]
+
+        # Forward OUTSIDE the lock — send_message() also acquires self._lock,
+        # and since it's a threading.Lock (non-reentrant), calling it while
+        # holding the lock would deadlock the daemon thread.
+        if _forward_to_send:
+            return self.send_message(session_id, prompt)
+
+
+        # A resume with no cwd takes it from the session's own transcript.
+        # Without this the CLI started in the daemon's own directory (the
+        # VibeNode repo): another project's session whose registry entry had
+        # an empty cwd, woken by a model switch, would run in the wrong folder
+        # with the wrong CLAUDE.md and show up under VibeNode as "New Session".
+        # The transcript records the real cwd on every line.
+        if resume and not cwd:
+            cwd = self._transcript_cwd(session_id)
+            if cwd:
+                logger.info("start_session: resume of %s had no cwd; using "
+                            "transcript cwd %s", session_id, cwd)
+        # Normalize cwd to OS-native path separators (cross-platform)
+        if cwd:
+            cwd = os.path.normpath(cwd)
+        # Seed info.model from the registry on a bare resume so the badge
+        # doesn't briefly show "" (or fall back to the client's system
+        # default) between STARTING and the CLI's ``init`` message.  The
+        # init handler remains authoritative — if the CLI resolves to a
+        # different model, ``_set_confirmed_model`` overwrites this seed
+        # and broadcasts the correction.  Only applied for ``resume=True``
+        # with no explicit ``model`` (the wake path); a caller-supplied
+        # model always wins so nothing overrides an explicit choice.
+        _seeded_model = model or ""
+        if resume and not model:
+            try:
+                _reg_meta = (self._reg.load_registry()
+                             .get("sessions", {})
+                             .get(session_id, {})) or {}
+                _reg_model = (_reg_meta.get("model") or "").strip()
+                if _reg_model:
+                    _seeded_model = _reg_model
+                    # PIN the recorded model on the CLI too, not just the
+                    # badge.  ``claude --resume`` does NOT remember a
+                    # session's model — without ``--model`` it comes back on
+                    # the CLI's configured default.  Seeding only
+                    # ``info.model`` meant the badge claimed the recorded
+                    # model while the session actually ran on the default
+                    # until the init message "corrected" the badge, so a
+                    # model switch did not stick.  It only ever
+                    # stuck when the initiating browser tab still held the
+                    # choice in memory and re-sent it; any other device, or
+                    # a reload, woke the session on the wrong model.  The
+                    # send_message auto-resume path already pins the
+                    # registry model (see below); this makes the wake path
+                    # match.  Marker-stripped: ``[1m]`` is a display suffix,
+                    # not a valid --model id.
+                    model = self._cli_model_id(_reg_model) or None
+            except Exception:
+                pass
+        extra_args, _effort = self._resolve_resume_effort(
+            session_id, resume, extra_args, _prev_effort, effort_reset)
+        info = SessionInfo(
+            session_id=session_id,
+            name=name,
+            cwd=cwd,
+            model=_seeded_model,
+            effort=_effort,
+            state=SessionState.STARTING,
+            session_type=session_type or "",
+            parent_session_id=parent_session_id,
+            subsession_origin_turn=subsession_origin_turn,
+            parent_deleted_at=parent_deleted_at,
+            auto_report_on_idle=auto_report_on_idle,
+        )
+        # SessionDurable: a record that exists at resume time was left by an
+        # engine restart or crash (Sleep/Delete forget theirs), so put its
+        # state back.  Timers are re-armed once the session is IDLE
+        # (_durable_restore_timers, from _drive_session).
+        if resume:
+            try:
+                from engine import session_durable as _sd
+                _rec = _sd.load(session_id)
+                if _rec:
+                    info._durable_restore = _sd.apply_static(info, _rec, attached=False)
+                    for _old in getattr(info, "_durable_aliases", ()) or ():
+                        with self._lock:
+                            self._id_aliases.setdefault(_old, session_id)
+                    logger.info("SessionDurable: restored %s (retry_at=%s, "
+                                "lost permission=%r)", session_id,
+                                info._durable_restore.get("retry_at"),
+                                info._durable_restore.get("lost_permission"))
+            except Exception:
+                logger.exception("SessionDurable restore failed for %s", session_id)
+        with self._lock:
+            self._sessions[session_id] = info
+
+        self._emit_state(info)
+        self._schedule_registry_save()
+
+        # Verify the event loop is alive before submitting
+        if not self._loop or not self._loop.is_running():
+            info.state = SessionState.STOPPED
+            info.error = "Session manager event loop is not running"
+            self._emit_state(info)
+            return {"ok": False, "error": "Session manager event loop is not running"}
+
+        # Launch the async session driver (wrapped so info.task is set for interrupt)
+        asyncio.run_coroutine_threadsafe(
+            self._tracked_coro(info, self._drive_session(
+                session_id, prompt, cwd, resume,
+                model=model, system_prompt=system_prompt,
+                max_turns=max_turns, allowed_tools=allowed_tools,
+                permission_mode=permission_mode,
+                extra_args=extra_args,
+            )),
+            self._loop,
+        )
+        return {"ok": True}
+
+    def send_message(self, session_id: str, text: str, _self_heal: bool = False,
+                     _auto_retry: bool = False, _ttft_t0_ns: int = 0) -> dict:
+        """Send a follow-up message to an idle session.
+
+        If the session is busy (WORKING/WAITING/STARTING), the message is
+        automatically queued and will be dispatched when the session next
+        becomes IDLE.  This eliminates race conditions where the frontend
+        thinks the session is idle but it has already transitioned.
+
+        _self_heal: internal flag -- when True, the call is a self-healing
+        retry and the heal counter is NOT reset (so the <=3 limit works).
+        _auto_retry: internal flag -- when True, the call is an API-error
+        auto-retry and the _api_retry_count is NOT reset (so the
+        _API_RETRY_MAX cap works across the backoff chain).  Any other
+        send (a genuine new user message) resets the retry budget.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            # Session isn't loaded in this daemon process.  Three reasons this
+            # happens AFTER startup recovery has run:
+            #   (a) the daemon was restarted while the session was IDLE — the
+            #       registry's recover_sessions() skips non-working sessions,
+            #       so they're absent from _sessions but the .jsonl is still
+            #       on disk and any pending queued messages are still alive.
+            #   (b) the session hit a fatal error (e.g. the thinking-block
+            #       400) that force-IDLE'd it; a later restart didn't recover.
+            #   (c) the user reopens an old session tab in the UI long after
+            #       the daemon was bounced.
+            # Before the fix below, send_message returned "Session not found"
+            # in all three cases, the frontend showed send_failed, AND any
+            # message that had been queued before the restart sat orphaned in
+            # the queue forever (no task to consume it).
+            # Fix: if the .jsonl exists on disk, auto-resume the session right
+            # here, then re-enter send_message so the message dispatches
+            # normally (covering both the new text and any queued backlog).
+            try:
+                jsonl = self._store.find_session_path(session_id)
+            except Exception:
+                jsonl = None
+            if jsonl and jsonl.exists():
+                # Recover cwd/model/name from the registry if available — the
+                # CLI's --resume needs cwd to find the right .jsonl, and the
+                # user's chosen model must be preserved across the restart.
+                reg = {}
+                try:
+                    # NOTE: attribute is _reg, not _registry — a typo here
+                    # was silently eaten by this except for months, so every
+                    # auto-resume ran with empty cwd/name/model.
+                    reg = self._reg.load_registry().get("sessions", {}).get(
+                        session_id, {}
+                    ) or {}
+                except Exception:
+                    pass
+                cwd = reg.get("cwd") or ""
+                if cwd:
+                    cwd = os.path.normpath(cwd)
+                logger.info(
+                    "send_message: auto-resuming idle/dropped session %s "
+                    "(cwd=%s) before delivery", session_id, cwd or "(none)"
+                )
+                start_result = self.start_session(
+                    session_id=session_id,
+                    prompt="",
+                    cwd=cwd,
+                    name=reg.get("name", ""),
+                    resume=True,
+                    # Marker-stripped: the registry mirrors ``info.model``
+                    # verbatim, which can carry the CLI's ``[1m]`` display
+                    # suffix — not a valid --model id (API 400).
+                    model=self._cli_model_id(reg.get("model")) or None,
+                )
+                if not start_result.get("ok"):
+                    # start_session can return ok=False if e.g. another race
+                    # already created the session; in that case _sessions now
+                    # has the entry and the re-enter below succeeds anyway.
+                    logger.warning(
+                        "send_message auto-resume returned %r for %s",
+                        start_result, session_id,
+                    )
+                with self._lock:
+                    info = self._sessions.get(session_id)
+                if not info:
+                    return {"ok": False, "error": "Session not found"}
+            else:
+                return {"ok": False, "error": "Session not found"}
+
+        # ── Subsession inbox drain (spec §4.3.4 + §4.3.5) ──
+        # Prepend any undelivered subsession reports onto the outbound
+        # text BEFORE the state lock acquisition and BEFORE _send_query
+        # is scheduled.  Fast path: ``info.inbox_dirty`` is an in-memory
+        # bool — when False (the common case) no disk I/O happens.
+        #
+        # PERF-CRITICAL ordering: this block sits ABOVE the
+        # _turn_had_direct_edit reset and the asyncio.gather() in
+        # _send_query.  The drain MUST NOT move into _send_query (which
+        # is the PERF-CRITICAL chokepoint per CLAUDE.md markers #2/#3/#4/#5)
+        # and MUST NOT be reordered after them.  See spec §7.1 and
+        # tests/test_send_query_operation_order.py for the invariant pin.
+        if info.inbox_dirty:
+            try:
+                from engine.subsession_inbox import (
+                    drain_undelivered,
+                    format_drain_block,
+                )
+                drained = drain_undelivered(session_id)
+                if drained:
+                    block = format_drain_block(drained)
+                    if text == "" or not text.strip():
+                        # Pull-updates path (spec §4.3.5): send the block as
+                        # the entire SDK message; no "[Your message]" suffix.
+                        text = block
+                    else:
+                        text = (
+                            block + "\n---\n[Your message]\n" + text
+                        )
+                # Clear the in-memory flag whether or not anything was
+                # drained — if the disk file disagreed with the flag we
+                # still want to avoid re-reading on every turn.
+                info.inbox_dirty = False
+            except Exception as e:
+                # Per spec §9: a corrupt/missing inbox must NOT block the
+                # user's message.  Log and continue with the original text.
+                logger.warning(
+                    "send_message: inbox drain failed for %s: %s — "
+                    "continuing with original text",
+                    session_id, e,
+                )
+                info.inbox_dirty = False
+
+        # Atomic state check + set under per-session lock to prevent two
+        # concurrent send_message calls from both seeing IDLE and both
+        # launching _send_query coroutines in parallel.
+        with info._lock:
+            if info.state == SessionState.STOPPED:
+                return {"ok": False, "error": "Session is stopped"}
+            if info.state != SessionState.IDLE:
+                # Auto-queue instead of returning an error
+                return self.queue_message(session_id, text)
+            # Reset self-healing counters for new user messages.
+            # Skip reset on self-healing retries so heal_count <= 3 works.
+            if not _self_heal:
+                if hasattr(info, '_stream_heal_count'):
+                    info._stream_heal_count = 0
+                info._stream_heal_needed = False
+            # A genuine new user message (not a self-heal or auto-retry resend)
+            # is the user "taking over": cancel any pending API-error auto-retry,
+            # reset its budget so the next failure starts a fresh backoff chain,
+            # and clear the prior error banner.  An _auto_retry resend preserves
+            # the accumulating counter (the cap depends on it); _fire_api_retry
+            # has already cleared the countdown fields for it.
+            if not _self_heal and not _auto_retry:
+                # A genuine send starts a new task for the silent-wait
+                # backstop (HealthMonitor job 5): background work seen after
+                # this instant belongs to the task the user just asked for.
+                info._task_started_at = time.time()
+                self._clear_api_retry(info, reset_count=True)
+                info.error = ""
+                # A genuine new user message retracts the usage-limit CTA too:
+                # either the quota reset, or the user switched models, or they
+                # simply want to try anyway.  If the limit is still in force the
+                # next RESULT re-applies it with a fresh reset instant.
+                self._clear_usage_limit(info)
+            # Read (but do NOT clear) the interrupted flag. Clearing it
+            # here races: the old task's CancelledError/finally handler
+            # runs on the event loop and checks _interrupted — if we clear
+            # it from this Flask thread first, the old task thinks it's a
+            # non-interrupt cancel and sets state back to IDLE.
+            # _send_query clears it on the event loop AFTER the old task exits.
+            _was_interrupted = getattr(info, '_interrupted', False)
+            # Capture the existing post-turn listener (if any) so we can
+            # cancel it before launching the new query.  When state is
+            # IDLE and a task is still alive, the task is the
+            # extended-post-turn listener installed by the previous turn —
+            # it sits on receive_response() waiting for delayed
+            # task_notification / auto-resume content.  We must cancel it
+            # before send_query() so two consumers don't race the same
+            # SDK buffer.
+            _existing_listener = info.task if (
+                info.task is not None and not info.task.done()
+            ) else None
+            # Flag for _send_query: drain stale messages from the SDK
+            # buffer before sending the new query.  This fires for two
+            # cases that share the same shared-buffer bug:
+            #   • interrupt → follow-up: stale ResultMessage from
+            #     interrupted turn (see "Drain stale messages" block in
+            #     _send_query).
+            #   • supersede an extended-post-turn listener: any
+            #     last-second auto-resume content the listener didn't
+            #     consume before being cancelled.
+            if _was_interrupted or _existing_listener is not None:
+                info._drain_stale = True
+                # Supersede-of-listener uses the quick (200 ms) drain so we
+                # don't add a 5 s penalty when the buffer is empty.  The
+                # interrupt path keeps the long timeout so it can wait for
+                # the SDK's interrupt-ack RESULT.
+                if _existing_listener is not None and not _was_interrupted:
+                    info._drain_stale_quick = True
+            # Set the supersede flag INSIDE the lock so its visibility is
+            # ordered with the state flip below.  The listener checks both
+            # ``info.task`` identity AND this flag — having the flag set
+            # under the same lock that flips state means the listener
+            # cannot observe ``state == WORKING`` without also observing
+            # ``_listener_superseded == True``, so it correctly drops any
+            # straggling auto-resume RESULT instead of clobbering state
+            # back to IDLE.
+            if _existing_listener is not None:
+                info._listener_superseded = True
+            # Add user entry to history. Normally the frontend shows it
+            # optimistically so we skip the emit. But after an interrupt the
+            # optimistic bubble was cleared, so emit to avoid a gap.
+            _stripped = text.strip()
+            if not (_stripped.startswith('/') and ' ' not in _stripped):
+                from shared.transcripts import automated_source as _auto_src
+                entry = LogEntry(kind="user", text=text, auto=_auto_src(_stripped))
+                info.entries.append(entry)
+                if _was_interrupted:
+                    entry_index = len(info.entries) - 1
+                    self._emit_entry(info.session_id, entry, entry_index)
+            # Set state to WORKING before submitting query.
+            # Also clear any stale model-switch flag so a real turn starting
+            # never gets misclassified by the post-turn listener.
+            info._model_switch_in_progress = False
+            # TTFT #0: stash T0 wall-clock ns (captured server-side in
+            # handle_send_message before the IPC hop) so _ttft_start_turn can
+            # anchor T0→T1 later. Zero-cost when disabled (defaults to 0).
+            # No effect on state semantics — pure timestamp storage.
+            if _TTFT_TIMING_ENABLED and _ttft_t0_ns:
+                info._ttft_pending_t0_ns = int(_ttft_t0_ns)
+            info.state = SessionState.WORKING
+            # Reset any stale substatus from the previous turn, then re-set
+            # if this turn is a /compact command.
+            info.substatus = ""
+            if _stripped == '/compact':
+                info.substatus = "compacting"
+
+        self._emit_state(info)
+
+        # Cancel the previous turn's extended-post-turn listener (if any)
+        # before launching the new query.  Order matters: cancel first so
+        # the old task's receive_response() bails before the new
+        # _send_query() reads from the shared SDK buffer.  The
+        # _listener_superseded flag (set inside the lock above) tells the
+        # old task's CancelledError handler to bail without resetting
+        # state — otherwise it would force-IDLE / STOPPED and clobber the
+        # WORKING flip we just performed.  The new _send_query clears the
+        # flag at startup.  ``_drain_stale`` guarantees any straggler
+        # messages the listener didn't consume get flushed before the new
+        # query is read.
+        if _existing_listener is not None:
+            self._loop.call_soon_threadsafe(_existing_listener.cancel)
+
+        asyncio.run_coroutine_threadsafe(
+            self._tracked_coro(info, self._send_query(session_id, text)), self._loop
+        )
+        return {"ok": True}
+
+    def resolve_permission(self, session_id: str, allow: bool, always: bool = False,
+                           almost_always: bool = False) -> dict:
+        """Resolve a pending permission request.
+
+        Called from a Flask-SocketIO handler thread. Uses
+        loop.call_soon_threadsafe to set the anyio.Event on the correct
+        event loop so the waiting callback resumes immediately.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"ok": False, "error": "Session not found"}
+        if info.state != SessionState.WAITING:
+            return {"ok": False, "error": f"Session is {info.state.value}, not waiting"}
+        if not info.pending_permission:
+            return {"ok": False, "error": "No pending permission"}
+
+        if allow:
+            # Echo back the original tool input — CLI expects updatedInput
+            # to be the full input dict, not null (causes H.includes crash).
+            # See _make_permission_callback() and sdk_transport_adapter.py
+            # for the full explanation of this requirement.
+            original_input = info.pending_tool_input if isinstance(info.pending_tool_input, dict) else {}
+            result = self._sdk.make_permission_result_allow(original_input)
+        else:
+            result = self._sdk.make_permission_result_deny(
+                message="User denied permission", interrupt=False
+            )
+
+        # Resolve the permission by setting the anyio Event.
+        perm_tuple = info.pending_permission  # (anyio.Event, result_holder)
+        info.pending_permission = None
+
+        if isinstance(perm_tuple, tuple) and len(perm_tuple) == 2:
+            perm_event, result_holder = perm_tuple
+            result_holder[0] = (result, always, almost_always)
+            perm_event.set()  # threading.Event.set() is fully thread-safe
+
+        return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # Permission methods — thin wrappers delegating to PermissionManager
+    # ------------------------------------------------------------------
+
+    def get_permission_policy(self) -> dict:
+        """Return the current permission policy and custom rules."""
+        return self._pm.get_permission_policy()
+
+    def set_permission_policy(self, policy: str, custom_rules: dict = None) -> None:
+        """Update the permission policy (synced from browser)."""
+        self._pm.set_permission_policy(policy, custom_rules)
+
+    # ------------------------------------------------------------------
+    # UI Preferences — thin wrappers delegating to PermissionManager
+    # ------------------------------------------------------------------
+
+    def get_ui_prefs(self) -> dict:
+        """Return all persisted UI preferences."""
+        return self._pm.get_ui_prefs()
+
+    def set_ui_prefs(self, prefs: dict) -> None:
+        """Merge new preferences into saved UI prefs and persist."""
+        self._pm.set_ui_prefs(prefs)
+
+    def _should_auto_approve(self, tool_name: str, tool_input: dict,
+                             cwd: Optional[str] = None) -> bool:
+        """Check if a tool use should be auto-approved — delegates to PermissionManager."""
+        return self._pm.should_auto_approve(tool_name, tool_input, cwd=cwd)
+
+    @classmethod
+    def _is_dangerous(cls, tool_name: str, tool_input,
+                      cwd: Optional[str] = None) -> bool:
+        """Return True if tool_input looks destructive — delegates to PermissionManager."""
+        return PermissionManager.is_dangerous(tool_name, tool_input, cwd=cwd)
+
+    # ------------------------------------------------------------------
+    # Server-side message queue
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Queue methods — thin wrappers delegating to MessageQueue
+    # PERF-CRITICAL #8: Debounced saves preserved in src/engine/message_queue.py
+    # ------------------------------------------------------------------
+
+    def _save_queues(self) -> None:
+        """Debounced queue save — delegates to MessageQueue. See CLAUDE.md #8."""
+        self._mq.save_queues()
+
+    def _emit_queue_update(self, session_id: str) -> None:
+        self._mq.emit_queue_update(session_id)
+
+    def queue_message(self, session_id: str, text: str) -> dict:
+        """Add a message to a session's queue.
+
+        If the session is IDLE we'd normally dispatch immediately so the
+        queued message runs without delay.  But during the post-turn
+        wake-up window (``_in_post_turn`` set AND ``_wakeup_pending``
+        set) the SDK may still deliver an auto-resume cycle — dispatching
+        now would cancel the post-turn listener mid-cycle and the
+        wake-up's remaining content would race the dispatched query.
+
+        Mirrors the gate in ``_emit_state``: same condition, same reason.
+        Without this duplicate check, ``queue_message`` would be the
+        bypass that re-introduces the bug.  The queued message sits in
+        the queue until either:
+          • the user explicitly sends a new message (which supersedes
+            via ``send_message``), or
+          • the wake-up cycle completes (``_enter_auto_resume`` clears
+            ``_wakeup_pending``, then the next IDLE emit dispatches).
+        """
+        session_id = self._resolve_id(session_id)
+        result = self._mq.queue_message(session_id, text)
+
+        # If the session is already idle, dispatch immediately — unless
+        # we're in a wake-up post-turn window (see docstring above).
+        info = self._sessions.get(session_id)
+        if (
+            info
+            and info.state == SessionState.IDLE
+            # Same retry gate as _emit_state: a message queued DURING an
+            # auto-retry countdown must wait behind the recovery, not preempt it.
+            and not (getattr(info, 'retry_at', 0) > 0)
+            and not (
+                getattr(info, '_in_post_turn', False)
+                and getattr(info, '_wakeup_pending', False)
+                # Starvation override: when the watchdog has flagged this
+                # session, the gate falls open so a starved message ships.
+                and not getattr(info, '_force_queue_dispatch', False)
+            )
+        ):
+            self._try_dispatch_queue(session_id)
+
+        return result
+
+    def get_queue(self, session_id: str) -> list:
+        return self._mq.get_queue(self._resolve_id(session_id))
+
+    def remove_queue_item(self, session_id: str, index: int) -> dict:
+        return self._mq.remove_queue_item(self._resolve_id(session_id), index)
+
+    def edit_queue_item(self, session_id: str, index: int, text: str) -> dict:
+        return self._mq.edit_queue_item(self._resolve_id(session_id), index, text)
+
+    def clear_queue(self, session_id: str) -> dict:
+        return self._mq.clear_queue(self._resolve_id(session_id))
+
+    def _try_dispatch_queue(self, session_id: str) -> None:
+        """Dispatch next queued message — delegates to MessageQueue with send_fn callback.
+
+        CENTRALIZED auto-retry ordering guard.  While an API-error auto-retry
+        countdown is pending (``retry_at > 0``) we must NEVER dispatch a queued
+        follow-up: the retry has to fire first (it resends / continues the
+        un-answered turn), and the queued message drains normally only once the
+        retry's turn completes and clears ``retry_at``.
+
+        This guard lives HERE — the single chokepoint every dispatch path funnels
+        through — rather than at each call site, because the call sites do not all
+        gate the same way.  In particular the wake-up starvation watchdog sets
+        ``_force_queue_dispatch = True`` specifically to BYPASS the per-call-site
+        gates; without a guard at the chokepoint it would force a queued message
+        out ahead of the retry.  A real ordering race (queued "OMEGA" answered
+        before the retry resent "ALPHA") was caught by live-daemon queue testing;
+        unit tests never exercised the watchdog / deferred-timer dispatch paths.
+        Reading ``self._sessions`` / ``retry_at`` is a plain dict-get + attr read
+        (atomic under the GIL), so no lock is taken — this method is called from
+        inside ``_emit_state`` which already holds session state, and re-locking
+        here risked reentrancy.
+        """
+        info = self._sessions.get(session_id)
+        if info is not None and getattr(info, 'retry_at', 0) > 0:
+            logger.info(
+                "Queue dispatch suppressed for %s: auto-retry countdown pending "
+                "(fires in %.1fs) — queued message will drain after the retry's "
+                "turn completes",
+                session_id[:12], max(0.0, info.retry_at - time.time()),
+            )
+            return
+        self._mq.try_dispatch_queue(session_id, self.send_message)
+
+    def interrupt_session(self, session_id: str, clear_queue: bool = True) -> dict:
+        """Interrupt a running session.
+
+        When clear_queue is True (default), also clears any queued messages
+        to prevent auto-dispatch when the session goes idle after interrupt.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"ok": False, "error": "Session not found"}
+        if info.state == SessionState.STOPPED:
+            return {"ok": False, "error": "Session already stopped"}
+
+        # Clear queue atomically BEFORE the interrupt so _emit_state(IDLE)
+        # won't auto-dispatch a queued message after the interrupt completes.
+        if clear_queue:
+            self._mq.pop_queue(session_id)
+
+        # Set IDLE synchronously so send_message sees it immediately.
+        # Without this, there's a race: the async _interrupt_session hasn't
+        # run yet, state is still WORKING, and send_message queues instead
+        # of sending.
+        info._interrupted = True
+        info.state = SessionState.IDLE
+        # Clear sleeping/awaiting-wakeup state.  If the user explicitly
+        # interrupted the session, any scheduled wake-up is no longer a
+        # source of truth — the session is now stopped at the user's
+        # request, not asleep waiting for a wake-up.  Without this clear,
+        # the UI shows "Awaiting wake-up…" on a session the user just
+        # stopped ("stuck in awaiting wake-up mode after stop").
+        info._wakeup_pending = False
+        info._force_queue_dispatch = False
+        info._wakeup_queue_blocked_since = 0.0
+        info._wakeup_deadline = 0.0
+        info._wakeup_max_delay = 0.0
+        info._wakeup_is_scheduled = False
+        info.substatus = ""
+        # Cancel any pending API-error auto-retry — the user took over.
+        self._clear_api_retry(info, reset_count=True)
+        # Capture the task NOW so _interrupt_session cancels the right one.
+        # Without this, if the user sends a new message before
+        # _interrupt_session runs, info.task gets replaced by the new
+        # query's task, and the interrupt kills the wrong coroutine.
+        task_to_cancel = info.task
+        self._emit_state(info)
+
+        asyncio.run_coroutine_threadsafe(
+            self._interrupt_session(session_id, task_to_cancel), self._loop
+        )
+        return {"ok": True}
+
+    def _transcript_cwd(self, session_id: str) -> str:
+        """The session's home folder, recovered from its transcript, or ''.
+
+        A transcript line's ``cwd`` follows every ``cd`` the session makes, so
+        "the latest cwd" can be a deep subfolder, or the wrong folder a bad
+        wake put it in.  The reliable signal is WHERE the transcript lives:
+        ``~/.claude/projects/<encoded>/`` is the encoding of the session's
+        home folder.  So the answer is the first recorded ``cwd`` whose
+        encoding matches that directory name (one transcript can hold cwd
+        lines across many folders, with exactly one matching its project
+        directory).  Only an
+        existing directory is returned.
+        """
+        try:
+            path = self._store.find_session_path(session_id)
+        except Exception:
+            path = None
+        if not path:
+            return ""
+        try:
+            from shared.paths import encode_cwd as _encode_cwd
+        except Exception:
+            return ""
+        home = path.parent.name
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if '"cwd"' not in line:
+                        continue
+                    try:
+                        cwd = (json.loads(line).get("cwd") or "").strip()
+                    except ValueError:
+                        continue
+                    if cwd and _encode_cwd(cwd) == home and os.path.isdir(cwd):
+                        return cwd
+        except OSError:
+            return ""
+        return ""
+
+    @classmethod
+    def _cli_model_id(cls, model: Optional[str]) -> str:
+        """Turn a recorded/confirmed model id into one safe to hand the CLI.
+
+        Backend knowledge (``ClaudeKnowledge.cli_model_id``): the 1M-context
+        marker is KEPT (stripping it silently woke 1M sessions on 200K),
+        any other bracketed marker is stripped, and so is 1M on a model the
+        API rejects it for.  Mirrors ``SessionModel._cleanId`` on the client.
+        """
+        return cls._BACKEND.cli_model_id(model)
+
+    # Values ``claude --effort`` accepts (verified against ``claude --help``,
+    # CLI 2.1.283).  The CLI only warns on anything else and silently runs at
+    # the default, so the session would record a level it is not running at.
+    # A stale/garbage remembered value is therefore dropped, not forwarded.
+    VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+    def _resolve_resume_effort(self, session_id: str, resume: bool,
+                               extra_args: Optional[dict], prev_effort: str,
+                               effort_reset: bool) -> tuple:
+        """Decide the ``--effort`` for a (re)start; return (extra_args, effort).
+
+        ``claude --resume`` does NOT remember a session's effort, exactly as it
+        does not remember its model.  Before this, every wake, auto-resume, and
+        resume-with-``--model`` silently dropped the session back to the CLI
+        default effort.  Precedence:
+
+          1. an explicit effort in ``extra_args`` (the caller chose) wins;
+          2. ``effort_reset`` — the caller explicitly chose "model default";
+          3. on resume only: the effort the in-memory session last ran at,
+             else the registry's record (dormant after a daemon restart).
+        """
+        args = dict(extra_args or {})
+        explicit = str(args.get("effort") or "").strip()
+        if explicit:
+            if explicit not in self.VALID_EFFORTS:
+                args.pop("effort", None)
+                return args, ""
+            return args, explicit
+        args.pop("effort", None)
+        if effort_reset or not resume:
+            return args, ""
+        effort = (prev_effort or "").strip()
+        if not effort:
+            try:
+                _reg_sessions = self._reg.load_registry().get("sessions", {})
+                _meta = (_reg_sessions.get(session_id)
+                         or _reg_sessions.get(self._resolve_id(session_id)) or {})
+                effort = str(_meta.get("effort") or "").strip()
+            except Exception:
+                effort = ""
+        if effort in self.VALID_EFFORTS:
+            args["effort"] = effort
+            return args, effort
+        return args, ""
+
+    # How long after a live ``set_model`` the CLI's side-effect ``init`` is
+    # still expected.  Past this, ``_model_switch_in_progress`` is stale: the
+    # CLI either never emitted the init (version-dependent) or it was consumed
+    # elsewhere, and honoring the flag would swallow the NEXT real auto-resume
+    # signal — leaving the session shown IDLE while it is actually working.
+    _MODEL_SWITCH_INIT_WINDOW_S = 20.0
+
+    def _model_switch_pending(self, info) -> bool:
+        """True while a live model switch's side-effect init is still expected.
+
+        Self-expiring: the flag is only honored within
+        ``_MODEL_SWITCH_INIT_WINDOW_S`` of the switch, and is cleared here the
+        first time it is found stale so later checks are cheap.
+        """
+        if not getattr(info, '_model_switch_in_progress', False):
+            return False
+        _at = getattr(info, '_model_switch_at', 0.0) or 0.0
+        if _at and (time.time() - _at) > self._MODEL_SWITCH_INIT_WINDOW_S:
+            info._model_switch_in_progress = False
+            return False
+        return True
+
+    def _broadcast_model_changed(self, session_id: str, info, model: str, *,
+                                 resumed: bool = False,
+                                 turn_resumed: bool = False) -> None:
+        """Push ``session_model_changed`` to EVERY connected client.
+
+        The socket reply (``session_model_result``) goes only to the tab that
+        asked.  Every other tab/device — and the asking tab itself, when its
+        mobile transport silently reconnected and lost the reply — learns of
+        a switch ONLY through this broadcast.  It is queue-neutral (no state
+        or dispatch machinery), so it is safe to fire from any path: a live
+        switch, a resume-with-``--model``, or the CLI's own init reconciling
+        the resolved id.  Never raises; a failed push is logged.
+
+        ``resumed``/``turn_resumed`` mirror the reply's fields so a client
+        that has to treat this broadcast AS its confirmation can act exactly
+        as it would have on the reply (the usage-limit CTA needs ``resumed``
+        to decide whether to nudge the interrupted turn).
+        """
+        if not self._push_callback:
+            return
+        try:
+            self._push_callback('session_model_changed', {
+                'session_id': session_id,
+                'model': model,
+                'limit_reset_at': info.limit_reset_at if info else None,
+                'limited_model': info.limited_model if info else None,
+                'error': info.error if info else "",
+                'resumed': bool(resumed),
+                'turn_resumed': bool(turn_resumed),
+            })
+        except Exception as _cb_err:
+            logger.warning(
+                "session_model_changed broadcast failed for %s: %s",
+                session_id, _cb_err,
+            )
+
+    def _set_confirmed_model(self, info, model: str, *,
+                             save_registry: bool = False) -> bool:
+        """Single sink for a CLI/daemon-confirmed session model.
+
+        Model reconciliation on the daemon used to be three scattered writes to
+        ``info.model`` (start, mid-session switch, and the CLI ``init`` message)
+        each with their own ``record_confirmed_model`` call.  Centralizing them
+        here makes the contract explicit and keeps them from drifting apart:
+
+          * A confirmed model is GROUND TRUTH — we mirror it onto ``info.model``
+            and into the persistent confirmed-models list that backs /api/models.
+          * The CLI ``init`` message remains the ultimate authority: if the CLI
+            later reports a different resolved id, it flows through this same
+            sink and overwrites the previously recorded value.
+
+        Returns True if ``info.model`` actually changed.  Callers that need the
+        registry persisted (e.g. an explicit mid-session switch) pass
+        ``save_registry=True``; the periodic init path does not, to avoid an
+        extra disk write on every turn's init message.
+
+        ``[1m]`` is taken literally.  The picker offers 1M as its own choice
+        and sends ``claude-opus-5[1m]`` for it; a BARE id leaves the window to
+        the CLI, which may still enable 1M on its own (seen in the daemon logs).
+        A carry-forward, which re-attached a previous
+        ``[1m]`` to a bare same-base id, guessed instead of asking: it was
+        removed, and the CLI's own ``init`` report, which runs through this
+        same sink, says which window the session actually got.
+        """
+        model = (model or "").strip()
+        if not model:
+            return False
+        changed = info.model != model
+        if changed:
+            info.model = model
+        try:
+            from shared.models import record_confirmed_model
+            record_confirmed_model(model)
+        except Exception:
+            pass
+        if save_registry and changed:
+            self._schedule_registry_save()
+        return changed
+
+    def _resume_with_model(self, session_id: str, model: str,
+                           info: Optional["SessionInfo"] = None,
+                           resume_turn: bool = False) -> dict:
+        """Switch a NOT-LIVE session's model by resuming it with ``--model``.
+
+        Covers every shape of "there is no CLI to send a control request to":
+        dormant (no in-memory SessionInfo), STOPPED, or in-memory with a dead
+        client.  ``--model`` at resume is as authoritative as a live
+        ``set_model`` control request, and the CLI's ``init`` message confirms
+        the resolved id through ``_set_confirmed_model`` exactly as it would
+        after a live switch.
+
+        By default the session is resumed with an EMPTY prompt: switching the
+        model must not silently spend a turn.  That is the right behaviour for
+        the model badge, where the user asked only to change models.
+
+        ``resume_turn=True`` (the usage-limit CTA) additionally re-runs the turn
+        the error interrupted, because there the user's intent is "get me
+        unblocked and carry on", and making them retype the message a quota ate
+        is exactly the misery this feature exists to remove.  The prompt is
+        resumed ATOMICALLY as part of the resume rather than by nudging the
+        session afterwards: a client-side "wait for idle, then fire" cannot tell
+        the resume reaching idle apart from the user typing something new, and
+        would eventually re-send a stale message into the wrong turn.
+
+        Only an in-memory session can resume its turn — a dormant one has no
+        ``entries`` loaded to derive the prompt from, so it resumes cold.
+
+        Returns the same ``{"ok", "model", "resumed"}`` shape as
+        ``set_session_model`` so the socket handler needs no special case, plus
+        ``turn_resumed`` so the UI can say what actually happened.
+        """
+        # Prefer live in-memory metadata over the on-disk registry: for a
+        # STOPPED session the registry can lag behind a rename or a cwd change.
+        cwd = (info.cwd if info else "") or ""
+        name = (info.name if info else "") or ""
+        if not (cwd and name):
+            reg = {}
+            try:
+                reg = self._reg.load_registry().get("sessions", {}).get(
+                    session_id, {}
+                ) or {}
+            except Exception:
+                pass
+            cwd = cwd or reg.get("cwd") or ""
+            name = name or reg.get("name", "")
+        if cwd:
+            cwd = os.path.normpath(cwd)
+        if info is None:
+            # Dormant: verify the transcript actually exists before resuming,
+            # otherwise start_session would create a NEW session under this id.
+            try:
+                jsonl = self._store.find_session_path(session_id)
+            except Exception:
+                jsonl = None
+            if not (jsonl and jsonl.exists()):
+                return {"ok": False, "error": "Session not found"}
+        prompt = ""
+        if info is not None:
+            # The user is explicitly moving off the model that hit the wall, so
+            # the recorded limit no longer describes this session.  Clear it
+            # BEFORE the resume so the restart doesn't re-emit a stale CTA.
+            self._clear_usage_limit(info)
+            info._limit_origin = ""
+            info.error = ""
+            if resume_turn:
+                prompt = self._resume_turn_prompt(info)
+                # A fresh turn must not inherit the failed turn's retry budget,
+                # so a later genuine outage still gets its full backoff chain.
+                if prompt:
+                    self._clear_api_retry(info, reset_count=True)
+        logger.info("set_session_model: resuming not-live session %s on %s "
+                    "(state=%s, resume_turn=%s)", session_id, model,
+                    info.state if info else "dormant", bool(prompt))
+        start_result = self.start_session(
+            session_id=session_id,
+            prompt=prompt,
+            cwd=cwd,
+            name=name,
+            resume=True,
+            model=model,
+        )
+        if not start_result.get("ok"):
+            return {"ok": False,
+                    "error": start_result.get("error",
+                                              "Failed to resume session")}
+        try:
+            from shared.models import record_confirmed_model
+            record_confirmed_model(model)
+        except Exception:
+            pass
+        # ─── Broadcast the switch to all clients ───────────────────────────
+        # Symmetry with the live-switch path (set_session_model): the tab that
+        # initiated the switch already learns the outcome via the reply-only
+        # ``session_model_result`` emit, but EVERY OTHER client/device needs a
+        # dedicated push or it keeps showing the OLD model.  This is exactly the
+        # desktop→phone case: a session started on the computer goes idle/slept,
+        # then its model is switched from the phone through THIS resume path.
+        # Without this broadcast the desktop's badge and the sidebar model
+        # column stay stale (the restart's own state events can lag or, for a
+        # client not currently viewing the session, never repaint the badge).
+        # ``session_model_changed`` is queue-neutral — no state/dispatch
+        # machinery attached — and ``ingestConfirmed`` on the client is
+        # idempotent, so this can never conflict with the restart's own events.
+        #
+        # Broadcast the REQUESTED model, not the mirror: on the resume path
+        # ``info.model`` still holds the OLD id until the CLI's init message
+        # reconciles it through ``_set_confirmed_model``.  ``model`` is what
+        # the session is resuming ON (it was passed as ``--model``), so it is
+        # the honest value to show now; a later init that resolves to a
+        # dated/[1m] id broadcasts its own correction.
+        self._broadcast_model_changed(
+            session_id, self._sessions.get(session_id), model,
+            resumed=True, turn_resumed=bool(prompt),
+        )
+        return {"ok": True, "model": model, "resumed": True,
+                "turn_resumed": bool(prompt)}
+
+    def set_session_model(self, session_id: str, model: str,
+                          resume_turn: bool = False) -> dict:
+        """Switch a running session's model for all subsequent turns.
+
+        ``resume_turn=True`` also re-runs the turn an error interrupted, for
+        the usage-limit CTA (see ``_resume_with_model``).  It is ignored when
+        there is nothing to resume.
+
+        Honesty contract (this exists because the UI once lied about it):
+        ``info.model`` is updated ONLY after the CLI confirms the switch
+        via the control-protocol response.  On any failure the recorded
+        model is left untouched and the error is returned to the caller —
+        the UI must surface it, never fake success.  The init-message
+        handler remains the ultimate ground truth: if the CLI later
+        reports a different resolved model id, that overwrites this.
+        """
+        session_id = self._resolve_id(session_id)
+        model = (model or "").strip()
+        if not model:
+            return {"ok": False, "error": "No model specified"}
+        with self._lock:
+            info = self._sessions.get(session_id)
+        # A session that is not live has no CLI to accept a control request, so
+        # the switch is performed by RESUMING it with ``--model`` instead.  All
+        # three not-live shapes route to the same helper:
+        #
+        #   * ``not info``            — dormant (daemon restarted since it idled)
+        #   * ``state == STOPPED``    — slept, killed, or died mid-turn
+        #   * ``not info.client``     — in memory but the transport is gone
+        #
+        # STOPPED used to hard-fail with "Session is stopped", which is exactly
+        # the dead end a usage limit puts the user in: the limit stops the
+        # session, and stopping the session removes the only way to switch off
+        # the limited model.  Resuming with the requested model is just as
+        # authoritative as a live set_model — the CLI's init message confirms
+        # the resolved id through the same sink either way.
+        if (not info) or info.state == SessionState.STOPPED or (not info.client):
+            return self._resume_with_model(session_id, model, info,
+                                           resume_turn=resume_turn)
+
+        # Guard the extended listener from misinterpreting the CLI's init
+        # message (emitted after set_model) as an auto-resume signal.
+        # See _extended_post_turn_listener / _post_turn_compact_drain pre-detect.
+        info._model_switch_in_progress = True
+        # Timestamp so the flag self-expires (see _model_switch_pending): if
+        # the CLI never emits the side-effect init, a stale flag would swallow
+        # the next REAL auto-resume signal and leave the session shown IDLE
+        # while it is working.
+        info._model_switch_at = time.time()
+        # The user's pick beats a usage-limit auto-switch counting down: clear
+        # it BEFORE this blocking request, so the countdown cannot fire its own
+        # set_model behind this one.  Kept aside in case this pick fails.
+        pending_switch = info.limit_switch_to
+        info.limit_switch_to = ""
+
+        def _restore_pending_switch():
+            # The pick did not happen, so the auto-switch still stands, but
+            # only while its countdown does (a Cancel meanwhile ended it).
+            if pending_switch and info.retry_at > 0 and not info.limit_switch_to:
+                info.limit_switch_to = pending_switch
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._sdk.set_model(info.client, model), self._loop
+            )
+            fut.result(timeout=15)
+        except NotImplementedError as e:
+            info._model_switch_in_progress = False
+            _restore_pending_switch()
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            # The switch did not happen, so no side-effect init is coming —
+            # clear the flag now rather than letting it linger and misfile
+            # the next genuine auto-resume signal.
+            info._model_switch_in_progress = False
+            _restore_pending_switch()
+            logger.warning("set_session_model failed for %s -> %s: %s",
+                           session_id, model, e)
+            return {"ok": False, "error": f"Model switch rejected: {e}"}
+
+        # CLI confirmed — now (and only now) record it, via the single sink.
+        self._set_confirmed_model(info, model, save_registry=True)
+        # A manual choice ends any usage-limit auto-switch bookkeeping: a later
+        # limit must not "switch back" to a model the user moved away from.
+        info._limit_origin = ""
+        # The session is no longer on the model that hit the wall, so retract
+        # the usage-limit CTA and its error banner.  (The limit itself is
+        # account+model scoped, so switching genuinely resolves it here.)
+        if info.limited_model or info.limit_reset_at:
+            self._clear_usage_limit(info)
+            info.error = ""
+        logger.info("Session %s model switched to %s (CLI confirmed)",
+                    session_id, model)
+        # NOTE: do NOT call _emit_state here.  _emit_state on an IDLE session
+        # unconditionally calls _try_dispatch_queue — which would fire any
+        # message the user had queued while the session was busy.  That
+        # caused a surprise WORKING state immediately after the switch, with
+        # the first turn on the new model appearing "hung" (cold cache hit).
+        # ─── Broadcast the switch to all clients ───────────────────────────
+        # Prior to this broadcast, only the tab that initiated the switch
+        # received ``session_model_result`` (reply-only emit).  Other tabs
+        # or devices kept showing the OLD model until the next natural
+        # state transition, which for an idle session can be hours away.
+        # ``session_model_changed`` is a queue-neutral push — no state or
+        # queue-dispatch machinery attached — so every client can update
+        # its badge without any risk of tripping ``_try_dispatch_queue``.
+        self._broadcast_model_changed(session_id, info, info.model)
+        # Human-readable log entry so the transcript records the switch.
+        entry = LogEntry(kind="system", text=f"Model switched to {model}")
+        with info._lock:
+            info.entries.append(entry)
+            entry_index = len(info.entries) - 1
+        self._emit_entry(session_id, entry, entry_index)
+        return {"ok": True, "model": info.model}
+
+    # Display names for the transcript note, matching the picker's labels
+    # (SessionModel.THINKING_LEVELS in src/web/static/js/session-model.js).
+    _EFFORT_LABELS = {"": "Default", "low": "Low", "medium": "Medium",
+                      "high": "High", "xhigh": "xHigh", "max": "Max"}
+
+    def set_session_effort(self, session_id: str, effort: str = "") -> dict:
+        """Change a LIVE session's thinking level (CLI effort) in place.
+
+        The thinking level used to be launch-only (``--effort``), so changing
+        it restarted the session's CLI, and a busy session refused with
+        "Session is busy. Change thinking once the current turn finishes."
+        The CLI's ``apply_flag_settings`` control request changes it in
+        place, mid-turn included (see ``ClaudeAgentSDK.set_effort``), so
+        nothing has to wait and nothing is restarted.
+
+        ``effort`` is a ``VALID_EFFORTS`` level, or '' / 'default' for the
+        model's own default.  Results:
+
+          * ``{"ok": True, "effort", "applied"}``: the CLI confirmed.
+            ``effort`` is what is recorded and re-pinned on every later
+            resume; ``applied`` is what the CLI runs on the CURRENT model
+            (it can be lower, or None on a model without thinking levels).
+          * ``not_live``: asleep (dormant or STOPPED).  The caller resumes
+            the session with ``--effort``.
+          * ``not_ready``: the CLI is still starting.  The caller applies the
+            level once the session is free, by relaunching with ``--effort``.
+          * ``live_unavailable``: this CLI can't change effort live (one that
+            predates the requests), the request failed, or the session is in
+            memory without a connection.  The caller relaunches the CLI with
+            ``--effort`` (close, then resume) once no turn is running.
+
+        Honesty contract, as for ``set_session_model``: ``info.effort`` and
+        the registry change ONLY after the CLI confirmed.  Deliberately no
+        ``_emit_state``: on an IDLE session it dispatches the queue, which
+        would start a queued message the user never sent (see the note in
+        ``set_session_model``).  Clients learn the change from the reply and
+        the queue-neutral ``session_effort_changed`` broadcast.
+        """
+        session_id = self._resolve_id(session_id)
+        level = str(effort or "").strip().lower()
+        if level == "default":
+            level = ""
+        if level and level not in self.VALID_EFFORTS:
+            return {"ok": False, "error": f"Unknown thinking level: {effort}"}
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if (not info) or info.state == SessionState.STOPPED:
+            return {"ok": False, "not_live": True,
+                    "error": "Session is not running"}
+        # Before the client check: a starting session may not have one yet.
+        if info.state == SessionState.STARTING:
+            return {"ok": False, "not_ready": True,
+                    "error": "Session is still starting"}
+        if not info.client:
+            # In memory and not STOPPED, but the transport is gone.  A plain
+            # resume would be refused as "already running", so the caller
+            # relaunches it (close, then resume with --effort).
+            return {"ok": False, "live_unavailable": True,
+                    "error": "Session has no live connection"}
+        fut = None
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._sdk.set_effort(info.client, level or None), self._loop
+            )
+            applied = fut.result(timeout=15)
+        except Exception as e:
+            # Nothing was confirmed, so nothing is recorded.  Every failure is
+            # reported as live_unavailable: relaunching the CLI with --effort
+            # is the remedy for each of them (a CLI that predates the request,
+            # a wedged CLI, a dead transport).
+            if fut is not None and not fut.done():
+                fut.cancel()
+            err = str(e) or e.__class__.__name__
+            logger.warning("set_session_effort: live change unavailable for "
+                           "%s -> %r: %s", session_id, level, err)
+            return {"ok": False, "live_unavailable": True, "error": err}
+
+        info.effort = level
+        self._schedule_registry_save()
+        self._broadcast_effort_changed(session_id, level, applied)
+        label = self._EFFORT_LABELS.get(level, level)
+        note = f"Thinking set to {label}"
+        if level and applied and applied != level:
+            note += f" (runs as {self._EFFORT_LABELS.get(applied, applied)} on this model)"
+        entry = LogEntry(kind="system", text=note)
+        with info._lock:
+            info.entries.append(entry)
+            entry_index = len(info.entries) - 1
+        self._emit_entry(session_id, entry, entry_index)
+        logger.info("Session %s thinking level set to %r live (CLI applies %r)",
+                    session_id, level or "default", applied)
+        return {"ok": True, "effort": level, "applied": applied}
+
+    def _broadcast_effort_changed(self, session_id: str, effort: str,
+                                  applied: Optional[str]) -> None:
+        """Push ``session_effort_changed`` to EVERY connected client.
+
+        The reply (``session_effort_result``) reaches only the asking socket;
+        other tabs and devices, and the asking tab when a mobile reconnect
+        lost the reply, learn of the change only from this.  Queue-neutral
+        like ``_broadcast_model_changed``.  Never raises.
+        """
+        if not self._push_callback:
+            return
+        try:
+            self._push_callback('session_effort_changed', {
+                'session_id': session_id,
+                'effort': effort,
+                'applied': applied,
+            })
+        except Exception as _cb_err:
+            logger.warning("session_effort_changed broadcast failed for %s: %s",
+                           session_id, _cb_err)
+
+    def close_session(self, session_id: str) -> dict:
+        """Close and disconnect an SDK session.
+
+        Immediately forces the session to STOPPED so subsequent start_session
+        calls don't get rejected with 'already running'.  The async cleanup
+        (disconnect, cancel task) still runs in the background.
+        """
+        raw_id = session_id
+        session_id = self._resolve_id(session_id)
+        # An explicit user stop is authoritative: erase the restart-memory
+        # entry for this session unconditionally.  _last_known_states is a
+        # snapshot taken once at daemon startup and is served by
+        # get_dormant_states() to /api/sessions as `last_state`.  Nothing else
+        # ever prunes it, so a session the user stopped kept being tagged
+        # "idle" on every page load and reappeared as idle after a refresh —
+        # the stop looked like it silently un-did itself.  Done BEFORE the
+        # not-found check because the not-found case is exactly the one that
+        # produced the bug: the session exists only as restart memory.
+        self.forget_dormant(raw_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"ok": False, "error": "Session not found"}
+
+        # Force STOPPED immediately so the session is unblocked for restart.
+        # Also clear sleeping state — a STOPPED session is not awaiting a
+        # wake-up, so the substatus should not linger as "auto-resuming"
+        # after close.
+        info.state = SessionState.STOPPED
+        info._wakeup_pending = False
+        info._force_queue_dispatch = False
+        info._wakeup_queue_blocked_since = 0.0
+        info._wakeup_deadline = 0.0
+        info._wakeup_max_delay = 0.0
+        info._wakeup_is_scheduled = False
+        info.substatus = ""
+        # Cancel any pending API-error auto-retry — the session is closing.
+        self._clear_api_retry(info, reset_count=True)
+        self._emit_state(info)
+
+        asyncio.run_coroutine_threadsafe(
+            self._close_session(session_id), self._loop
+        )
+        return {"ok": True}
+
+    def cancel_auto_retry(self, session_id: str) -> dict:
+        """Cancel a pending API-error auto-retry (the Cancel button).
+
+        Leaves the session idle with the error visible and the retry budget
+        reset, so the user can type a fresh message or click manual Retry.
+        One exception: during a usage-limit auto-switch countdown ("switching
+        to Opus 5.5 in 5s"), Cancel means "don't switch", so the session goes
+        on to wait for its own limit to reset, as a visible countdown with its
+        own Cancel.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"ok": False, "error": "Session not found"}
+        had_pending = info.retry_at > 0
+        had_switch = bool(getattr(info, "limit_switch_to", ""))
+        self._clear_api_retry(info, reset_count=True)
+        if had_switch and info.limited_model \
+                and self._schedule_limit_resume(info, allow_switch=False):
+            # Cancel during "switching to Opus in 5s" means "don't switch",
+            # not "stop": wait for this model's own limit to reset instead,
+            # visibly, with its own Cancel.
+            entry = LogEntry(kind="system", text="Not switching models. Continuing on %s "
+                             "when its limit resets." % self._model_label(info.limited_model))
+            with info._lock:
+                info.entries.append(entry)
+                entry_index = len(info.entries) - 1
+            self._emit_entry(session_id, entry, entry_index)
+            self._arm_api_retry(session_id, info)
+            return {"ok": True}
+        if had_pending:
+            info.error = "Auto-retry cancelled — use Retry or type a new message"
+            entry = LogEntry(kind="system", text="Auto-retry cancelled.")
+            with info._lock:
+                info.entries.append(entry)
+                entry_index = len(info.entries) - 1
+            self._emit_entry(session_id, entry, entry_index)
+        if info.state != SessionState.STOPPED:
+            info.state = SessionState.IDLE
+        self._emit_state(info)
+        return {"ok": True}
+
+    def retry_now(self, session_id: str) -> dict:
+        """Resend the last user message immediately (the Retry-now button during
+        a countdown, or the manual Retry button after the budget was exhausted
+        or a permanent error).
+
+        During an active countdown the accumulating attempt counter is preserved
+        (the _API_RETRY_MAX cap still applies).  A manual retry from a settled
+        error state (no countdown) instead restores the full auto-retry budget,
+        treating the click as a fresh start.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"ok": False, "error": "Session not found"}
+        if info.state == SessionState.STOPPED:
+            return {"ok": False, "error": "Session is stopped"}
+        if info.state != SessionState.IDLE:
+            return {"ok": False, "error": "Session is %s, not idle" % info.state.value}
+        countdown_active = info.retry_at > 0
+        self._cancel_api_retry_task(info)
+        if not countdown_active:
+            # Manual retry from an error state — fresh start, full budget.
+            info._api_retry_count = 0
+            info.error = ""
+        if getattr(info, '_retry_needs_reconnect', False):
+            # Transport is dead (connectivity loss / CLI crash) — reconnect on
+            # the loop before resending.  Done async so we don't block the
+            # caller's request thread on a network reconnect.
+            asyncio.run_coroutine_threadsafe(
+                self._do_retry_now_reconnect(session_id), self._loop
+            )
+        elif countdown_active and getattr(info, "limit_switch_to", ""):
+            # A usage-limit auto-switch is counting down: "Retry now" means
+            # switch now, then continue.  The switch is a control request, so
+            # it runs on the loop, tracked like the timer so Cancel can stop it.
+            info._api_retry_task = asyncio.run_coroutine_threadsafe(
+                self._retry_now_switch(session_id, info), self._loop
+            )
+        else:
+            self._fire_api_retry(session_id, info)
+        return {"ok": True}
+
+    async def _retry_now_switch(self, session_id: str, info) -> None:
+        """Retry-now during a usage-limit auto-switch countdown: switch, then
+        continue, inside the same exception boundary as the timer
+        (``_api_retry_timer``), so a failure leaves a usable manual Retry
+        instead of a countdown nothing will ever complete."""
+        try:
+            await self._switch_then_fire(session_id, info)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Retry-now switch crashed for %s", session_id)
+            self._fail_retry_open(
+                session_id, "Auto-retry failed unexpectedly — use Retry to resume.")
+
+    async def _do_retry_now_reconnect(self, session_id: str) -> None:
+        """Reconnect-then-fire path for retry_now when the transport is dead."""
+        with self._lock:
+            info = self._sessions.get(self._resolve_id(session_id))
+        if not info:
+            return
+        reconnected = False
+        try:
+            reconnected = await self._reconnect_client(session_id, info)
+        except Exception as rc_err:
+            logger.warning("retry_now reconnect for %s raised: %s", session_id, rc_err)
+        if not reconnected:
+            info.error = "Reconnect failed — connection may still be down. Try again."
+            info.state = SessionState.IDLE
+            self._emit_state(info)
+            return
+        info._retry_needs_reconnect = False
+        await self._switch_then_fire(session_id, info)
+
+    def close_session_sync(self, session_id: str, timeout: float = 5.0) -> dict:
+        """Close an SDK session and block until the disconnect finishes."""
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"ok": False, "error": "Session not found"}
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._close_session(session_id), self._loop
+        )
+        try:
+            future.result(timeout=timeout)
+        except Exception as e:
+            logger.warning("Timed-out or failed waiting for close of %s: %s", session_id, e)
+        return {"ok": True}
+
+    def _on_rate_limit_info(self, rate_limit_info) -> None:
+        """Sink for the CLI's rate_limit_event (called from the SDK parser).
+
+        Merges the windows, and only on a real change persists them and pushes
+        ``usage_limits`` to every browser.  Cheap and never raises: it runs on
+        the session's receive path, once per turn.
+        """
+        from engine import usage_limits as _ul
+        lock = getattr(self, "_usage_lock", None)
+        if lock is None:
+            return
+        with lock:
+            new_state, changed = _ul.merge(getattr(self, "_usage_state", {}) or {},
+                                           rate_limit_info)
+            self._usage_state = new_state
+        if not changed:
+            return
+        _ul.save(new_state)
+        if self._push_callback:
+            try:
+                self._push_callback("usage_limits", _ul.public_view(new_state))
+            except Exception as e:
+                logger.debug("usage_limits broadcast failed: %s", e)
+
+    def remove_session(self, session_id: str) -> None:
+        """Remove a session from the in-memory dict entirely.
+
+        Follows the temp-id -> CLI-id remap.  Callers usually hold the id they
+        started the session with, but after the first RESULT the session lives
+        under the CLI's id, so popping only the raw id silently left the
+        session (and, for title sessions, its idle CLI) registered forever.
+        Callers must close the session first (close_session_sync) to stop
+        its CLI; this only forgets it.
+        """
+        with self._lock:
+            self._sessions.pop(session_id, None)
+            resolved = self._resolve_id(session_id)
+            if resolved != session_id:
+                self._sessions.pop(resolved, None)
+
+    def get_all_states(self) -> list:
+        """Return snapshot of all session states for initial WebSocket connect.
+
+        Includes queue data from the server-side queue store so reconnecting
+        clients can immediately display queued items.
+
+        Cross-project bleed fix: sessions auto-resumed before the
+        ``_reg`` typo fix had ``info.cwd = ""`` because the registry was never
+        read.  Empty-cwd sessions pass through ``_filter_sessions_for_project``
+        (the filter treats them as "no project context → show everywhere"), so
+        they bled into every project's snapshot and appeared in the wrong
+        project's sidebar.  We fill in the cwd from the persistent registry for
+        any session whose in-memory ``cwd`` is still empty, so the server-side
+        filter can exclude them correctly.
+        """
+        with self._lock:
+            states = [info.to_state_dict() for info in self._sessions.values()
+                      if info.session_type not in ("planner", "title")]
+        # Fill in missing cwds from the registry for sessions with empty cwd.
+        # Only do the registry read when there are actually empty-cwd sessions
+        # (should be rare after the _reg fix; avoids disk I/O on the hot path).
+        _empty_cwd_states = [s for s in states if not s.get("cwd")]
+        if _empty_cwd_states:
+            try:
+                reg_sessions = self._reg.load_registry().get("sessions", {})
+                for s in _empty_cwd_states:
+                    reg_cwd = (reg_sessions.get(s["session_id"]) or {}).get("cwd") or ""
+                    if reg_cwd:
+                        s["cwd"] = reg_cwd
+            except Exception:
+                pass  # registry unreadable — leave cwd as-is; filter stays permissive
+        # Merge queue data into state dicts
+        for s in states:
+            sid = s.get("session_id", "")
+            q = self._mq.get_queue_data(sid)
+            if q:
+                s["queue"] = q
+        return states
+
+    def get_entries(self, session_id: str, since: int = 0) -> list:
+        """Return log entries for a session, optionally from an index."""
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return []
+        with info._lock:
+            return [e.to_dict() for e in info.entries[since:]]
+
+    # PERF-CRITICAL: Returns len(entries) without serialization (0-1ms vs 25-32ms). See CLAUDE.md #6.
+    #
+    # LESSON LEARNED: The watchdog endpoint (/api/live/state)
+    # polled every 10 seconds and used len(get_entries(session_id)) to count
+    # entries.  get_entries() serializes EVERY LogEntry to a dict, JSON-encodes
+    # the list, sends it over TCP IPC, deserializes — then Python counts len().
+    # For a 300-entry session: 25-32ms to return the integer 300.  This method
+    # returns len(info.entries) directly — O(1), no serialization, 0-1ms.
+    def get_entry_count(self, session_id: str) -> int:
+        """Return the number of log entries without serializing them."""
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return 0
+        return len(info.entries)
+
+    # Companion to get_entry_count that also reports whether the in-memory
+    # entries list has been trimmed at any point in this session's lifetime.
+    # Same O(1) shape as get_entry_count -- adds only a single getattr.
+    # Consumed by src/web/routes/ws_events.py::handle_get_session_log's fast path,
+    # which must refuse to trust ``count`` as an authoritative total for the
+    # on-disk JSONL once ``trimmed`` is True (the JSONL is never trimmed, so
+    # engine.count < JSONL.len from that point on).  See CLAUDE.md #6.
+    def get_entry_trim_status(self, session_id: str) -> dict:
+        """Return {"count": N, "trimmed": bool} for a managed session.
+
+        ``count``   -- len(info.entries), same value as get_entry_count.
+        ``trimmed`` -- True iff the in-memory entries were ever trimmed
+                       (sticky flag; see the IDLE/STOPPED trim block).
+        Returns {"count": 0, "trimmed": False} for unmanaged sessions.
+        (Dict rather than tuple so JSON IPC round-trips cleanly.)
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"count": 0, "trimmed": False}
+        return {
+            "count": len(info.entries),
+            "trimmed": bool(getattr(info, "_entries_trimmed", False)),
+        }
+
+    def has_session(self, session_id: str) -> bool:
+        """Check if a session is managed by the SDK."""
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            return session_id in self._sessions
+
+    def get_session_state(self, session_id: str) -> Optional[str]:
+        """Return the state string for a session, or None if not managed."""
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if info:
+            return info.state.value
+        return None
+
+    def get_dormant_states(self) -> dict:
+        """Return restart-memory states for previously-active dormant sessions.
+
+        After a restart, sessions that were merely idle are intentionally NOT
+        auto-recovered (see SessionRegistry.recover_sessions), so they are
+        absent from _sessions and get_session_state() returns None for them —
+        which the UI renders as "sleeping".  This returns the state each such
+        session held before the restart (captured at startup in
+        _last_known_states) so the UI can mark them "was active before
+        restart" instead.
+
+        A session that has since gone live (recovered, or re-opened by the
+        user) is OMITTED here: its live state from get_all_states() is
+        authoritative and must win.  This method never launches a process.
+
+        Returns {session_id: {"last_state", "name", "cwd", "session_type",
+        "last_activity"}} keyed by canonical (alias-resolved) id.
+        """
+        snapshot = self._last_known_states
+        if not snapshot:
+            return {}
+        with self._lock:
+            live = set(self._sessions.keys())
+        out = {}
+        for sid, meta in snapshot.items():
+            # Drop anything currently live under either the registry id or its
+            # canonical (post-recovery remap) id — live state wins.
+            rid = self._resolve_id(sid)
+            if sid in live or rid in live:
+                continue
+            out[rid] = meta
+        return out
+
+    def forget_dormant(self, session_id: str) -> None:
+        """Drop *session_id* from the restart-memory snapshot.
+
+        Called on an explicit user stop (and on delete).  ``_last_known_states``
+        is loaded once at daemon startup and is otherwise immutable for the
+        life of the process, so without this a stopped session keeps being
+        reported to the UI with ``last_state="idle"`` on every /api/sessions
+        call.  The user stops it, the sidebar shows "sleeping", they refresh,
+        and the server hands the idle marker straight back — the stop appears
+        to be undone by the refresh.  Only a daemon restart cleared it.
+
+        Removes both the id as given and its alias-resolved form, because the
+        snapshot is keyed by the pre-remap registry id while callers usually
+        hold the canonical one.  Safe to call for unknown ids.
+        """
+        snapshot = self._last_known_states
+        if not snapshot:
+            return
+        snapshot.pop(session_id, None)
+        try:
+            resolved = self._resolve_id(session_id)
+        except Exception:
+            return
+        if resolved != session_id:
+            snapshot.pop(resolved, None)
+        # Also drop any registry-side alias that resolves to the same session.
+        for sid in [s for s in snapshot if self._resolve_id(s) == resolved]:
+            snapshot.pop(sid, None)
+
+    def orphan_children_of(self, parent_sid: str) -> list:
+        """Mark every in-memory child of *parent_sid* as orphaned.
+
+        Sets ``parent_deleted_at`` to the current ISO8601 UTC timestamp
+        and clears ``parent_session_id`` so the next sidebar render no
+        longer indents the child under a missing parent (spec §6.2).
+
+        Returns the list of orphaned child SIDs (may be empty).  Called
+        by the deletion endpoint immediately after the parent's
+        SessionInfo is removed from the registry.
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
+        orphaned = []
+        with self._lock:
+            for sid, info in self._sessions.items():
+                if info.parent_session_id == parent_sid:
+                    info.parent_deleted_at = now
+                    info.parent_session_id = None
+                    orphaned.append(sid)
+        if orphaned:
+            self._schedule_registry_save()
+        return orphaned
+
+    def detect_rewind_orphans(self, parent_sid: str, new_line_count: int) -> list:
+        """Sweep in-memory children of *parent_sid* and return those whose
+        ``subsession_origin_turn`` is now past the new line count.
+
+        Called by the rewind endpoint after the parent JSONL is rewritten
+        (spec §6.3).  The returned SIDs need a UI badge ("Spawn point no
+        longer in parent's history") and a Re-anchor / Detach prompt.
+        We do NOT auto-detach — the user decides.
+        """
+        flagged = []
+        with self._lock:
+            for sid, info in self._sessions.items():
+                if info.parent_session_id != parent_sid:
+                    continue
+                if info.subsession_origin_turn > new_line_count:
+                    flagged.append(sid)
+        return flagged
+
+    def detach_subsession(self, child_sid: str) -> bool:
+        """Phase 6.5 P1-5 — clear a subsession's parent pointer (Detach
+        action on the rewind-orphan UI prompt).
+
+        Sets ``parent_session_id = None`` and stamps a
+        ``parent_deleted_at`` tombstone so the orphan-state UI shows
+        "Reports to: (parent deleted)" exactly the same way as a true
+        parent deletion (spec §6.2).  Returns True on success.
+        """
+        from datetime import datetime, timezone
+
+        child_sid = self._resolve_id(child_sid)
+        with self._lock:
+            info = self._sessions.get(child_sid)
+            if not info:
+                return False
+            info.parent_session_id = None
+            info.parent_deleted_at = datetime.now(timezone.utc).isoformat(
+                timespec="seconds"
+            ).replace("+00:00", "Z")
+        self._schedule_registry_save()
+        self._emit_state(info)
+        return True
+
+    def reanchor_subsession(self, child_sid: str, new_origin_turn: int) -> bool:
+        """Set a new ``subsession_origin_turn`` on a child whose parent was
+        rewound past its old anchor (spec §6.3 Re-anchor action).
+
+        Returns True if the in-memory SessionInfo was updated.
+        """
+        child_sid = self._resolve_id(child_sid)
+        with self._lock:
+            info = self._sessions.get(child_sid)
+            if not info:
+                return False
+            info.subsession_origin_turn = max(0, int(new_origin_turn))
+        self._schedule_registry_save()
+        return True
+
+    def _maybe_auto_report_to_parent(self, info: "SessionInfo") -> None:
+        """Phase 6.5 P1-4 — write the last assistant message to the parent's
+        inbox if this subsession has new content since the previous auto-
+        report.
+
+        Idempotent: tracks ``_last_auto_report_entry_count`` so multiple
+        IDLE emits per turn don't produce duplicate reports.  Caller must
+        already have verified ``info.auto_report_on_idle`` and
+        ``info.parent_session_id``.
+        """
+        # Snapshot under the per-session lock so we don't race a streaming
+        # writer that's appending entries.
+        with info._lock:
+            entry_count = len(info.entries)
+            if entry_count <= info._last_auto_report_entry_count:
+                return  # No new turn since last auto-report.
+            # Find the last assistant text entry.
+            last_assistant_text = ""
+            for entry in reversed(info.entries):
+                kind = getattr(entry, "kind", "")
+                if kind != "assistant":
+                    continue
+                text = (getattr(entry, "text", "") or "").strip()
+                if text:
+                    last_assistant_text = text
+                    break
+            if not last_assistant_text:
+                # No assistant content yet — bump the counter so we don't
+                # re-scan every IDLE emit for the same empty state.
+                info._last_auto_report_entry_count = entry_count
+                return
+            # Update the counter BEFORE the disk write so a slow write
+            # can't race a second concurrent _emit_state into double-
+            # reporting.
+            info._last_auto_report_entry_count = entry_count
+            parent_sid = info.parent_session_id
+            child_sid = info.session_id
+            child_name = info.name or ""
+            # Cap the auto-report summary so a long assistant message
+            # doesn't bloat the inbox.  The user can still see the full
+            # text by clicking the subsession.
+            summary = last_assistant_text[:1500]
+
+        # OUTSIDE the lock — disk write should never hold the session lock.
+        try:
+            from engine.subsession_inbox import append_report
+            append_report(
+                parent_sid=parent_sid,
+                child_sid=child_sid,
+                child_name=child_name,
+                summary=summary,
+            )
+        except Exception as e:
+            logger.warning(
+                "auto-report append_report failed for %s -> %s: %s",
+                child_sid, parent_sid, e,
+            )
+            return
+        # Flip the parent's inbox-dirty flag if managed, so the parent's
+        # next send_message turn drains without re-reading disk.
+        try:
+            self.mark_inbox_dirty(parent_sid)
+        except Exception as e:
+            logger.debug(
+                "auto-report mark_inbox_dirty soft-fail for %s: %s",
+                parent_sid, e,
+            )
+        # Best-effort: emit an inbox_updated event so any connected
+        # client updates the badge.
+        try:
+            from engine.subsession_inbox import undelivered_count
+            if self._push_callback:
+                self._push_callback("inbox_updated", {
+                    "parent_session_id": parent_sid,
+                    "undelivered_count": undelivered_count(parent_sid),
+                    "from_child_session_id": child_sid,
+                    "auto": True,
+                })
+        except Exception as e:
+            logger.debug("auto-report inbox_updated emit soft-fail: %s", e)
+
+    def _maybe_marker_report_to_parent(self, info: "SessionInfo") -> None:
+        """Patent 13 — report the child's conclusion up when its latest
+        assistant message carries the ``<!-- subsession:report -->`` marker.
+
+        Independent of ``auto_report_on_idle``: the marker is the child
+        explicitly deciding to report, so this fires whenever the marker is
+        present on a fresh turn.  Idempotent across repeated IDLE emits via
+        ``_last_marker_report_entry_count``.  Caller must already have
+        verified ``info.parent_session_id``.
+        """
+        with info._lock:
+            entry_count = len(info.entries)
+            if entry_count <= getattr(info, "_last_marker_report_entry_count", 0):
+                return  # No new turn since the last marker report.
+            # Find the last assistant text entry and test it for the marker.
+            last_assistant_text = ""
+            for entry in reversed(info.entries):
+                if getattr(entry, "kind", "") != "assistant":
+                    continue
+                text = (getattr(entry, "text", "") or "").strip()
+                if text:
+                    last_assistant_text = text
+                    break
+            found, conclusion = _scan_subsession_report_marker(last_assistant_text)
+            if not found:
+                # Advance the counter so we don't re-scan the same turn on
+                # every IDLE emit; the marker either was or wasn't here.
+                info._last_marker_report_entry_count = entry_count
+                return
+            info._last_marker_report_entry_count = entry_count
+            parent_sid = info.parent_session_id
+            child_sid = info.session_id
+            child_name = info.name or ""
+            # Fall back to the raw text if stripping the marker left nothing.
+            summary = (conclusion or last_assistant_text)[:1500]
+
+        # OUTSIDE the lock — disk write never holds the session lock.
+        try:
+            from engine.subsession_inbox import append_report
+            append_report(
+                parent_sid=parent_sid,
+                child_sid=child_sid,
+                child_name=child_name,
+                summary=summary,
+            )
+        except Exception as e:
+            logger.warning(
+                "marker-report append_report failed for %s -> %s: %s",
+                child_sid, parent_sid, e,
+            )
+            return
+        try:
+            self.mark_inbox_dirty(parent_sid)
+        except Exception as e:
+            logger.debug(
+                "marker-report mark_inbox_dirty soft-fail for %s: %s",
+                parent_sid, e,
+            )
+        try:
+            from engine.subsession_inbox import undelivered_count
+            if self._push_callback:
+                self._push_callback("inbox_updated", {
+                    "parent_session_id": parent_sid,
+                    "undelivered_count": undelivered_count(parent_sid),
+                    "from_child_session_id": child_sid,
+                    "marker": True,
+                })
+        except Exception as e:
+            logger.debug("marker-report inbox_updated emit soft-fail: %s", e)
+
+    def set_auto_report_on_idle(self, session_id: str, on: bool) -> bool:
+        """Phase 6.5 P1-4 — toggle the subsession's auto-report preference.
+
+        Returns True if the flag was updated on a managed SessionInfo.  The
+        live-panel toggle calls this via POST /api/sessions/<sid>/auto-report-toggle.
+        The change is debounced into the registry snapshot via the existing
+        save-scheduler so a daemon restart preserves the preference.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+            if not info:
+                return False
+            info.auto_report_on_idle = bool(on)
+        self._schedule_registry_save()
+        # Push state so any connected client picks up the new flag in
+        # to_state_dict() without waiting for the next session_state emit.
+        self._emit_state(info)
+        return True
+
+    def mark_inbox_dirty(self, session_id: str) -> bool:
+        """Set ``info.inbox_dirty = True`` on a managed parent session.
+
+        Returns True if the flag was set (parent is managed), False
+        otherwise.  Called by the report-to-parent endpoint so the next
+        send_message turn knows to drain the inbox without re-reading
+        the file off disk on every turn (spec §7.2 hot-path constraint).
+
+        If the parent isn't currently daemon-managed, the call falls
+        through; the next time the parent loads, send_message will
+        re-derive ``inbox_dirty`` from disk (Phase 4 behavior).
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+            if not info:
+                return False
+            info.inbox_dirty = True
+            return True
+
+    def get_subsession_meta(self, session_id: str) -> Optional[dict]:
+        """Return a lightweight metadata snapshot for spawn/subsession guards.
+
+        Returns ``None`` if the session is not managed.  Otherwise returns
+        a plain dict with the fields needed to enforce the spawn-time
+        guards in spec §4.2 and §6.8: ``session_type`` (planner check),
+        ``cwd`` (cross-project check), and ``parent_session_id`` (cycle
+        walk).  Read under the manager lock so the snapshot is internally
+        consistent; the returned dict is a copy so callers can mutate it
+        freely.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+            if not info:
+                return None
+            return {
+                "session_id": info.session_id,
+                "name": info.name,
+                "cwd": info.cwd,
+                "session_type": info.session_type,
+                "parent_session_id": info.parent_session_id,
+                "subsession_origin_turn": info.subsession_origin_turn,
+            }
+
+    # ------------------------------------------------------------------
+    # Async internals (run on the event loop thread)
+    # ------------------------------------------------------------------
+
+    async def _cli_watchdog(self, session_id: str, info: SessionInfo) -> None:
+        """Poll the CLI subprocess during a WORKING turn and trigger heal
+        if the process dies.
+
+        The existing STREAM_HEAL_TRIGGER sites only fire when the SDK
+        propagates death through ``receive_response()``,
+        ``can_use_tool``, or a tool_result block carrying "Stream
+        closed".  In practice the CLI can die or its control channel
+        can break in ways that none of those sites observe — the user
+        then sees a hung session or a cascade of "Tool permission
+        request failed: Error: Stream closed" tool_results that get
+        fed to the model without our daemon ever knowing.  This
+        watchdog catches outright CLI process death by polling the
+        subprocess returncode directly.  On death it flags heal and
+        disconnects the transport so ``receive_response()`` raises and
+        the active turn's exception handler fires the existing
+        heal-fire path.
+
+        Lifetime is bounded to a single WORKING-state turn: the
+        watchdog auto-returns when ``info.state`` leaves WORKING (which
+        the caller's ``async for`` exit guarantees) and is also
+        cancelled in the caller's ``finally`` block.  It does NOT run
+        during the post-turn listener — that path's exit logic is
+        intentionally suppressed (see L4173 comment on past heal-loop
+        regressions).
+        """
+        POLL_INTERVAL = 1.0
+        # Long-turn heartbeat: on very large sessions a single legitimate turn
+        # can take 7-18 minutes to return its first content (measured: 465s and
+        # 1084s result times on an 8.2M-token session).  With nothing streaming
+        # the UI looks frozen and the user assumes the session is hung.  Emit a
+        # ONE-SHOT system entry once a turn has been silent (no content yet) for
+        # HEARTBEAT_AFTER seconds so they know it's alive and grinding, not
+        # stuck.  One entry per turn — the watchdog is recreated each turn, so
+        # these locals reset naturally.
+        HEARTBEAT_AFTER = 75.0
+        _t_start = time.perf_counter()
+        _heartbeat_sent = False
+        try:
+            while True:
+                await asyncio.sleep(POLL_INTERVAL)
+                if info.state != SessionState.WORKING:
+                    return
+                # Heartbeat: only if the turn has produced no visible content
+                # yet (content streaming is its own progress signal) and we
+                # haven't already announced.
+                if (not _heartbeat_sent
+                        and not getattr(info, '_turn_content_started', False)
+                        and (time.perf_counter() - _t_start) >= HEARTBEAT_AFTER):
+                    _heartbeat_sent = True
+                    _elapsed_min = int((time.perf_counter() - _t_start) // 60)
+                    _hb = LogEntry(
+                        kind="system",
+                        text=(
+                            "Still working — this is a large turn and the model "
+                            "is taking a while to respond"
+                            + (f" (~{_elapsed_min} min so far)" if _elapsed_min else "")
+                            + ". This is normal for big sessions; it will stream "
+                            "output as soon as it's ready. (Tip: /compact shrinks "
+                            "the context and speeds up future turns.)"
+                        ),
+                    )
+                    with info._lock:
+                        info.entries.append(_hb)
+                        _hb_index = len(info.entries) - 1
+                    self._emit_entry(session_id, _hb, _hb_index)
+                client = info.client
+                if client is None:
+                    return
+                try:
+                    cli_pid = self._sdk.extract_process_pid(client)
+                except Exception:
+                    return
+                if cli_pid != 0:
+                    continue
+                info._stream_heal_count = getattr(info, '_stream_heal_count', 0) + 1
+                info._stream_heal_needed = True
+                logger.warning(
+                    "STREAM_HEAL_TRIGGER site=cli_watchdog sid=%s "
+                    "state=%s heal_count=%d",
+                    session_id,
+                    getattr(info.state, 'value', info.state),
+                    info._stream_heal_count,
+                )
+                try:
+                    await self._sdk.disconnect(client)
+                except Exception:
+                    pass
+                return
+        except asyncio.CancelledError:
+            raise
+
+    def _prepare_resume_transcript(self, resolved_id: str, cwd: str) -> None:
+        """Sanitize + shrink the transcript before a ``--resume`` reads it.
+
+        PERF-CRITICAL: called ONLY from the two ``--resume``-driving paths
+        (``_drive_session`` resume branch, ``_reconnect_client``), never on the
+        per-turn send path.  Runs the store's combined change-gated pass: repair
+        (so the API doesn't 400 on an interrupted/poisoned transcript) PLUS
+        lossless stale-media eviction (externalize OLD inline screenshots so the
+        model doesn't re-attend 60-85K stale vision tokens every round-trip).
+        See the CLAUDE.md PERF guardrails.
+
+        Config is read via the cached ``get_kanban_config`` (CLAUDE.md #11) — the
+        master switch ``large_session_media_eviction`` (default ON), the recency
+        window ``large_session_media_keep_recent_turns`` (K, default 4), and
+        ``large_session_dedup_recent_tooluseresult`` (default ON).  Because this
+        only runs on resume, even the cached read is off the per-turn path.
+
+        Never raises into the resume path: any failure falls back to a plain
+        ``repair_incomplete_turn`` so a broken eviction can never block resume.
+        """
+        try:
+            from shared.config import get_kanban_config
+            cfg = get_kanban_config()
+            evict = bool(cfg.get("large_session_media_eviction", True))
+            keep = int(cfg.get("large_session_media_keep_recent_turns", 4))
+            dedup = bool(cfg.get("large_session_dedup_recent_tooluseresult", True))
+        except Exception:
+            evict, keep, dedup = True, 4, True
+        try:
+            self._store.prepare_for_resume(
+                resolved_id, cwd=cwd or "", evict_media=evict,
+                keep_recent_turns=keep, dedup_recent_tooluseresult=dedup,
+            )
+        except Exception as _prep_err:
+            logger.warning(
+                "_prepare_resume_transcript failed for %s, falling back to "
+                "repair-only: %s", resolved_id, _prep_err,
+            )
+            try:
+                self._store.repair_incomplete_turn(resolved_id, cwd=cwd or "")
+            except Exception as _rep_err:
+                logger.warning(
+                    "_prepare_resume_transcript repair fallback failed for "
+                    "%s: %s", resolved_id, _rep_err,
+                )
+
+    # In-memory entries put back after a restart: the same number the IDLE
+    # trim keeps (_emit_state), so a restored session looks like one that ran.
+    _RESTORED_ENTRY_COUNT = 200
+
+    def _restore_entries_from_transcript(self, info, resolved_id: str,
+                                         cwd: str, until_ts: float = 0.0) -> int:
+        """Seed ``info.entries`` with the session's last turns from the
+        transcript (Session Host spec, step 2).  Runs in an executor.
+
+        Only into an EMPTY log (a live session's entries are newer than the
+        file).  The entries are flagged ``restored`` (the self-heal resend
+        paths skip them) and the log is marked ``_entries_trimmed``: the
+        web's timeline then keeps reading the full transcript, and
+        ``_has_user_message`` stays honest for a retry after the restart.  The
+        subsession report counters start at the restored length so history is
+        never reported to a parent as new.  Returns the count restored.
+        Gated by ``VIBENODE_SESSION_DURABLE``.
+        """
+        try:
+            from engine import session_durable as _sd
+            if not _sd.enabled():
+                return 0
+            reader = getattr(self._store, "read_log_entries", None)
+            if reader is None:
+                return 0
+            rows = reader(resolved_id, cwd=cwd or "",
+                          max_entries=self._RESTORED_ENTRY_COUNT, until_ts=until_ts)
+            if not isinstance(rows, list):
+                return 0
+            restored = LogEntry.from_transcript(rows)
+            if not restored:
+                return 0
+            with info._lock:
+                if info.entries:
+                    return 0
+                info.entries = restored
+                info._entries_trimmed = True
+                info._last_auto_report_entry_count = len(restored)
+                info._last_marker_report_entry_count = len(restored)
+            info._restored_uuids = {r.get("uuid") for r in rows
+                                    if isinstance(r, dict) and r.get("uuid")}
+            logger.info("Restored %d timeline entries for %s from its transcript",
+                        len(restored), resolved_id)
+            return len(restored)
+        except Exception:
+            logger.exception("Restoring entries for %s failed", resolved_id)
+            return 0
+
+    @staticmethod
+    def _user_stopped(info) -> bool:
+        """True if the user explicitly stopped/slept/closed the session.
+
+        Sleep (UI) calls ``close_session`` which forces ``state = STOPPED``;
+        Stop calls the interrupt path which sets ``_interrupted``.  Either
+        one is an explicit "I want this session to stop" and MUST beat the
+        transport self-heal — otherwise a reconnect scheduled the instant the
+        stream died (e.g. the CLI killed by a machine shutdown) resurrects a
+        session the user just put to sleep, re-sending the last message and
+        flipping it back to WORKING.  That is the "Sleep won't stick" bug.
+        """
+        # A session detached from its Session Host by an engine stop() is
+        # owned by the host now: nothing in this engine may reconnect it.
+        return info is not None and (
+            info.state == SessionState.STOPPED
+            or getattr(info, '_interrupted', False)
+            or getattr(info, '_host_detached', False) is True
+        )
+
+    async def _reconnect_client(self, session_id: str, info) -> bool:
+        """Reconnect a session whose SDK stream died.
+
+        Creates a fresh ClaudeSDKClient with resume=session_id, connects it,
+        and replaces info.client.  Returns True on success.
+
+        Uses a semaphore to limit concurrent reconnects — when multiple
+        sessions die simultaneously (e.g. network blip), spawning too many
+        CLI processes at once overwhelms the system and they all timeout on
+        the "initialize" control request.
+        """
+        # An explicit user stop/sleep/close wins over any reconnect — never
+        # resurrect a session the user deliberately put down.  Defense-in-depth
+        # for every caller (self-heal, retry-now, recovery).
+        if self._user_stopped(info):
+            logger.info("Reconnect skipped for %s — user stopped/slept the "
+                        "session", session_id)
+            return False
+
+        # Lazy-init the semaphore on the event loop (can't create in __init__
+        # because the loop doesn't exist yet).
+        if self._reconnect_semaphore is None:
+            self._reconnect_semaphore = asyncio.Semaphore(2)
+
+        resolved = self._resolve_id(session_id)
+        logger.info("Reconnecting SDK client for %s (resolved: %s) — "
+                     "waiting for reconnect slot", session_id, resolved)
+
+        try:
+            async with self._reconnect_semaphore:
+                logger.info("Reconnecting SDK client for %s — got slot", session_id)
+
+                # Tear down the dead client
+                if info.client:
+                    try:
+                        await self._sdk.disconnect(info.client)
+                    except Exception:
+                        pass
+                    info.client = None
+
+                # Sanitize + shrink the .jsonl before reconnecting — if the
+                # stream died mid-response, the last entry has stop_reason=null
+                # and --resume will choke on it immediately.  The combined
+                # pre-resume pass also evicts stale media (lossless).  It delegates to
+                # repair_incomplete_turn so the same repair semantics apply
+                # before connect.
+                self._prepare_resume_transcript(resolved, info.cwd or "")
+
+                # Small stagger to avoid slamming the system when multiple
+                # sessions are queued behind the semaphore.
+                await asyncio.sleep(self._RECONNECT_STAGGER_S)
+
+                try:
+                    # Honor the global policy's SDK mode override.  Under the
+                    # "claude_auto" policy this becomes "acceptEdits" so the
+                    # SDK auto-handles edits without a callback round-trip.
+                    _mode_override = self._pm.get_sdk_permission_mode_override()
+                    options = SessionOptions(
+                        cwd=info.cwd or None,
+                        resume=resolved,
+                        permission_callback=self._make_permission_callback(session_id),
+                        pre_compact_callback=self._make_pre_compact_callback(session_id),
+                        turn_end_callback=self._make_turn_end_callback(session_id),
+                        append_system_prompt=self._smart_termination_prompt(info.session_type),
+                        # Marker-stripped: info.model can carry the CLI's
+                        # "[1m]" display suffix, which is an API 400 as --model.
+                        model=self._cli_model_id(info.model) or None,
+                        permission_mode=_mode_override or "default",
+                        include_partial_messages=True,
+                        # Re-pin the session's effort.  Without this every
+                        # self-heal reconnect silently dropped the session to
+                        # the CLI default level.
+                        extra_args=self._with_chrome(
+                            {"effort": info.effort}
+                            if getattr(info, "effort", "") in self.VALID_EFFORTS
+                            else {}, info.session_type),
+                        hosted=self._host_wanted(info.session_type),
+                        host_sid=resolved,
+                    )
+                    client = await self._sdk.create_session(options)
+                    await self._sdk.connect(client)
+                    info.client = client
+                    self._mark_hosted(info, client)
+                    # Update tracked PID so orphan sweep doesn't kill the new process
+                    info._cli_pid = self._sdk.extract_process_pid(info.client)
+                    logger.info("Reconnected SDK client for %s (new PID %d)",
+                                session_id, info._cli_pid)
+                    return True
+                except Exception as e:
+                    logger.exception("Failed to reconnect SDK client for %s: %s", session_id, e)
+                    return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("_reconnect_client semaphore error for %s: %s", session_id, e)
+            return False
+
+    async def _drive_session(
+        self, session_id: str, prompt: str, cwd: str, resume: bool,
+        model: Optional[str] = None, system_prompt: Optional[str] = None,
+        max_turns: Optional[int] = None, allowed_tools: Optional[list] = None,
+        permission_mode: Optional[str] = None,
+        extra_args: Optional[dict] = None,
+        attach: Optional[dict] = None,
+    ) -> None:
+        """Main driver coroutine for one SDK session.
+
+        ``attach``: the session's CLI survived an engine restart inside its
+        Session Host and ``info.client`` is already connected to it
+        (``_attach_hosted``); this is the host's ``hello_ok``.  Then nothing
+        is launched or sent: the timeline is reloaded from the transcript up
+        to the moment the previous engine left, the host's replay is let
+        through, and the turn in flight (if any) is read to its RESULT."""
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return
+
+        _t0 = time.perf_counter()
+        _profile_log = (lambda label: logger.info(
+            "PROFILE _drive_session [%s] %s: %.3fs elapsed",
+            session_id[:12], label, time.perf_counter() - _t0)
+        ) if self._PROFILE_PIPELINE else lambda _: None
+
+        got_result = False
+        result_handled = False
+        try:
+            # ── Self-heal on resume: sanitize the transcript BEFORE --resume
+            # replays it ────────────────────────────────────────────────────
+            # repair_incomplete_turn() strips assistant entries whose only
+            # content is an empty-but-signed ``thinking`` block (and completes
+            # interrupted trailing turns).  Replaying such a block makes the
+            # Anthropic API reject the request with "thinking ... blocks ...
+            # cannot be modified".  The CLI surfaces that 400 as ordinary
+            # assistant TEXT followed by a clean RESULT — NOT a transport
+            # exception — so the reactive finally-block self-heal can be
+            # stranded by the post-turn drain (which consumes auto-resume /
+            # background-task content and reassigns info.task) and never
+            # reconnect.  Failure seen: a session looped on
+            # ``asst_thinking_block_400`` with 2 heal TRIGGERs but 0 reconnects,
+            # because every reconnect lives behind the supersede guard.
+            #
+            # _reconnect_client already repairs before its --resume; it was the
+            # ONLY place that did.  Repairing here too makes "safe for --resume"
+            # a true invariant across BOTH paths a fresh CLI re-reads the JSONL,
+            # so a poisoned session self-heals the next time it is resumed
+            # (user-driven resume, or crash-recovery re-drive) instead of
+            # staying wedged forever.  Idempotent and safe: repair never writes
+            # invalid JSONL, and the API expressly permits omitting prior
+            # thinking blocks.  Only meaningful on resume (a fresh session has
+            # no transcript to poison), and offloaded to a worker thread so a
+            # large transcript can't block the shared daemon event loop.
+            if resume:
+                try:
+                    _repair_id = self._resolve_id(session_id)
+                    # Combined change-gated pass: repair (delegates to
+                    # repair_incomplete_turn) + lossless stale-media eviction.
+                    # Offloaded to a worker thread so a large transcript can't
+                    # block the shared daemon event loop, and overlapped with the
+                    # subsequent client.connect() — same as the original repair.
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        self._prepare_resume_transcript,
+                        _repair_id,
+                        cwd or "",
+                    )
+                except Exception as _rep_err:
+                    logger.warning(
+                        "_drive_session: pre-resume jsonl repair failed for "
+                        "%s: %s", session_id, _rep_err,
+                    )
+
+            # Honor the global policy's SDK mode override (e.g. "claude_auto"
+            # → "acceptEdits") only when the caller hasn't pinned a specific
+            # mode for this session.  Explicit per-session modes — like the
+            # titling task's "plan" — always win.
+            _effective_mode = (
+                permission_mode
+                or self._pm.get_sdk_permission_mode_override()
+                or "default"
+            )
+            options = SessionOptions(
+                cwd=cwd or None,
+                resume=session_id if resume else None,
+                permission_callback=self._make_permission_callback(session_id),
+                pre_compact_callback=self._make_pre_compact_callback(session_id),
+                turn_end_callback=self._make_turn_end_callback(session_id),
+                model=model or None,
+                system_prompt=system_prompt or None,
+                append_system_prompt=self._smart_termination_prompt(info.session_type),
+                max_turns=max_turns or None,
+                allowed_tools=allowed_tools or [],
+                permission_mode=_effective_mode,
+                include_partial_messages=True,
+                extra_args=self._with_chrome(extra_args, info.session_type),
+                hosted=self._host_wanted(info.session_type),
+                host_sid=session_id,
+            )
+            _profile_log("options_built")
+            if attach is None:
+                client = await self._sdk.create_session(options)
+                info.client = client
+            else:
+                client = info.client
+
+            # Connect with no prompt. The SDK auto-sets permission_prompt_tool_name="stdio"
+            # when can_use_tool is set. Prompt=None becomes _empty_stream() which is an
+            # AsyncIterator, so the streaming mode check passes.
+            # PERF-CRITICAL: Mtime scan overlapped with client.connect() — moving after adds 70-90ms. See CLAUDE.md #5.
+            #
+            # LESSON LEARNED: client.connect() takes 700-1000ms
+            # (Claude CLI subprocess spawn).  _record_pre_turn_mtimes takes
+            # 70-90ms (git ls-files + stat).  They're independent — mtime scan
+            # only reads info.cwd, doesn't need the SDK connection.  Starting
+            # the scan before await connect() hides it completely behind the
+            # 900ms startup.  Measured result: pre_turn_mtimes_done equals
+            # client_connected timestamp (0ms additional wait).
+            loop = asyncio.get_event_loop()
+            mtime_task = loop.run_in_executor(None, self._record_pre_turn_mtimes, info)
+            # Step 2 of the Session Host spec: a resumed session gets its
+            # recent timeline back in memory from the transcript (tail read,
+            # overlapped with connect like the mtime scan above).
+            _entries_task = None
+            if resume:
+                _entries_task = loop.run_in_executor(
+                    None, self._restore_entries_from_transcript, info,
+                    self._resolve_id(session_id), cwd or "", 0.0)
+
+            if attach is None:
+                await self._sdk.connect(client)
+                _profile_log("client_connected")
+            else:
+                # Reattached: the timeline up to the moment the previous
+                # engine left comes from the transcript; the host's replay
+                # carries the rest (lines already in the transcript are
+                # skipped by uuid).  0 = the previous engine was replaced
+                # while attached: load all and let the uuid check dedupe.
+                _entries_task = loop.run_in_executor(
+                    None, self._restore_entries_from_transcript, info,
+                    self._resolve_id(session_id), cwd or "",
+                    float(attach.get("detached_at") or 0.0))
+            if _entries_task is not None:
+                try:
+                    await _entries_task
+                except Exception as _ent_err:
+                    logger.warning("Restoring entries for %s failed: %s",
+                                   session_id, _ent_err)
+            if attach is not None:
+                self._sdk.host_release_replay(
+                    client, getattr(info, "_restored_uuids", None) or ())
+
+            # Capture the CLI subprocess PID for orphan cleanup.
+            # If _drive_session exits (crash, cancel, normal end) without
+            # going through _close_session, the finally block uses this to
+            # kill the process tree so child node.exe workers don't linger.
+            # (A hosted CLI is its host's child; the host cleans it up.)
+            self._mark_hosted(info, client)
+            info._cli_pid = self._sdk.extract_process_pid(info.client)
+
+            info.state = SessionState.WORKING
+            self._emit_state(info)
+
+            # Reset per-turn state and record mtimes for change detection.
+            # Mtimes are only used as fallback when no direct Edit/Write is
+            # seen in the stream (e.g. Agent sub-agent did the editing).
+            #
+            # NOTE: We do NOT write a pre-turn snapshot here.  On the first
+            # turn the SDK hasn't sent a ResultMessage yet, so the session_id
+            # hasn't been remapped to the CLI's real UUID.  Writing a snapshot
+            # now would target the wrong JSONL file.  Pre-populate and pre-turn
+            # snapshots are deferred to _send_query (follow-up turns), where
+            # the remap has already occurred.
+            info._turn_had_direct_edit = False
+            # Fresh session start — clear any wake-up tracking from a
+            # prior incarnation of this session_id (e.g. crash recovery
+            # restoring a SessionInfo).  See _send_query's matching
+            # reset for full reasoning.  A reattached CLI is NOT fresh: its
+            # wake-up timer is still real (restored by SessionDurable).
+            if attach is None:
+                info._wakeup_pending = False
+                info._wakeup_deadline = 0.0
+                info._wakeup_is_scheduled = False
+            info._force_queue_dispatch = False
+            info._wakeup_queue_blocked_since = 0.0
+            info._wakeup_max_delay = 0.0
+            info._post_compact_init_seen = False
+            await mtime_task
+            _profile_log("pre_turn_mtimes_done")
+
+            # A wake with a message supersedes a countdown restored from
+            # before a restart: the user's new turn is the continuation.
+            if prompt and getattr(info, "_durable_restore", None):
+                info._durable_restore = None
+                self._clear_api_retry(info, reset_count=True)
+
+            # Add user's message to the log and send
+            if prompt:
+                from shared.transcripts import automated_source as _auto_src
+                entry = LogEntry(kind="user", text=_cap_user_display_text(prompt),
+                                 auto=_auto_src(prompt))
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+                await self._sdk.send_query(client, prompt)
+                _profile_log("query_sent")
+
+            # Process messages — the SDK backend normalizes all messages to
+            # VibeNodeMessage before yielding them.  None/unknown types are
+            # filtered out by the backend's receive_response().
+            #
+            # IMPORTANT: receive_response() terminates after the equivalent
+            # of a ResultMessage (turn complete).  See comment in
+            # ClaudeAgentSDK.receive_response() for details.
+            info._stream_evt_logged = False
+            _first_msg_logged = False
+            # Reattached mid-turn (or the turn ended while no engine was
+            # attached): read the replay and the live stream to the RESULT.
+            _attach_turn = attach is not None and bool(
+                attach.get("turn_in_flight") or attach.get("replay_has_result"))
+            if _attach_turn and getattr(info, "_durable_restore", None):
+                # The turn that ran on is the continuation; a countdown saved
+                # before it started is stale.
+                info._durable_restore = None
+                self._clear_api_retry(info, reset_count=False)
+            if prompt or _attach_turn:
+                _watchdog = asyncio.create_task(
+                    self._cli_watchdog(session_id, info)
+                )
+                try:
+                    async for message in self._sdk.receive_response(client):
+                        # If a newer task has replaced us, stop processing —
+                        # our stream is stale and we must not touch state.
+                        if info.task is not asyncio.current_task():
+                            break
+                        if not _first_msg_logged:
+                            _profile_log("first_stream_message (%s)" % message.kind.value)
+                            _first_msg_logged = True
+                        if message.kind == MessageKind.RESULT:
+                            got_result = True
+                            _profile_log("result_message")
+                        try:
+                            await self._process_message(session_id, message)
+                            if message.kind == MessageKind.RESULT:
+                                result_handled = True
+                        except Exception as pm_err:
+                            # Don't let one bad message kill the entire stream.
+                            logger.exception(
+                                "_process_message error for %s (msg kind %s): %s",
+                                session_id, message.kind.value, pm_err
+                            )
+                finally:
+                    _watchdog.cancel()
+                    try:
+                        await _watchdog
+                    except (asyncio.CancelledError, Exception):
+                        pass
+            else:
+                # No prompt (empty session or bare resume) — nothing to receive.
+                # Go straight to IDLE so send_message() can dispatch follow-ups.
+                #
+                # IMPORTANT: drain the CLI's startup init message
+                # before declaring IDLE.  When the CLI is spawned (or resumed
+                # via --resume), it emits an ``init`` system message that lands
+                # in the SDK message stream.  If we skip this, the subsequent
+                # _post_turn_compact_drain peek reads the init in its 100 ms
+                # window, misinterprets it as an auto-resume signal
+                # (_enter_auto_resume → WORKING), waits for a RESULT that never
+                # comes, and leaves the session stuck in WORKING indefinitely.
+                # This manifested as "session appears working after model switch"
+                # for dormant sessions resumed via set_session_model.
+                #
+                # We consume up to one init (the only expected startup message)
+                # within a 3-second window.  A timeout means the CLI didn't emit
+                # one (non-fatal) — we continue to IDLE normally.
+                got_result = True
+                result_handled = True
+                try:
+                    async def _drain_startup_init():
+                        async for msg in self._sdk.receive_response(info.client):
+                            if info.task is not asyncio.current_task():
+                                return
+                            # Process the message so init records the model id
+                            await self._process_message(session_id, msg)
+                            if msg.kind == MessageKind.SYSTEM \
+                                    and (msg.subtype or '') == 'init':
+                                return  # startup init consumed — done
+                            if msg.kind == MessageKind.RESULT:
+                                return  # unexpected early result — stop
+                    # A reattached CLI started long ago: no startup init comes.
+                    if attach is None:
+                        await asyncio.wait_for(_drain_startup_init(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    pass   # no startup init — safe to continue
+                except asyncio.CancelledError:
+                    raise  # propagate task cancellation
+                except Exception as _drain_err:
+                    logger.warning(
+                        "_drive_session startup-init drain error for %s: %s",
+                        session_id, _drain_err,
+                    )
+                info.state = SessionState.IDLE
+                self._emit_state(info)
+                # SessionDurable: re-arm a countdown from before the restart.
+                if getattr(info, "_durable_restore", None):
+                    self._durable_restore_timers(session_id, info)
+
+            # Post-turn compact drain — also installs the extended listener
+            # that consumes auto-resume / late ``task_notification`` content.
+            # We MUST call this on every successful turn (including bare
+            # resume) or future buffered messages will land unread and the
+            # next user query will read them as stale.  The drain itself
+            # decides whether there's anything to consume right now.
+            if result_handled and info.task is asyncio.current_task():
+                # API-error auto-retry takes precedence over the post-turn
+                # listener.  CRITICAL (found via live-CLI fault testing): after
+                # a transient error RESULT there is NO auto-resume content
+                # coming, so _post_turn_compact_drain's extended listener blocks
+                # forever waiting for it — which means this coroutine never
+                # returns and the drive-loop *finally* (where arming used to
+                # live) never runs.  The session then dead-ends at IDLE: exactly
+                # the "ended with error then stopped forever" bug.  So when a
+                # retry was flagged this turn, arm it directly here and SKIP the
+                # drain entirely.  (The transport self-heal still owns its own
+                # path; don't arm over it.)
+                if getattr(info, '_api_retry_needed', False) \
+                        and not getattr(info, '_stream_heal_needed', False):
+                    info.state = SessionState.IDLE
+                    self._arm_api_retry(info.session_id, info)
+                else:
+                    await self._post_turn_compact_drain(session_id, info)
+                    info._awaiting_compact_drain = False
+                    if info.task is asyncio.current_task() \
+                            and info.state == SessionState.IDLE:
+                        self._emit_state(info)
+
+            # Safety net: if the stream ended without a ResultMessage,
+            # force IDLE so the session isn't stuck.  Skip if we already
+            # got a ResultMessage (drain above handled IDLE + queue dispatch).
+            # Also skip if superseded — the new task owns state.
+            if not got_result and info.state == SessionState.WORKING \
+                    and info.task is asyncio.current_task():
+                logger.warning("_drive_session for %s: stream ended without "
+                               "ResultMessage, forcing IDLE", session_id)
+                info._awaiting_compact_drain = False
+                info.state = SessionState.IDLE
+                self._emit_state(info)
+
+        except asyncio.CancelledError:
+            # Defense-in-depth for the stop→follow-up race (see "Drain
+            # stale messages" comment in _send_query).  Also covers the
+            # post-turn-listener supersede case (send_message cancelled
+            # us before the new task claimed info.task).
+            _superseded = (
+                info.task is not asyncio.current_task()
+                or getattr(info, '_listener_superseded', False)
+            )
+            if _superseded or getattr(info, '_interrupted', False):
+                if not _superseded:
+                    logger.info("Session %s interrupted (task cancelled)", session_id)
+            else:
+                # Close/shutdown — go to STOPPED
+                logger.info("Session %s cancelled", session_id)
+                info.state = SessionState.STOPPED
+                self._emit_state(info)
+        except Exception as e:
+            err_str = str(e)
+            logger.exception("Session %s stream error: %s", session_id, e)
+
+            # If _stream_heal_needed was already set (from "Stream closed" in
+            # a tool result), skip the reconnect here — the finally block will
+            # do reconnect + retry.  This avoids a wasteful double-reconnect.
+            if getattr(info, '_stream_heal_needed', False):
+                logger.info("_drive_session %s: stream_heal already flagged, "
+                            "deferring to finally block", session_id)
+                entry = LogEntry(kind="system", text="Stream lost — will reconnect and retry...", is_error=True)
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+            else:
+                # Flag for self-healing if this looks like a transport error
+                # (not an API/logic error).  This covers cases where the
+                # stream dies with an exception BEFORE a "Stream closed"
+                # tool result was processed.
+                _etype = type(e).__name__
+                _is_transport = (
+                    "Stream closed" in err_str
+                    or "exit code" in err_str
+                    or "closed" in err_str.lower()
+                    or "CLIConnection" in _etype
+                    or "Process" in _etype
+                    or "ClosedResource" in _etype
+                )
+                if _is_transport:
+                    if not hasattr(info, '_stream_heal_count'):
+                        info._stream_heal_count = 0
+                    info._stream_heal_count += 1
+                    info._stream_heal_needed = True
+                    logger.info(
+                        "STREAM_HEAL_TRIGGER site=drive_session_except sid=%s "
+                        "etype=%s err=%r state=%s in_post_turn=%s "
+                        "listener_superseded=%s heal_count=%d",
+                        session_id, _etype, err_str[:200],
+                        getattr(info.state, 'value', info.state),
+                        getattr(info, '_in_post_turn', False),
+                        getattr(info, '_listener_superseded', False),
+                        info._stream_heal_count,
+                    )
+                    entry = LogEntry(kind="system", text="Stream lost — will reconnect and retry...", is_error=True)
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
+                else:
+                    # Non-transport error (e.g. an API 5xx / overload raised
+                    # mid-stream): reconnect the client, then auto-retry on the
+                    # exponential backoff if the error is transient.
+                    entry = LogEntry(kind="system", text=f"Stream lost — reconnecting...", is_error=True)
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
+
+                    if await self._reconnect_client(session_id, info):
+                        info.state = SessionState.IDLE
+                        info.error = ""
+                        # Detection channel (b): flag a backoff auto-retry for a
+                        # transient API error.  The finally block arms it.
+                        _retry_flagged = self._flag_api_retry_if_transient(
+                            info, err_str)
+                        if _retry_flagged:
+                            _txt = "API error (%s) — auto-retry scheduled…" % info.retry_reason
+                        else:
+                            _txt = "Reconnected successfully"
+                        entry = LogEntry(kind="system", text=_txt)
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        # ORDERING (hardening): do NOT emit state while a retry is
+                        # flagged but not yet ARMED.  retry_at is still 0 here
+                        # (only _arm_api_retry sets it), so _emit_state →
+                        # _try_dispatch_queue sees an OPEN queue gate on an IDLE
+                        # session and can dispatch a queued follow-up AHEAD of the
+                        # retry.  That flips the session to WORKING, and the
+                        # finally's _arm_api_retry then drops the retry — the
+                        # failed turn is abandoned and the queue jumps the line.
+                        # _arm_api_retry emits the countdown state itself a moment
+                        # later.  Channel (c) (the heal escalation below) already
+                        # skips its emit for exactly this reason.
+                        if not _retry_flagged:
+                            self._emit_state(info)
+                    else:
+                        info.error = err_str
+                        info.state = SessionState.STOPPED
+                        entry = LogEntry(kind="system", text=f"Reconnect failed: {e}", is_error=True)
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        self._emit_state(info)
+        finally:
+            # Defense-in-depth for the stop→follow-up race (see "Drain
+            # stale messages" comment in _send_query).  Superseded or
+            # interrupted tasks must not touch state.
+            _superseded = info and (
+                info.task is not asyncio.current_task()
+                or getattr(info, '_listener_superseded', False)
+            )
+            if _superseded or (info and getattr(info, '_interrupted', False)):
+                return
+
+            # Catch-all: force IDLE if stuck in WORKING. Skip if
+            # ResultMessage was processed -- _try_dispatch_queue may
+            # have legitimately set WORKING for the next queued msg.
+            if info and info.state == SessionState.WORKING and not result_handled:
+                logger.error("_drive_session finally: %s still WORKING after all "
+                             "handlers — forcing IDLE as catch-all", session_id)
+                info.state = SessionState.IDLE
+                self._emit_state(info)
+
+            # ── Self-healing: reconnect + retry if "Stream closed" errors
+            # were detected during the turn (either from tool results or
+            # from the except handler flagging a transport exception).
+            try:
+                if info and getattr(info, '_stream_heal_needed', False):
+                    info._stream_heal_needed = False
+                    heal_count = getattr(info, '_stream_heal_count', 0)
+                    if self._user_stopped(info):
+                        # User slept/stopped the session after the stream died —
+                        # honour it, don't self-heal it back to life.
+                        logger.info(
+                            "Self-heal (drive) skipped for %s — user stopped/"
+                            "slept the session", session_id,
+                        )
+                    elif heal_count <= 3:
+                        # Exponential backoff: 2s, 4s, 8s between retries
+                        backoff = 2 ** heal_count
+                        logger.info(
+                            "Self-healing (drive): reconnecting %s after %d stream errors "
+                            "(backoff %ds)",
+                            session_id, heal_count, backoff,
+                        )
+                        entry = LogEntry(kind="system", text="Reconnecting session...")
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        await asyncio.sleep(backoff)
+
+                        if self._user_stopped(info):
+                            # Slept DURING the backoff wait — abort the reconnect.
+                            logger.info(
+                                "Self-heal (drive) aborted post-backoff for %s — "
+                                "user stopped/slept the session", session_id,
+                            )
+                        elif await self._reconnect_client(session_id, info):
+                            # Do NOT reset _stream_heal_count here.  Let it
+                            # accumulate across retries so the heal_count<=3
+                            # limit actually stops infinite loops.  The counter
+                            # is reset in send_message() when the user sends a
+                            # genuinely new message (not a self-healing retry).
+                            last_user_text = None
+                            with info._lock:
+                                for e in reversed(info.entries):
+                                    if e.kind == "user" and not getattr(e, "restored", False):
+                                        last_user_text = e.text
+                                        break
+                            if last_user_text:
+                                logger.info(
+                                    "STREAM_HEAL_FIRE site=drive_session_finally sid=%s "
+                                    "heal_count=%d text_preview=%r",
+                                    session_id, heal_count, last_user_text[:120],
+                                )
+                                entry = LogEntry(
+                                    kind="system",
+                                    text="Reconnected — retrying last message automatically",
+                                )
+                                with info._lock:
+                                    info.entries.append(entry)
+                                    entry_index = len(info.entries) - 1
+                                self._emit_entry(session_id, entry, entry_index)
+                                info.state = SessionState.IDLE
+                                self._emit_state(info)
+                                self.send_message(session_id, last_user_text, _self_heal=True)
+                            else:
+                                entry = LogEntry(kind="system", text="Reconnected successfully")
+                                with info._lock:
+                                    info.entries.append(entry)
+                                    entry_index = len(info.entries) - 1
+                                self._emit_entry(session_id, entry, entry_index)
+                                info.state = SessionState.IDLE
+                                self._emit_state(info)
+                        else:
+                            info._stream_heal_count = 0
+                            # Reconnect itself failed — likely connectivity is
+                            # down.  Escalate to the long backoff (it retries the
+                            # reconnect on the backoff schedule) rather than
+                            # dead-ending with "please resend".
+                            if self._escalate_heal_to_backoff(info, "Connection lost"):
+                                info.state = SessionState.IDLE
+                            else:
+                                entry = LogEntry(
+                                    kind="system",
+                                    text="Reconnect failed — please resend your message",
+                                    is_error=True,
+                                )
+                                with info._lock:
+                                    info.entries.append(entry)
+                                    entry_index = len(info.entries) - 1
+                                self._emit_entry(session_id, entry, entry_index)
+                                info.state = SessionState.IDLE
+                                self._emit_state(info)
+                    else:
+                        info._stream_heal_count = 0
+                        # Persistent transport failure (the quick 3-try heal
+                        # couldn't recover) \u2014 most likely a connectivity outage.
+                        # Escalate to the long exponential backoff so an
+                        # overnight task rides it out instead of dead-ending.
+                        if self._escalate_heal_to_backoff(info, "Connection lost"):
+                            info.state = SessionState.IDLE
+                            # the API-retry arm block (below) emits the countdown
+                        else:
+                            entry = LogEntry(
+                                kind="system",
+                                text="Too many stream errors \u2014 please resend your message",
+                                is_error=True,
+                            )
+                            with info._lock:
+                                info.entries.append(entry)
+                                entry_index = len(info.entries) - 1
+                            self._emit_entry(session_id, entry, entry_index)
+                            info.state = SessionState.IDLE
+                            self._emit_state(info)
+            except Exception as heal_err:
+                logger.exception("Self-healing failed for %s: %s", session_id, heal_err)
+                if info:
+                    info._stream_heal_count = 0
+                    info.state = SessionState.IDLE
+                    self._emit_state(info)
+
+            # ── API-error auto-retry: a transient error RESULT this turn asked
+            # for an automatic retry on exponential backoff.  Arm the countdown
+            # timer here (state has settled).  Skip if the transport self-heal
+            # already owns a retry of the same message — avoids a double-send.
+            try:
+                if info and getattr(info, '_api_retry_needed', False) \
+                        and not getattr(info, '_stream_heal_needed', False):
+                    self._arm_api_retry(info.session_id, info)
+            except Exception as _retry_err:
+                logger.exception("Arming API auto-retry failed for %s: %s",
+                                 session_id, _retry_err)
+                if info:
+                    info._api_retry_needed = False
+
+            # Post-turn snapshot: captures file state AFTER Claude's edits.
+            # By now the SDK remap has occurred (ResultMessage was processed
+            # in the message loop), so _resolve_id will find the correct
+            # session JSONL.
+            # Post-turn snapshot
+            try:
+                resolved = self._resolve_id(session_id)
+                with self._lock:
+                    finfo = self._sessions.get(resolved)
+                loop = asyncio.get_event_loop()
+                if finfo:
+                    await loop.run_in_executor(
+                        None, self._prepopulate_tracked_files, finfo)
+                await loop.run_in_executor(
+                    None, self._write_file_snapshot, session_id, True)
+            except Exception as snap_err:
+                logger.warning("Snapshot in finally for %s failed: %s", session_id, snap_err)
+
+            # Orphan cleanup: if the CLI process died (crash, OOM, etc.),
+            # kill its child process tree.  On Windows, child node.exe
+            # workers survive when the parent dies — they become orphans
+            # eating CPU/RAM until the machine is rebooted.  A hosted CLI is
+            # not our child: its host kills its own tree.
+            if info and info._cli_pid and not self._is_hosted(info):
+                try:
+                    # Check if the CLI process is actually dead.  Windows-safe:
+                    # a bare os.kill(pid, 0) would TERMINATE a still-alive CLI
+                    # on Windows instead of probing it (see _process_alive).
+                    proc_alive = self._process_alive(info._cli_pid)
+                    if not proc_alive:
+                        logger.info("CLI process %d for %s is dead — "
+                                    "cleaning up orphaned child processes",
+                                    info._cli_pid, session_id)
+                        self._kill_process_tree(info._cli_pid)
+                        info._cli_pid = 0
+                except Exception as cleanup_err:
+                    logger.debug("Orphan cleanup for %s: %s", session_id, cleanup_err)
+
+    async def _send_query(self, session_id: str, text: str) -> None:
+        """Send a follow-up query to an already-connected session."""
+        # Yield once so any pending CancelledError from the old task is
+        # delivered BEFORE we clear _interrupted.  Without this, the old
+        # task's handler may see _interrupted=False and clobber state.
+        await asyncio.sleep(0)
+        # Now safe to clear the flag — the old task has processed its cancel.
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if info:
+            info._interrupted = False
+            # Clear the supersede flag set by send_message — the previous
+            # listener has now bailed (the asyncio.sleep(0) above gave it
+            # a tick to deliver its cancellation).  Leaving the flag set
+            # would make the NEXT listener bail spuriously the first time
+            # something cancels it.
+            info._listener_superseded = False
+            # TTFT #1: anchor T1 = daemon entered _send_query. This is a
+            # pure clock read + dict allocation on `info`; it does NOT touch
+            # tracked_files, _pre_turn_mtimes, _turn_had_direct_edit, or
+            # info.client, so CLAUDE.md #2/#3/#4/#5 are all preserved.
+            # No-op when VIBENODE_TIMING_TTFT is unset.
+            _ttft_start_turn(info)
+
+        _t0 = time.perf_counter()
+        _profile_log = (lambda label: logger.info(
+            "PROFILE _send_query [%s] %s: %.3fs elapsed",
+            session_id[:12], label, time.perf_counter() - _t0)
+        ) if self._PROFILE_PIPELINE else lambda _: None
+        if not info:
+            return
+        if not info.client:
+            # Client is gone — attempt reconnection before giving up.
+            # This covers zombie sessions left IDLE with no client after
+            # a failed reconnect or a daemon registry restore.
+            logger.warning("_send_query: %s has no client — attempting reconnect", session_id)
+            if await self._reconnect_client(session_id, info):
+                logger.info("_send_query: reconnected %s successfully", session_id)
+            else:
+                # Reconnect failed — force back to IDLE so the session isn't stuck
+                if info.state == SessionState.WORKING:
+                    logger.error("_send_query: %s reconnect failed — forcing IDLE", session_id)
+                    info.state = SessionState.IDLE
+                    info.error = "Session disconnected — reconnect failed"
+                    entry = LogEntry(kind="system", text="Could not reconnect SDK client — please try again", is_error=True)
+                    with info._lock:
+                        info.entries.append(entry)
+                    self._emit_state(info)
+                return
+
+        # Pre-flight liveness check: the client object exists but the
+        # underlying CLI process may have exited between turns.  Reconnect
+        # before sending so the user never sees "Stream lost".
+        #
+        # Symptom this guards against: a session shows 'working' for 10+
+        # minutes with no output.
+        #
+        # Root cause: on very large sessions (this path was observed firing 7
+        # times on a single 8.2M-token session) the CLI subprocess repeatedly
+        # OOMs/crashes mid-turn.  This reconnect used to be SILENT — it emitted
+        # nothing to the UI and had NO retry cap.  Meanwhile the *loud* heal
+        # path (STREAM_HEAL_TRIGGER, with its 3-strike breaker and user-facing
+        # "Reconnecting…" entries) never fired, because the orphan sweep had
+        # already reaped the dead CLI so the turn died via this preflight
+        # instead of via a transport exception.  Net effect: the user stares at
+        # a "working" spinner for 10+ minutes while the daemon silently
+        # crash-loops — reconnect, resend the giant query, crash, repeat.
+        #
+        # Fix: (1) make it VISIBLE — post a system entry so the live panel
+        # shows "CLI exited — reconnecting" instead of a frozen spinner; and
+        # (2) make it BOUNDED — reuse the shared _stream_heal_count breaker
+        # (reset on a genuine new user message in send_message()) so repeated
+        # crashes on the same turn stop after CAP attempts and surface a clear
+        # "context is too large" message instead of looping forever.
+        if info.client:
+            cli_pid = self._sdk.extract_process_pid(info.client)
+            if cli_pid == 0:
+                # Shared crash breaker.  send_message() resets this to 0 for a
+                # genuine new user message, so a fresh user turn always gets a
+                # clean retry budget; self-heal resends and same-turn crashes
+                # accumulate toward the cap.
+                _CLI_CRASH_CAP = 3
+                info._stream_heal_count = getattr(info, '_stream_heal_count', 0) + 1
+                _crash_n = info._stream_heal_count
+                logger.warning(
+                    "_send_query: %s CLI process dead before send "
+                    "(crash %d/%d) — reconnecting",
+                    session_id, _crash_n, _CLI_CRASH_CAP,
+                )
+                if _crash_n > _CLI_CRASH_CAP:
+                    # Circuit breaker: stop the silent crash-loop and tell the
+                    # user WHY, with an actionable next step, instead of
+                    # reconnecting into another multi-minute crash.
+                    logger.error(
+                        "_send_query: %s exceeded CLI crash cap (%d) — stopping "
+                        "auto-recovery; context likely too large",
+                        session_id, _CLI_CRASH_CAP,
+                    )
+                    info._stream_heal_count = 0
+                    info.state = SessionState.IDLE
+                    info.error = "CLI repeatedly crashed before sending"
+                    entry = LogEntry(
+                        kind="system",
+                        text=(
+                            f"The CLI process crashed {_CLI_CRASH_CAP} times in a "
+                            "row before your message could be sent. This almost "
+                            "always means the conversation has grown too large "
+                            "for the model to process (this session is carrying a "
+                            "very large context). Stopping automatic retries so "
+                            "you're not left waiting. Run /compact to shrink the "
+                            "context, then resend your message."
+                        ),
+                        is_error=True,
+                    )
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
+                    self._emit_state(info)
+                    return
+                # Make the reconnect VISIBLE so the user isn't staring at a
+                # frozen "working" spinner with no explanation.
+                entry = LogEntry(
+                    kind="system",
+                    text=(
+                        "CLI process exited unexpectedly — reconnecting and "
+                        f"resuming your turn (attempt {_crash_n}/{_CLI_CRASH_CAP})…"
+                    ),
+                )
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+                if await self._reconnect_client(session_id, info):
+                    logger.info("_send_query: reconnect succeeded for %s "
+                                "(crash %d)", session_id, _crash_n)
+                else:
+                    if info.state == SessionState.WORKING:
+                        info.state = SessionState.IDLE
+                        info.error = "Session disconnected — reconnect failed"
+                        entry = LogEntry(kind="system",
+                                         text="Could not reconnect — please try again",
+                                         is_error=True)
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        self._emit_state(info)
+                    return
+
+        # Pre-populate tracked_files on follow-up turns (covers daemon
+        # restart scenarios where tracked_files was lost).
+        # Runs in a thread so large JSONL parses don't block the event loop.
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._prepopulate_tracked_files, info)
+        _profile_log("prepopulate_tracked_files")
+
+        # Pre-turn snapshot (isSnapshotUpdate=false, linked to user UUID)
+        # Safe here because the SDK remap has already happened by the time
+        # _send_query is called (remap occurs on first turn's ResultMessage).
+        # Runs in a thread — reads JSONL tail + file contents + writes backups.
+        # ── Parallel pre-turn file operations ──
+        #
+        # PERF-CRITICAL: _turn_had_direct_edit reset BEFORE gather — moving it creates a race. See CLAUDE.md #3.
+        # PERF-CRITICAL: asyncio.gather runs snapshot+mtimes in parallel — sequential adds 60-70ms. See CLAUDE.md #2.
+        #
+        # LESSON LEARNED (performance overhaul):
+        #
+        # These two operations were originally sequential await calls, adding
+        # 66-139ms to every follow-up message before the query reached Claude.
+        # Profiling proved they access disjoint SessionInfo fields:
+        #   _write_file_snapshot: tracked_files, _turn_had_direct_edit, _last_hashes, file_versions
+        #   _record_pre_turn_mtimes: _pre_turn_mtimes, _post_turn_mtimes, _mtime_turn_count, _cached_git_files
+        # Running them via asyncio.gather() cut the measured pre-work from
+        # 66-139ms to 10ms (with carry-forward hitting on most turns).
+        #
+        # The _turn_had_direct_edit reset MUST happen before BOTH functions
+        # start.  It was originally between the two sequential awaits.  When
+        # we parallelized, we moved it above the gather.  If it were moved
+        # back between or after, _write_file_snapshot could read the stale
+        # True value from the previous turn and skip the snapshot.
+        info._turn_had_direct_edit = False
+        info._turn_content_started = False
+        info._awaiting_compact_drain = False
+        # Reset wake-up tracking at the start of a user-driven turn.  The
+        # previous turn's pending wake-up is now moot — this fresh user
+        # query supersedes it (the post-turn listener was just cancelled
+        # by send_message, and any leftover wake-up content will be
+        # drained as stale below).  Tool uses in this turn will re-flag
+        # _wakeup_pending if they schedule a new wake-up.
+        info._wakeup_pending = False
+        # Consume any starvation-watchdog override and disarm its timer:
+        # THIS turn is the dispatch the watchdog asked for (or a fresh user
+        # turn that supersedes the wake-up anyway).  The watchdog re-arms
+        # and re-sets the flag on a later sweep if a backlog still remains
+        # behind a newly-scheduled wake-up.
+        info._force_queue_dispatch = False
+        info._wakeup_queue_blocked_since = 0.0
+        info._wakeup_deadline = 0.0
+        info._wakeup_max_delay = 0.0
+        info._wakeup_is_scheduled = False
+        # Same reasoning for the post-compact flag: a fresh user query
+        # supersedes any in-progress compaction transition.
+        info._post_compact_init_seen = False
+        await asyncio.gather(
+            loop.run_in_executor(None, self._write_file_snapshot, session_id, False),
+            loop.run_in_executor(None, self._record_pre_turn_mtimes, info),
+        )
+        _profile_log("write_snapshot+record_mtimes")
+        # TTFT #2: stamp AFTER the gather completes. Runs strictly outside the
+        # parallel awaits, so CLAUDE.md #2 (parallel snapshot+mtimes) and #3
+        # (_turn_had_direct_edit reset placement) are untouched. Pure clock read.
+        _ttft_stamp(info, "t2_perf_ns")
+
+        # ── Drain stale messages from interrupted turn ──────────────
+        #
+        # BUG: "Stop then follow-up shows IDLE immediately"
+        #
+        # The Claude SDK (claude-code-sdk) uses a single shared anyio
+        # MemoryObjectStream (100-msg capacity) as its message buffer.
+        # This buffer persists for the entire ClaudeSDKClient lifetime
+        # and is NOT flushed by interrupt().  Here's the race:
+        #
+        #   1. User clicks Stop → interrupt_session() sets IDLE, cancels
+        #      the old task, schedules _interrupt_session().
+        #   2. _interrupt_session() calls client.interrupt() → the CLI
+        #      acknowledges and emits a ResultMessage for the old turn.
+        #   3. The old task was reading receive_response() but got
+        #      CancelledError — it never consumed that ResultMessage.
+        #      The stale ResultMessage sits in the SDK's shared buffer.
+        #   4. User sends a follow-up → send_message() sets WORKING,
+        #      schedules _send_query().
+        #   5. _send_query() calls receive_response() → immediately
+        #      gets the STALE ResultMessage from step 2.
+        #   6. _process_message(ResultMessage) sets state to IDLE.
+        #   7. UI flashes WORKING for a split second then goes IDLE.
+        #      The new query was sent but its response loop terminated
+        #      early because of the stale message.
+        #
+        # Fix: when send_message() detects it's sending after an
+        # interrupt (_was_interrupted), it sets info._drain_stale=True.
+        # Here we consume one full receive_response() cycle to eat the
+        # stale ResultMessage before sending the new query.  This
+        # naturally synchronises with _interrupt_session() because
+        # receive_response() blocks until the stale ResultMessage
+        # arrives (which happens after interrupt() completes).
+        #
+        # Defense in depth: the CancelledError handlers and finally
+        # blocks in both _send_query and _drive_session also check
+        # info.task identity (superseded check) so that even if a
+        # stale task somehow touches state, it bails out when it
+        # detects a newer task has replaced it.
+        if getattr(info, '_drain_stale', False):
+            info._drain_stale = False
+            # Two callers set this flag with different timing needs:
+            #   • Post-interrupt: client.interrupt() asynchronously emits a
+            #     stale RESULT — receive_response() blocks until it arrives.
+            #     One full cycle, 5 s timeout for CLI ack.
+            #   • Post-supersede of an extended-post-turn listener: the
+            #     buffer is usually empty (listener was already consuming),
+            #     but it CAN contain a partial auto-resume cycle if the
+            #     supersede caught us mid-stream.  In that case we MUST
+            #     consume the cycle's RESULT — otherwise the new query's
+            #     ``receive_response()`` will read the auto-resume's RESULT
+            #     as the response to the new query.  We use an adaptive
+            #     per-message timeout: short for the first message of a
+            #     cycle (empty-buffer detection), long once activity is
+            #     seen (let the in-progress cycle complete).
+            _quick = bool(getattr(info, '_drain_stale_quick', False))
+            info._drain_stale_quick = False
+            # TTFT: annotate the record so we can tell drain-stale turns
+            # apart in the log (they have an extra 0–5 s wait between T2
+            # and T3 that is NOT model TTFT).
+            _ttft_note(info, "drain_stale_quick" if _quick else "drain_stale")
+            try:
+                if _quick:
+                    # Adaptive multi-cycle drain.  ``receive_response()`` is
+                    # an async generator that terminates at RESULT, so we
+                    # drive it manually with ``__anext__`` + ``wait_for``
+                    # to apply the adaptive per-message timeout.
+                    SHORT = 0.1   # first message: covers empty buffer
+                    LONG = 30.0   # subsequent: let cycle complete
+                    _max_cycles = 10  # real life is ≤ 2
+                    cycles_drained = 0
+                    for _ in range(_max_cycles):
+                        got_any_in_cycle = False
+                        cycle_completed = False
+                        gen = self._sdk.receive_response(info.client)
+                        aiter = gen.__aiter__()
+                        try:
+                            while True:
+                                try:
+                                    _msg = await asyncio.wait_for(
+                                        aiter.__anext__(),
+                                        timeout=LONG if got_any_in_cycle else SHORT,
+                                    )
+                                    got_any_in_cycle = True
+                                    logger.debug("Drained stale msg for %s: %s",
+                                                 session_id, type(_msg).__name__)
+                                except asyncio.TimeoutError:
+                                    break
+                                except StopAsyncIteration:
+                                    cycle_completed = True
+                                    break
+                        finally:
+                            try:
+                                await aiter.aclose()
+                            except Exception:
+                                pass
+                        if not cycle_completed:
+                            break
+                        cycles_drained += 1
+                    if cycles_drained:
+                        _profile_log("drained_stale_messages")
+                else:
+                    # Interrupt path: single cycle, simple async-for with
+                    # 5 s overall timeout.  ``client.interrupt()`` emits one
+                    # stale RESULT that we need to consume; subsequent
+                    # cycles aren't expected.
+                    async def _drain():
+                        async for _msg in self._sdk.receive_response(info.client):
+                            logger.debug("Drained stale msg for %s: %s",
+                                         session_id, type(_msg).__name__)
+                    try:
+                        await asyncio.wait_for(_drain(), timeout=5.0)
+                        _profile_log("drained_stale_messages")
+                    except asyncio.TimeoutError:
+                        logger.warning("_send_query %s: stale drain timed out (5s)", session_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as drain_err:
+                logger.warning("_send_query %s: stale drain error: %s", session_id, drain_err)
+
+        got_result = False
+        result_handled = False
+        _first_msg_logged = False
+        try:
+            # TTFT #3: last daemon moment before handing the prompt off to
+            # the CLI. Pure clock read; does not reorder anything.
+            _ttft_stamp(info, "t3_perf_ns")
+            await self._sdk.send_query(info.client, text)
+            _profile_log("query_sent")
+
+            # Process response messages — normalized to VibeNodeMessage by backend
+            info.usage.pop('_per_call', None)  # clear stale per-call marker from previous turn
+            info._stream_evt_logged = False  # re-enable diagnostic log for this turn
+            _watchdog = asyncio.create_task(
+                self._cli_watchdog(session_id, info)
+            )
+            try:
+                async for message in self._sdk.receive_response(info.client):
+                    # If a newer task has replaced us, stop processing —
+                    # our stream is stale and we must not touch state.
+                    if info.task is not asyncio.current_task():
+                        break
+                    if not _first_msg_logged:
+                        _profile_log("first_stream_message (%s)" % message.kind.value)
+                        _first_msg_logged = True
+                        # TTFT #4: first non-user message received from the CLI
+                        # stream. This is THE critical delta anchor — everything
+                        # before it is VibeNode/CLI/model TTFT, everything after
+                        # it is streaming render. Arms _ttft_await_first_emit so
+                        # the very next _emit_entry stamps T5 and flushes.
+                        # Pure clock read + a few dict writes; no state change.
+                        if _TTFT_TIMING_ENABLED and getattr(info, "_ttft_turn", None) is not None:
+                            info._ttft_turn["t4_perf_ns"] = time.perf_counter_ns()
+                            try:
+                                info._ttft_turn["first_msg_kind"] = message.kind.value
+                            except Exception:
+                                pass
+                            try:
+                                p = self._store.find_session_path(session_id)
+                                if p and p.exists():
+                                    info._ttft_turn["jsonl_bytes"] = p.stat().st_size
+                            except Exception:
+                                pass
+                            info._ttft_await_first_emit = True
+                    if message.kind == MessageKind.RESULT:
+                        got_result = True
+                        _profile_log("result_message")
+                    try:
+                        await self._process_message(session_id, message)
+                        if message.kind == MessageKind.RESULT:
+                            result_handled = True
+                    except Exception as pm_err:
+                        # Don't let one bad message kill the entire stream.
+                        # Log the error and continue processing remaining
+                        # messages so ResultMessage can still arrive and set IDLE.
+                        logger.exception(
+                            "_process_message error for %s (msg kind %s): %s",
+                            session_id, message.kind.value, pm_err
+                        )
+            finally:
+                _watchdog.cancel()
+                try:
+                    await _watchdog
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            # Post-turn compact drain — also installs the extended listener
+            # that consumes auto-resume / late ``task_notification`` content.
+            # We MUST call this on every successful turn or future buffered
+            # messages will land unread and the next user query will read
+            # them as stale.  The drain itself decides whether there's
+            # anything to consume right now.
+            if result_handled and info.task is asyncio.current_task():
+                # API-error auto-retry takes precedence over the post-turn
+                # listener — see the matching block in _drive_session for the
+                # full rationale.  After a transient error RESULT the extended
+                # listener would block waiting for auto-resume content that
+                # never arrives, so this coroutine would never return and the
+                # finally's arm would never run.  Arm directly + skip the drain.
+                if getattr(info, '_api_retry_needed', False) \
+                        and not getattr(info, '_stream_heal_needed', False):
+                    info.state = SessionState.IDLE
+                    self._arm_api_retry(info.session_id, info)
+                else:
+                    await self._post_turn_compact_drain(session_id, info)
+                    info._awaiting_compact_drain = False
+                    # Emit IDLE if drain didn't already transition state (e.g.
+                    # superseded by a new task).
+                    if info.task is asyncio.current_task() \
+                            and info.state == SessionState.IDLE:
+                        self._emit_state(info)
+
+            # Safety net: if the stream ended without a ResultMessage,
+            # force IDLE so the session isn't stuck forever.  Skip if we
+            # got a ResultMessage — the drain above handled IDLE transition.
+            # Also skip if superseded.
+            if not got_result and info.state == SessionState.WORKING \
+                    and info.task is asyncio.current_task():
+                logger.warning("_send_query for %s: stream ended without "
+                               "ResultMessage, forcing IDLE", session_id)
+                info._awaiting_compact_drain = False
+                info.state = SessionState.IDLE
+                self._emit_state(info)
+
+        except asyncio.CancelledError:
+            # Defense-in-depth for the stop→follow-up race (see "Drain
+            # stale messages" comment above).  If a newer task replaced
+            # us OR send_message flagged us as superseded (it cancels the
+            # extended-post-turn listener before the new task has a
+            # chance to claim info.task), bail without touching state.
+            _superseded = (
+                info.task is not asyncio.current_task()
+                or getattr(info, '_listener_superseded', False)
+            )
+            if _superseded or getattr(info, '_interrupted', False):
+                if not _superseded:
+                    logger.info("_send_query %s: interrupted (CancelledError)", session_id)
+                return
+            # Non-interrupt, non-superseded cancel — set IDLE so session isn't stuck
+            if info.state == SessionState.WORKING:
+                info.state = SessionState.IDLE
+                self._emit_state(info)
+        except Exception as e:
+            err_str = str(e)
+            logger.exception("Send query stream error for %s: %s", session_id, e)
+
+            # If _stream_heal_needed was already set (from "Stream closed" in
+            # a tool result), skip reconnect — finally block will do it + retry.
+            if getattr(info, '_stream_heal_needed', False):
+                logger.info("_send_query %s: stream_heal already flagged, "
+                            "deferring to finally block", session_id)
+                entry = LogEntry(kind="system", text="Stream lost — will reconnect and retry...", is_error=True)
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+            else:
+                _etype = type(e).__name__
+                _is_transport = (
+                    "Stream closed" in err_str
+                    or "exit code" in err_str
+                    or "closed" in err_str.lower()
+                    or "CLIConnection" in _etype
+                    or "Process" in _etype
+                    or "ClosedResource" in _etype
+                )
+                if _is_transport:
+                    if not hasattr(info, '_stream_heal_count'):
+                        info._stream_heal_count = 0
+                    info._stream_heal_count += 1
+                    info._stream_heal_needed = True
+                    logger.info(
+                        "STREAM_HEAL_TRIGGER site=send_query_except sid=%s "
+                        "etype=%s err=%r state=%s in_post_turn=%s "
+                        "listener_superseded=%s heal_count=%d",
+                        session_id, _etype, err_str[:200],
+                        getattr(info.state, 'value', info.state),
+                        getattr(info, '_in_post_turn', False),
+                        getattr(info, '_listener_superseded', False),
+                        info._stream_heal_count,
+                    )
+                    entry = LogEntry(kind="system", text="Stream lost — will reconnect and retry...", is_error=True)
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
+                else:
+                    # Non-transport error (e.g. an API 5xx / overload raised
+                    # mid-stream): reconnect, then auto-retry on the exponential
+                    # backoff if the error is transient.
+                    entry = LogEntry(kind="system", text="Stream lost — reconnecting...")
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
+
+                    if await self._reconnect_client(session_id, info):
+                        info.state = SessionState.IDLE
+                        info.error = ""
+                        # Detection channel (b): flag a backoff auto-retry for a
+                        # transient API error.  The finally block arms it.
+                        _retry_flagged = self._flag_api_retry_if_transient(
+                            info, err_str)
+                        if _retry_flagged:
+                            _txt = "API error (%s) — auto-retry scheduled…" % info.retry_reason
+                        else:
+                            _txt = "Reconnected successfully"
+                        entry = LogEntry(kind="system", text=_txt)
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        # ORDERING (hardening): do NOT emit state while a retry is
+                        # flagged but not yet ARMED.  retry_at is still 0 here
+                        # (only _arm_api_retry sets it), so _emit_state →
+                        # _try_dispatch_queue sees an OPEN queue gate on an IDLE
+                        # session and can dispatch a queued follow-up AHEAD of the
+                        # retry.  That flips the session to WORKING, and the
+                        # finally's _arm_api_retry then drops the retry — the
+                        # failed turn is abandoned and the queue jumps the line.
+                        # _arm_api_retry emits the countdown state itself a moment
+                        # later.  Channel (c) (the heal escalation below) already
+                        # skips its emit for exactly this reason.
+                        if not _retry_flagged:
+                            self._emit_state(info)
+                    else:
+                        info.error = err_str
+                        entry = LogEntry(kind="system", text=f"Reconnect failed: {e}", is_error=True)
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        info.state = SessionState.IDLE
+                        self._emit_state(info)
+        finally:
+            # Defense-in-depth for the stop→follow-up race (see "Drain
+            # stale messages" comment in _send_query).  Superseded or
+            # interrupted tasks must not touch state.
+            _superseded = info and (
+                info.task is not asyncio.current_task()
+                or getattr(info, '_listener_superseded', False)
+            )
+            # TTFT #6: if T5 never fired (empty stream, error, interrupt),
+            # flush a "no_reply" record so the diagnostic sees the turn.
+            # Idempotent — _ttft_flush is a no-op when the dict is already
+            # None (i.e. T5 already fired and flushed). No behavior change.
+            if info is not None:
+                _ttft_flush(info, session_id, status="no_reply")
+            if _superseded or (info and getattr(info, '_interrupted', False)):
+                return
+
+            # Catch-all: force IDLE if stuck in WORKING. Skip if
+            # ResultMessage was processed -- _try_dispatch_queue may
+            # have legitimately set WORKING for the next queued msg.
+            if info and info.state == SessionState.WORKING and not result_handled:
+                logger.error("_send_query finally: %s still WORKING after all "
+                             "handlers — forcing IDLE as catch-all", session_id)
+                info.state = SessionState.IDLE
+                self._emit_state(info)
+
+            # ── Self-healing: reconnect + retry if "Stream closed" errors
+            # were detected during this turn (either from tool results or
+            # from the except handler flagging a transport exception).
+            try:
+                if info and getattr(info, '_stream_heal_needed', False):
+                    info._stream_heal_needed = False
+                    heal_count = getattr(info, '_stream_heal_count', 0)
+                    if self._user_stopped(info):
+                        # User slept/stopped the session after the stream died —
+                        # honour it, don't self-heal it back to life.
+                        logger.info(
+                            "Self-heal (query) skipped for %s — user stopped/"
+                            "slept the session", session_id,
+                        )
+                    elif heal_count <= 3:
+                        # Exponential backoff: 2s, 4s, 8s between retries
+                        backoff = 2 ** heal_count
+                        logger.info(
+                            "Self-healing (query): reconnecting %s after %d stream errors "
+                            "(backoff %ds)",
+                            session_id, heal_count, backoff,
+                        )
+                        entry = LogEntry(kind="system", text="Reconnecting session...")
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        await asyncio.sleep(backoff)
+
+                        if self._user_stopped(info):
+                            # Slept DURING the backoff wait — abort the reconnect.
+                            logger.info(
+                                "Self-heal (query) aborted post-backoff for %s — "
+                                "user stopped/slept the session", session_id,
+                            )
+                        elif await self._reconnect_client(session_id, info):
+                            # Do NOT reset _stream_heal_count here.  Let it
+                            # accumulate across retries so the heal_count<=3
+                            # limit actually stops infinite loops.  The counter
+                            # is reset in send_message() when the user sends a
+                            # genuinely new message (not a self-healing retry).
+                            last_user_text = None
+                            with info._lock:
+                                for e in reversed(info.entries):
+                                    if e.kind == "user" and not getattr(e, "restored", False):
+                                        last_user_text = e.text
+                                        break
+                            if last_user_text:
+                                logger.info(
+                                    "STREAM_HEAL_FIRE site=send_query_finally sid=%s "
+                                    "heal_count=%d text_preview=%r",
+                                    session_id, heal_count, last_user_text[:120],
+                                )
+                                entry = LogEntry(
+                                    kind="system",
+                                    text="Reconnected — retrying last message automatically",
+                                )
+                                with info._lock:
+                                    info.entries.append(entry)
+                                    entry_index = len(info.entries) - 1
+                                self._emit_entry(session_id, entry, entry_index)
+                                info.state = SessionState.IDLE
+                                self._emit_state(info)
+                                self.send_message(session_id, last_user_text, _self_heal=True)
+                            else:
+                                entry = LogEntry(kind="system", text="Reconnected successfully")
+                                with info._lock:
+                                    info.entries.append(entry)
+                                    entry_index = len(info.entries) - 1
+                                self._emit_entry(session_id, entry, entry_index)
+                                info.state = SessionState.IDLE
+                                self._emit_state(info)
+                        else:
+                            info._stream_heal_count = 0
+                            # Reconnect itself failed — likely connectivity is
+                            # down.  Escalate to the long backoff (it retries the
+                            # reconnect on the backoff schedule) rather than
+                            # dead-ending with "please resend".
+                            if self._escalate_heal_to_backoff(info, "Connection lost"):
+                                info.state = SessionState.IDLE
+                            else:
+                                entry = LogEntry(
+                                    kind="system",
+                                    text="Reconnect failed — please resend your message",
+                                    is_error=True,
+                                )
+                                with info._lock:
+                                    info.entries.append(entry)
+                                    entry_index = len(info.entries) - 1
+                                self._emit_entry(session_id, entry, entry_index)
+                                info.state = SessionState.IDLE
+                                self._emit_state(info)
+                    else:
+                        info._stream_heal_count = 0
+                        # Persistent transport failure (the quick 3-try heal
+                        # couldn't recover) — most likely a connectivity outage.
+                        # Escalate to the long exponential backoff so an
+                        # overnight task rides it out instead of dead-ending.
+                        if self._escalate_heal_to_backoff(info, "Connection lost"):
+                            info.state = SessionState.IDLE
+                            # the API-retry arm block (below) emits the countdown
+                        else:
+                            entry = LogEntry(
+                                kind="system",
+                                text="Too many stream errors — please resend your message",
+                                is_error=True,
+                            )
+                            with info._lock:
+                                info.entries.append(entry)
+                                entry_index = len(info.entries) - 1
+                            self._emit_entry(session_id, entry, entry_index)
+                            info.state = SessionState.IDLE
+                            self._emit_state(info)
+            except Exception as heal_err:
+                logger.exception("Self-healing failed for %s: %s", session_id, heal_err)
+                if info:
+                    info._stream_heal_count = 0
+                    info.state = SessionState.IDLE
+                    self._emit_state(info)
+
+            # ── API-error auto-retry: a transient error this turn (an is_error
+            # RESULT, a non-transport API exception, or an escalated stream-heal)
+            # asked for an automatic retry on exponential backoff.  Arm the
+            # countdown timer here (state has settled).  Skip if the transport
+            # self-heal still owns a retry of the same message — avoids a
+            # double-send.
+            try:
+                if info and getattr(info, '_api_retry_needed', False) \
+                        and not getattr(info, '_stream_heal_needed', False):
+                    self._arm_api_retry(info.session_id, info)
+            except Exception as _retry_err:
+                logger.exception("Arming API auto-retry failed for %s: %s",
+                                 session_id, _retry_err)
+                if info:
+                    info._api_retry_needed = False
+
+            # Post-turn snapshot (isSnapshotUpdate=true, linked to assistant UUID)
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None, self._write_file_snapshot, session_id, True)
+            except Exception as snap_err:
+                logger.warning("Snapshot in finally for %s failed: %s", session_id, snap_err)
+
+    async def _interrupt_session(self, session_id: str,
+                                task_to_cancel: "asyncio.Task | None" = None) -> None:
+        """Interrupt a running session.
+
+        task_to_cancel: the asyncio.Task captured at interrupt time so we
+        cancel the correct coroutine even if a new query replaced info.task
+        before this coroutine ran.
+        """
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info or not info.client:
+            return
+
+        try:
+            # If waiting for permission, resolve with deny
+            if info.pending_permission:
+                perm_tuple = info.pending_permission
+                info.pending_permission = None
+                if isinstance(perm_tuple, tuple) and len(perm_tuple) == 2:
+                    perm_event, result_holder = perm_tuple
+                    deny = self._sdk.make_permission_result_deny(
+                        message="Interrupted by user", interrupt=True
+                    )
+                    result_holder[0] = (deny, False, False)
+                    perm_event.set()
+
+            # _interrupted flag and IDLE state already set by the sync
+            # interrupt_session() before this coroutine was dispatched.
+
+            # Cancel the driving task — this is what actually stops the
+            # coroutine. client.interrupt() alone just signals the CLI
+            # but the coroutine keeps running and can set WORKING again.
+            # Use the captured task reference, NOT info.task, because a
+            # new send_message may have replaced info.task already.
+            _task = task_to_cancel or info.task
+            if _task and not _task.done():
+                _task.cancel()
+
+            # Only send the SDK interrupt signal if no new query has started.
+            # If info.task has been replaced by a new _tracked_coro, calling
+            # interrupt() would kill the NEW query instead of the old one.
+            _new_task_started = (
+                task_to_cancel is not None
+                and info.task is not None
+                and info.task is not task_to_cancel
+            )
+            if not _new_task_started:
+                try:
+                    await self._sdk.interrupt(info.client)
+                except Exception:
+                    pass
+
+            # Add interrupt marker unless the CLI stream already delivered one
+            # (the SDK sends "[Request interrupted by user]" which gets
+            # converted to "Session interrupted by user" by _process_message).
+            with info._lock:
+                already = any(
+                    getattr(e, 'text', '') == "Session interrupted by user"
+                    for e in info.entries[-3:]  # only check tail
+                ) if info.entries else False
+            if not already:
+                entry = LogEntry(kind="system", text="Session interrupted by user")
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+        except Exception as e:
+            logger.exception("Interrupt error for %s: %s", session_id, e)
+
+    @staticmethod
+    def _process_alive(pid: int) -> bool:
+        """Return True iff process ``pid`` currently exists — WITHOUT killing it.
+
+        WINDOWS-CRITICAL:
+            The POSIX idiom ``os.kill(pid, 0)`` is a harmless existence probe
+            on Unix, but on Windows Python's ``os.kill`` has NO concept of
+            "signal 0".  For any signal other than CTRL_C_EVENT/CTRL_BREAK_EVENT
+            it calls ``TerminateProcess(handle, sig)`` — so ``os.kill(pid, 0)``
+            *terminates the target process* (with exit code 0) instead of
+            probing it.  The orphan sweep ran this "existence check" on every
+            IDLE session every 60s, which meant it KILLED the live, healthy CLI
+            of every idle session on Windows.  The user then saw "CLI process
+            exited unexpectedly — reconnecting…" on their next message, every
+            single turn, because the daemon had silently shot its own CLI.
+
+        This helper never terminates the process:
+          • Windows: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) — read-only,
+            cannot terminate — then GetExitCodeProcess; alive iff STILL_ACTIVE.
+          • POSIX: os.kill(pid, 0), where signal 0 genuinely is a no-op probe.
+        """
+        if not pid or pid <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+            )
+            if not handle:
+                # OpenProcess failed — process does not exist (or we lack
+                # rights, which for our own child never happens).
+                return False
+            try:
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                return code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        else:
+            try:
+                os.kill(pid, 0)  # signal 0: genuine existence probe on POSIX
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True  # exists but owned by another user
+            except OSError:
+                return False
+            return True
+
+    @staticmethod
+    def _kill_process_tree(pid: int) -> None:
+        """Kill a process and all its children.  Cross-platform.
+
+        On Windows, ``taskkill /T`` only works while the parent is alive.
+        If the parent already died, we fall back to WMI to find orphaned
+        children by ParentProcessId and kill them individually.
+
+        On POSIX, this uses ``os.killpg(os.getpgid(pid), ...)`` to kill the
+        target process and its descendants.  This depends on Patch 4
+        (sdk_patches.py) having spawned the CLI subprocess with
+        ``start_new_session=True`` so it lives in its own session/pgrp.
+
+        DAEMON-SAFETY DEFENSE (CRITICAL):
+            We refuse to call ``killpg()`` when the target's pgid equals
+            the daemon's own pgid.  If Patch 4 ever fails to apply (race
+            during startup, third-party spawn path that bypasses
+            ``subprocess.Popen``, PID reuse landing on an unrelated
+            process in our group, etc.), the unconditional killpg would
+            blast the entire daemon — every running session dies, the
+            IPC connection drops, and "Stop Session" silently nukes the
+            whole app.  This regression already shipped to users on
+            Linux, so this defensive check is required even with Patch 4
+            in place.  When the check trips, we fall back to per-PID
+            ``os.kill`` which only signals the target (descendants leak
+            but the daemon survives — better than tearing everything
+            down).
+        """
+        try:
+            # Both platforms: only a real, positive int is a pid.  (bool is
+            # an int subclass and is rejected too.)  See GUARD #0 below for
+            # what a mock object did here on Linux.
+            if type(pid) is not int or pid <= 1:
+                logger.error(
+                    "_kill_process_tree(pid=%r): refusing to act — not a "
+                    "valid process id.", pid)
+                return
+            # Never our own tree, on either platform: ``taskkill /T`` on the
+            # engine would also take every Session Host it spawned (they are
+            # detached, but still its children by parent pid), ending the
+            # sessions a restart is meant to keep.
+            if pid == os.getpid():
+                logger.error(
+                    "_kill_process_tree(pid=%r): refusing to act — that is "
+                    "this process.", pid)
+                return
+            if os.name == "nt":
+                # Try taskkill /T first (works when parent is alive)
+                result = _subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdout=_subprocess.PIPE,
+                    stderr=_subprocess.PIPE,
+                    timeout=10,
+                    creationflags=_subprocess.CREATE_NO_WINDOW,
+                )
+                # If taskkill failed (parent already dead), find orphans
+                # by ParentProcessId via WMIC and kill them with /T so
+                # their own children are also cleaned up recursively.
+                if result.returncode != 0:
+                    try:
+                        wmic = _subprocess.run(
+                            ["wmic", "process", "where",
+                             f"ParentProcessId={pid}", "get",
+                             "ProcessId", "/value"],
+                            capture_output=True, text=True, timeout=10,
+                            creationflags=_subprocess.CREATE_NO_WINDOW,
+                        )
+                        for line in wmic.stdout.splitlines():
+                            line = line.strip()
+                            if line.startswith("ProcessId="):
+                                child_pid = line.split("=", 1)[1].strip()
+                                if child_pid.isdigit():
+                                    # Use /T to kill the child AND its
+                                    # descendants (e.g. node → workers)
+                                    _subprocess.run(
+                                        ["taskkill", "/F", "/T", "/PID",
+                                         child_pid],
+                                        stdout=_subprocess.DEVNULL,
+                                        stderr=_subprocess.DEVNULL,
+                                        timeout=5,
+                                        creationflags=_subprocess.CREATE_NO_WINDOW,
+                                    )
+                    except Exception as wmic_err:
+                        logger.debug("WMIC orphan cleanup for PID %d: %s",
+                                     pid, wmic_err)
+            else:
+                # ── DAEMON-SUICIDE GUARD #0 (HARD STOP) ─────────────────
+                # Refuse to operate on dangerous PID values before issuing
+                # any signal.  Every previous round of debugging the Linux
+                # "Stop Session crashed the daemon" regression focused on
+                # the pgid leak; this catches the OTHER category that the
+                # pgid check can miss — pid confusion.
+                #
+                #   pid == os.getpid()    →  caller passed our own pid
+                #                            (corrupt info._cli_pid, race
+                #                            in extract_process_pid).
+                #                            killpg AND the per-PID
+                #                            fallback would land on us.
+                #
+                #   pid == 0              →  os.kill(0, sig) sends to the
+                #                            ENTIRE current process group,
+                #                            which on the daemon includes
+                #                            the daemon itself.  This is
+                #                            the classic Unix footgun.
+                #
+                #   pid in (-1, 1)        →  -1 broadcasts to every process
+                #                            we can signal; 1 is init and
+                #                            never a CLI pid.  Both are
+                #                            certainly wrong.
+                #
+                # Returning early here means descendants may leak (the
+                # caller passed a bad pid so we have nothing reliable to
+                # kill), but the daemon survives.
+                #
+                #   not a real int        →  REFUSE.  This guard used to be
+                #                            `pid <= 1` inside a try whose
+                #                            `except Exception: pass` FELL
+                #                            THROUGH.  A non-int (a test's
+                #                            MagicMock backend returned one
+                #                            from extract_process_pid) raised
+                #                            TypeError on the comparison, the
+                #                            guard was skipped, and
+                #                            os.getpgid(mock) coerced the
+                #                            mock to 1 via __index__ and
+                #                            returned pgid 1.  killpg(1) is
+                #                            kill(-1): EVERY process the user
+                #                            owns.  It logged the desktop out
+                #                            and killed every session.
+                #                            The guard now
+                #                            fails CLOSED: anything it cannot
+                #                            prove safe is refused.
+                try:
+                    _pid_ok = (
+                        type(pid) is int
+                        and pid > 1
+                        and pid != os.getpid()
+                    )
+                except Exception:
+                    _pid_ok = False
+                if not _pid_ok:
+                    logger.error(
+                        "_kill_process_tree(pid=%r): refusing to act — "
+                        "pid is not a real int, is None/0/1/negative, or "
+                        "equals the daemon pid.  Caller passed a corrupt "
+                        "CLI pid (likely a stale info._cli_pid or an "
+                        "extract_process_pid race during a session "
+                        "close).  Descendants may leak; daemon survives.",
+                        pid,
+                    )
+                    return
+
+                # Resolve the target's pgid first.  If the process is
+                # already gone, getpgid raises ProcessLookupError — nothing
+                # to do.
+                try:
+                    target_pgid = os.getpgid(pid)
+                except (ProcessLookupError, OSError):
+                    return
+
+                # killpg(0) signals OUR group and killpg(1) is kill(-1),
+                # every process this user owns.  No CLI ever legitimately
+                # lives in either; a real process group id is > 1.
+                if type(target_pgid) is not int or target_pgid <= 1:
+                    logger.error(
+                        "_kill_process_tree(%d): target pgid %r is not a "
+                        "real process group. Refusing killpg (would signal "
+                        "every process this user owns).",
+                        pid, target_pgid,
+                    )
+                    return
+
+                # CRITICAL: never killpg our own group — that would kill
+                # the daemon.  See full explanation in the docstring above.
+                own_pgid = os.getpgid(os.getpid())
+                if target_pgid == own_pgid:
+                    logger.error(
+                        "_kill_process_tree(%d): target pgid %d == daemon "
+                        "pgid %d. Refusing killpg (would kill the daemon). "
+                        "Patch 4 (start_new_session injection) did not "
+                        "isolate this subprocess. Falling back to per-PID "
+                        "kill — descendants may leak but the daemon "
+                        "survives.",
+                        pid, target_pgid, own_pgid,
+                    )
+                    # Per-PID fallback: signal only the target.  This
+                    # leaks any grandchildren the target spawned, but
+                    # that's a recoverable resource leak; killing the
+                    # daemon is not recoverable.
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    time.sleep(SessionManager._KILL_GRACE_S)
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    return
+
+                # Safe path: target is in its own session/pgrp.  Kill the
+                # whole subtree via SIGTERM, give it 300ms to exit, then
+                # SIGKILL anything still alive.
+                try:
+                    os.killpg(target_pgid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                time.sleep(SessionManager._KILL_GRACE_S)
+                try:
+                    os.killpg(target_pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        except Exception as e:
+            logger.debug("_kill_process_tree(%r) best-effort: %s", pid, e)
+
+    def _schedule_orphan_sweep(self) -> None:
+        """Schedule the next orphan process sweep (every 60s)."""
+        self._orphan_sweep_timer = threading.Timer(60.0, self._orphan_sweep)
+        self._orphan_sweep_timer.daemon = True
+        self._orphan_sweep_timer.start()
+
+    def _orphan_sweep(self) -> None:
+        """Check all tracked sessions for dead CLI processes with live children.
+
+        On Windows, when claude.exe crashes or is killed externally, its child
+        node.exe workers survive as orphans eating CPU and RAM.  This sweep
+        detects that and kills the orphaned tree.
+        """
+        try:
+            with self._lock:
+                sessions = list(self._sessions.values())
+            cleaned = 0
+            for info in sessions:
+                pid = info._cli_pid
+                if not pid or self._is_hosted(info):
+                    # A hosted CLI is its host's child; the host reaps it,
+                    # and session_host_registry.sweep reaps hosts.
+                    continue
+                # Skip sessions that are actively working — their CLI
+                # process may have been replaced by a reconnect and
+                # _cli_pid may be stale.  Only clean up IDLE/STOPPED.
+                if info.state in (SessionState.WORKING, SessionState.WAITING):
+                    continue
+                # Verify _cli_pid matches the current client's process.
+                # After reconnect, _cli_pid is updated, but belt-and-
+                # suspenders: if the client has a live process with a
+                # DIFFERENT PID, our recorded PID is stale — skip it.
+                current_pid = self._sdk.extract_process_pid(info.client)
+                if current_pid and current_pid != pid:
+                    # Stale PID — update and skip
+                    info._cli_pid = current_pid
+                    continue
+                # Check if the CLI process is still alive.  MUST use the
+                # Windows-safe probe: a bare os.kill(pid, 0) here TERMINATES the
+                # live CLI on Windows (see _process_alive).  That bug made this
+                # sweep kill every idle session's CLI every 60s.
+                if self._process_alive(pid):
+                    continue  # still alive, nothing to do
+                # CLI is dead but we still have a PID recorded — kill orphans
+                logger.warning(
+                    "Orphan sweep: CLI PID %d for session %s is dead — "
+                    "killing child process tree",
+                    pid, info.session_id,
+                )
+                self._kill_process_tree(pid)
+                info._cli_pid = 0
+                cleaned += 1
+            if cleaned:
+                logger.info("Orphan sweep cleaned up %d dead session(s)", cleaned)
+            # Session Hosts: hosts of slept sessions, retiring hosts, dead
+            # records (only for sessions this engine knows).
+            try:
+                from engine import session_host_registry as _shr
+                _shr.sweep(self)
+            except Exception as _sh_err:
+                logger.debug("Session Host sweep error: %s", _sh_err)
+        except Exception as e:
+            logger.debug("Orphan sweep error: %s", e)
+        finally:
+            # Reschedule regardless of success/failure
+            if getattr(self, '_started', False):
+                self._schedule_orphan_sweep()
+
+    def _schedule_wakeup_queue_watchdog(self) -> None:
+        """Schedule the next wake-up queue starvation sweep."""
+        self._wakeup_queue_watchdog_timer = threading.Timer(
+            self._WAKEUP_QUEUE_WATCHDOG_INTERVAL, self._wakeup_queue_watchdog
+        )
+        self._wakeup_queue_watchdog_timer.daemon = True
+        self._wakeup_queue_watchdog_timer.start()
+
+    def _wakeup_queue_watchdog(self) -> None:
+        """Guarantee a queued user message can never be stranded on an idle
+        session — no matter why dispatch stalled.
+
+        ROOT-CAUSE FIX.  The wake-up dispatch gate in
+        ``_emit_state`` / ``queue_message`` suppresses queue auto-dispatch
+        while ``_in_post_turn AND _wakeup_pending`` so a queued message
+        can't race a deferred auto-resume cycle into the SDK buffer.  That
+        gate is correct but UNBOUNDED.  Two real failure modes strand the
+        queue forever (UI stuck on "Awaiting wake-up…"):
+
+          1. Self-perpetuating wake-up loop — the agent schedules a fresh
+             wake-up (``Bash run_in_background`` / ``ScheduleWakeup``) on
+             every turn, so ``_wakeup_pending`` is re-armed at every RESULT
+             and the gate never reopens.
+          2. Phantom wake-up — ``_wakeup_pending`` is set but the SDK never
+             delivers the auto-resume (a background process that never exits,
+             a wake-up whose notification is lost).  The user observes this
+             directly: "those wake-ups never fire."  The session sits IDLE
+             behind a closed gate indefinitely.
+
+        Earlier drafts of this watchdog armed on ``_in_post_turn AND
+        _wakeup_pending``.  That bets on the listener being alive and the
+        flags being set — but if the wake-up never fires AND the listener
+        has since died (CLI exit, transport error clears ``_in_post_turn``),
+        nothing would arm.  So this version bets on NOTHING about wake-ups:
+
+        * The only invariant we enforce is the one the user actually cares
+          about — a non-empty queue on a session that is alive but not
+          actively producing a turn (state == IDLE) must drain.
+        * We arm ``_wakeup_queue_blocked_since`` the first sweep we see a
+          backlog the session has not drained, and keep it armed across the
+          IDLE<->WORKING oscillation of a wake-up loop (we only reset it when
+          the queue empties).  Normal sessions drain in milliseconds, so they
+          never reach the timeout — only a genuinely stuck queue does.
+        * Past the timeout we set ``_force_queue_dispatch`` (which makes the
+          gate fall open) and, when the session is IDLE, dispatch via
+          ``_try_dispatch_queue`` → ``send_message`` — the same supersede +
+          drain-stale path a manual user send uses during a sleep window
+          (documented safe in ``queue_message``).  WORKING/WAITING sessions
+          only get the flag set; the next IDLE emit delivers, so we never
+          interrupt an in-flight turn.
+
+        Bounding (not removing) the gate keeps its race protection intact for
+        the common case (real wake-ups complete in seconds, far under the
+        timeout) while making indefinite starvation impossible.
+        """
+        try:
+            with self._lock:
+                sessions = list(self._sessions.values())
+            now = time.time()
+            timeout = self._WAKEUP_QUEUE_STARVATION_TIMEOUT
+            for info in sessions:
+                q_len = len(self._mq.get_queue_data(info.session_id))
+
+                # ── (A) PHANTOM WAKE-UP: bound the "Awaiting wake-up…" state ──
+                # If a wake-up was scheduled but has not fired by its
+                # deadline, declare it phantom and clear the awaiting state
+                # back to plain Idle.  This is the absolute guarantee the
+                # user demanded: a wake-up that never wakes can NEVER leave
+                # the session hung on "Awaiting wake-up…".  Independent of
+                # the queue — it fixes the pure stuck-indicator case too.
+                # The listener (if any) stays alive, so a late wake-up can
+                # still resume the session; we only stop the indefinite lie.
+                if (
+                    info.state == SessionState.IDLE
+                    and getattr(info, '_wakeup_pending', False)
+                    and info._wakeup_deadline
+                    and now > info._wakeup_deadline
+                    and not getattr(info, '_interrupted', False)
+                ):
+                    logger.warning(
+                        "WAKEUP_PHANTOM sid=%s: scheduled wake-up did not "
+                        "fire by its deadline (overdue %.0fs) — clearing "
+                        "'Awaiting wake-up…' back to Idle%s",
+                        info.session_id[:12], now - info._wakeup_deadline,
+                        " and reopening the queue gate" if q_len else "",
+                    )
+                    info._wakeup_pending = False
+                    info._wakeup_deadline = 0.0
+                    info._wakeup_max_delay = 0.0
+                    info._wakeup_is_scheduled = False
+                    info.substatus = ""
+                    info._wakeup_queue_blocked_since = 0.0
+                    if q_len > 0:
+                        # Let any backlog drain on this same emit.
+                        info._force_queue_dispatch = True
+                    # Push the corrected state (UI -> Idle) and, via the
+                    # IDLE dispatch path, deliver any queued messages.
+                    self._emit_state(info)
+                    continue
+
+                if q_len == 0:
+                    # No backlog — disarm and drop any spent override so a
+                    # future backlog starts from a clean slate.
+                    if info._wakeup_queue_blocked_since or info._force_queue_dispatch:
+                        info._wakeup_queue_blocked_since = 0.0
+                        info._force_queue_dispatch = False
+                    continue
+                # A STOPPED session can't run anything; a freshly-interrupted
+                # one is being torn down (and its queue is normally cleared).
+                # Don't try to force work onto either.
+                if info.state == SessionState.STOPPED \
+                        or getattr(info, '_interrupted', False):
+                    continue
+                # Arm the clock the first sweep we observe an undrained
+                # backlog.  Kept across turns until the queue empties, so a
+                # tight wake-up loop's IDLE<->WORKING flicker can't keep
+                # resetting it (that flicker was the original starvation).
+                if not info._wakeup_queue_blocked_since:
+                    info._wakeup_queue_blocked_since = now
+                    continue
+                waited = now - info._wakeup_queue_blocked_since
+                if waited < timeout:
+                    continue
+                # ── STARVATION CONFIRMED — open the gate and deliver. ──
+                # The override makes _emit_state / queue_message bypass the
+                # wake-up gate; we additionally dispatch right now if the
+                # session is sitting IDLE.  A WORKING/WAITING session keeps
+                # the flag and drains at its next IDLE emit (no mid-turn
+                # interruption).  _wakeup_queue_blocked_since stays armed so
+                # the remaining backlog keeps draining on later sweeps.
+                info._force_queue_dispatch = True
+                if info.state == SessionState.IDLE:
+                    logger.warning(
+                        "WAKEUP_QUEUE_STARVATION sid=%s: %d queued message(s) "
+                        "stuck %.0fs on an idle session (limit %.0fs) — "
+                        "force-dispatching so the user's queue is not "
+                        "stranded (in_post_turn=%s wakeup_pending=%s)",
+                        info.session_id[:12], q_len, waited, timeout,
+                        getattr(info, '_in_post_turn', False),
+                        getattr(info, '_wakeup_pending', False),
+                    )
+                    try:
+                        self._try_dispatch_queue(info.session_id)
+                    except Exception as disp_err:
+                        logger.error(
+                            "WAKEUP_QUEUE_STARVATION dispatch failed for %s: %s",
+                            info.session_id[:12], disp_err,
+                        )
+        except Exception as e:
+            logger.debug("Wake-up queue watchdog error: %s", e)
+        finally:
+            # Reschedule regardless of success/failure
+            if getattr(self, '_started', False):
+                self._schedule_wakeup_queue_watchdog()
+
+    async def _close_session(self, session_id: str, forget: bool = True) -> None:
+        """Disconnect and clean up a session.
+
+        ``forget`` (default): an explicit close (Sleep/Delete/close_session),
+        so the session's SessionDurable record is deleted ("Sleep must
+        stick").  ``stop()`` passes False: an engine shutdown keeps the record
+        for the next engine's recovery.
+
+        A hosted session (``src/engine/session_host.py``) is shut down through its
+        host (the ``shutdown`` frame: the host closes the CLI's stdin and kills
+        ITS OWN child tree).  The daemon never signals a pid it read from a
+        host record unless the host is unreachable and the pid's create time
+        still matches (``session_host_registry.guarded_kill``).
+
+        Exception-safety contract: this coroutine MUST NEVER let an
+        exception escape.  It runs on the daemon's asyncio loop via
+        ``run_coroutine_threadsafe`` and the resulting Future's exception
+        is observed by ``close_session_sync``'s ``future.result()`` —
+        but a raised exception there can mislead callers into thinking
+        the close failed when it actually succeeded enough.  More
+        importantly, an unhandled exception in the cleanup-side
+        ``except`` block (which itself emits state and schedules a save)
+        could fire on top of the original exception and break the
+        ``info.state = STOPPED`` invariant other code relies on.
+
+        Each step is therefore wrapped in its own try/except so a
+        failure in one step (e.g., the SDK's disconnect throws, the
+        kill races with the orphan sweep, the push callback fails) can
+        never prevent later steps from running.
+        """
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return
+
+        # Step 1: Cancel pending permission so the agent's
+        # waiting-on-permission task wakes up and exits.
+        try:
+            if info.pending_permission:
+                perm_tuple = info.pending_permission
+                info.pending_permission = None
+                if isinstance(perm_tuple, tuple) and len(perm_tuple) == 2:
+                    perm_event, result_holder = perm_tuple
+                    deny = self._sdk.make_permission_result_deny(
+                        message="Session closed", interrupt=True
+                    )
+                    result_holder[0] = (deny, False, False)
+                    perm_event.set()
+        except Exception:
+            logger.exception("close_session: pending-permission cleanup failed for %s",
+                             session_id)
+
+        # Step 2: Cancel the driving task.
+        try:
+            if info.task and not info.task.done():
+                info.task.cancel()
+        except Exception:
+            logger.exception("close_session: task cancel failed for %s", session_id)
+
+        # Step 3: Grab the CLI subprocess PID before the SDK's
+        # disconnect() cleans it up.
+        hosted = self._is_hosted(info)
+        host_record = getattr(info, "_host_record", None) if hosted else None
+        cli_pid = 0
+        if not hosted:
+            try:
+                cli_pid = self._sdk.extract_process_pid(info.client) or info._cli_pid
+            except Exception:
+                logger.exception("close_session: extract_process_pid failed for %s",
+                                 session_id)
+                cli_pid = info._cli_pid or 0
+
+        # Step 4: Disconnect the SDK client (closes pipes, calls the
+        # SDK's process.terminate() — per-PID, safe).  A hosted client's
+        # disconnect sends its host the ``shutdown`` frame.
+        if info.client:
+            try:
+                await self._sdk.disconnect(info.client)
+            except Exception:
+                logger.exception("close_session: SDK disconnect failed for %s",
+                                 session_id)
+
+        # Step 4b (hosted): the host normally confirms and exits.  If it did
+        # not, the guarded fallback kills only a pid whose create time still
+        # matches the record.
+        if hosted and isinstance(host_record, dict):
+            # Remembered so the sweep still shuts this host down if it
+            # outlives the close AND the session is then deleted (forgotten
+            # from _sessions): session_host_registry.sweep acts only on
+            # sessions this engine knows or closed.
+            closed = getattr(self, "_host_closed", None)
+            if not isinstance(closed, set):
+                closed = self._host_closed = set()
+            closed.update(s for s in (session_id, info.session_id,
+                                      host_record.get("sid")) if isinstance(s, str) and s)
+            try:
+                from engine import session_host_registry as _shr
+                await asyncio.get_running_loop().run_in_executor(
+                    None, _shr.ensure_host_gone, host_record)
+            except Exception:
+                logger.exception("close_session: host cleanup failed for %s", session_id)
+
+        # Step 5: Kill the full process tree so descendants don't leak.
+        # Defended at the kill_process_tree level against killpg-on-self.
+        if cli_pid:
+            try:
+                self._kill_process_tree(cli_pid)
+            except Exception:
+                logger.exception("close_session: _kill_process_tree(%d) raised for %s",
+                                 cli_pid, session_id)
+        info._cli_pid = 0
+
+        # Step 6: Drop session-local state.  This is the last step the
+        # caller cares about — guarantee STOPPED regardless of any
+        # earlier failures.
+        info.state = SessionState.STOPPED
+        info.client = None
+
+        # Step 7: Emit state + schedule registry save.  These can fail
+        # if the push callback throws or the timer can't be scheduled.
+        # Caught individually so neither blocks the other or leaks an
+        # exception out of the coroutine.
+        try:
+            self._emit_state(info)
+        except Exception:
+            logger.exception("close_session: _emit_state failed for %s", session_id)
+        try:
+            self._schedule_registry_save()
+        except Exception:
+            logger.exception("close_session: _schedule_registry_save failed for %s",
+                             session_id)
+        if forget:
+            try:
+                from engine import session_durable as _sd
+                _sd.delete(session_id)
+            except Exception:
+                logger.exception("close_session: durable delete failed for %s", session_id)
+
+    # ------------------------------------------------------------------
+    # Permission callback
+    # ------------------------------------------------------------------
+
+    # ── Chrome control (System → Preferences) ────────────────────────────
+    # Without the CLI's ``--chrome`` flag a session has no browser tools.
+    # The global
+    # ``claudeInChromeDefaultEnabled`` setting does not reach SDK sessions
+    # (probed: tools appear only with the flag).  Opt-in: every launch and
+    # resume carries ``--chrome`` while ``chrome_control`` is true.  A caller
+    # that chose ``chrome`` / ``no-chrome`` itself wins.
+
+    @staticmethod
+    def _chrome_control_on() -> bool:
+        try:
+            from shared.config import get_kanban_config
+            return get_kanban_config().get("chrome_control", False) is True
+        except Exception:
+            return False
+
+    def _with_chrome(self, extra_args: Optional[dict], session_type: str) -> dict:
+        """``extra_args`` plus ``--chrome`` when Chrome control is on."""
+        args = dict(extra_args or {})
+        if (session_type not in ("planner", "title") and "chrome" not in args
+                and "no-chrome" not in args and self._chrome_control_on()):
+            args["chrome"] = None
+        return args
+
+    # ── Smart termination (src/engine/smart_termination.py) ──────────────────
+
+    @staticmethod
+    def _smart_termination_on() -> bool:
+        """The ``smart_termination`` preference (System → Preferences), opt-in:
+        on only when set to true.  Read through the cached config (CLAUDE.md
+        PERF-CRITICAL #11)."""
+        try:
+            from shared.config import get_kanban_config
+            return get_kanban_config().get("smart_termination", False) is True
+        except Exception:
+            return False
+
+    def _smart_termination_prompt(self, session_type: str) -> Optional[str]:
+        """The handoff instruction appended to a launch's system prompt, or
+        None for sessions that never talk to a person (planner, title)."""
+        if session_type in ("planner", "title") or not self._smart_termination_on():
+            return None
+        try:
+            # The rules as they are on disk now, not as they were when the
+            # engine started (src/engine/smart_termination_live.py).
+            from engine.smart_termination_live import module as _st_live
+            return _st_live().INSTRUCTIONS
+        except Exception:
+            return None
+
+    def _others_working(self, sid: str, cwd: str) -> list:
+        """Short ids of the other sessions in the same folder that are
+        WORKING right now (Smart termination's blame check)."""
+        def norm(p):
+            return os.path.normcase(os.path.normpath(p)) if p else ""
+        mine = norm(cwd)
+        if not mine:
+            return []
+        with self._lock:
+            return [k[:8] for k, s in self._sessions.items()
+                    if k != sid and s.state == SessionState.WORKING and norm(getattr(s, "cwd", "")) == mine]
+
+    def _make_turn_end_callback(self, session_id: str):
+        """The backend's turn-end hook for one session: returns the reason to
+        send the agent back (no handoff block, unexplained labels, or stopping
+        with work it could still do), or None to let the turn end.
+
+        Never sends back a session the user stopped (``_interrupted``), a
+        planner/title session, or any session while the preference is off.
+        Each stop cycle is sent back at most ``MAX_SENDBACKS`` times."""
+        captured_sid = session_id
+
+        async def turn_end_hook(message=None, continued=False,
+                                background_in_flight=False, cli_session_id=""):
+            if not self._smart_termination_on():
+                return None
+            sid = self._resolve_id(captured_sid)
+            with self._lock:
+                info = self._sessions.get(sid)
+            if info is None or getattr(info, "_interrupted", False):
+                return None
+            if getattr(info, "session_type", "") in ("planner", "title"):
+                return None
+            # A queued message goes out now; the next turn's card covers it.
+            try:
+                if self._mq.get_queue(sid):
+                    return None
+            except Exception:
+                pass
+            if not continued:
+                info._st_sendbacks = 0
+            sendbacks = getattr(info, "_st_sendbacks", 0) or 0
+            from engine.smart_termination_live import module as _st_live
+            # Off the event loop: after a rule edit it runs an import check.
+            _st = await asyncio.get_running_loop().run_in_executor(None, _st_live)
+            # What the session did and what the user said in this task: the
+            # card is checked against it (claims, every ask covered, the big
+            # picture kept, the user's question answered; src/engine/handoff_evidence.py).
+            facts = None
+            try:
+                from engine import handoff_evidence as _ev
+                with self._lock:
+                    entries = list(info.entries)
+                facts = _ev.facts_from_entries(entries, trimmed=bool(getattr(info, "_entries_trimmed", False)))
+                # Who else in this project is working now: a card that
+                # leaves work to "another session" is sent back when nobody
+                # is (handoff_evidence.blame_problems).
+                facts.others_working = self._others_working(sid, getattr(info, "cwd", "") or "")
+                # The session's own folder: a project's stop checks apply only inside it.
+                facts.cwd = getattr(info, "cwd", "") or ""
+                facts.session_id = sid
+            except Exception as e:   # never trap a turn on a facts failure
+                logger.debug("Smart termination: no facts for %s: %s", sid[:12], e)
+                facts = None
+            # The session it judges: the self-check's stamp is per session,
+            # so a card checked in another session never passes.
+            try:
+                reason = _st.review(message, continued=continued, sendbacks=sendbacks,
+                                    background_in_flight=background_in_flight, facts=facts,
+                                    session_id=cli_session_id or sid)
+            except TypeError:   # rules hot-loaded from before session_id existed
+                reason = _st.review(message, continued=continued, sendbacks=sendbacks,
+                                    background_in_flight=background_in_flight, facts=facts)
+            if reason:
+                info._st_sendbacks = sendbacks + 1
+                logger.info("Smart termination: sent %s back (%d/%d): %s",
+                            sid[:12], sendbacks + 1, getattr(_st, "HARD_CEILING", _st.MAX_SENDBACKS),
+                            reason.split("\n", 1)[0][:160])
+                return reason
+            # Let through at the ceiling still unusable: say so on screen, so
+            # a summary with nothing to tap never looks like a working one.
+            try:
+                released = getattr(_st, "released_faults", None)
+                try:
+                    faults = released(message, sendbacks, facts=facts) if released else []
+                except TypeError:   # rules from before the facts argument
+                    faults = released(message, sendbacks) if released else []
+            except Exception:
+                faults = []
+            if faults:
+                # A claim it never proved is labelled "Not proven", so it
+                # never reads as verified.
+                entry = LogEntry(kind="system", is_error=True,
+                                 text="This summary was let through after "
+                                      f"{sendbacks} send-backs and still cannot be used as it stands: "
+                                      + "; ".join(faults) + " Reply in the box below.")
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(sid, entry, entry_index)
+            return None
+
+        return turn_end_hook
+
+    def _make_pre_compact_callback(self, session_id: str):
+        """Create a PreCompact hook callback for a specific session.
+
+        The SDK invokes this BEFORE starting a compaction cycle — both
+        manual ``/compact`` and SDK-initiated auto-compaction.  We use
+        it to flip ``substatus="compacting"`` early so the UI shows
+        "Compacting…" during the actual work, not just briefly at the
+        end (``compact_boundary`` arrives AFTER compaction completes,
+        so the label would otherwise appear only once compacting is done).
+
+        The callback returns implicitly via the SDK's ``HookJSONOutput``
+        wrapper (see ``ClaudeAgentSDK.create_session``); we do nothing
+        that would alter SDK behavior — this is notification only.
+
+        Resolves session_id via ``_resolve_id`` because the hook may
+        fire AFTER the first turn's SDK-assigned-id remap.
+        """
+        captured_sid = session_id
+
+        async def pre_compact_hook(input_data, tool_use_id, context):
+            sid = self._resolve_id(captured_sid)
+            with self._lock:
+                info = self._sessions.get(sid)
+            if not info:
+                return
+            # Only flip if we'd actually change anything — avoid emitting
+            # a no-op state event for a session that's already in
+            # working+compacting (e.g. user just pressed /compact and the
+            # optimistic substatus is already set).
+            if info.substatus == 'compacting' and info.state == SessionState.WORKING:
+                return
+            logger.info(
+                "PreCompact hook fired for %s — flipping substatus early "
+                "(was state=%s substatus=%r)",
+                sid[:12], info.state.value, info.substatus,
+            )
+            # The SDK is about to compact.  Mark the session WORKING +
+            # compacting so the UI shows the indicator from the start
+            # of the work, not the end.  If state was IDLE (post-turn
+            # auto-compact case), this also keeps the listener's IDLE
+            # emit from confusingly showing "ready" while the SDK is
+            # actively summarizing in the background.
+            info.state = SessionState.WORKING
+            info.substatus = "compacting"
+            # Reset _post_compact_init_seen so the init handler's
+            # "wait for new content before clearing" logic re-arms.
+            info._post_compact_init_seen = False
+            self._emit_state(info)
+
+        return pre_compact_hook
+
+    def _make_permission_callback(self, session_id: str):
+        """Create the can_use_tool callback for a specific session.
+
+        The callback runs inside an anyio task group (the SDK's control
+        handler). We use anyio.Event for waiting, which properly yields to
+        the anyio scheduler instead of blocking the thread.
+
+        resolve_permission() (called from a caller thread) sets the event
+        via loop.call_soon_threadsafe() so the waiting coroutine wakes up
+        immediately.
+        """
+        manager = self
+
+        async def can_use_tool(tool_name, tool_input, context):
+            # Resolve through aliases — the SDK remaps session IDs on
+            # ResultMessage, so the closed-over session_id may be stale.
+            resolved_id = manager._resolve_id(session_id)
+            with manager._lock:
+                info = manager._sessions.get(resolved_id)
+            if not info:
+                return manager._sdk.make_permission_result_deny(
+                    message="Session not found", interrupt=True
+                )
+
+            # ── Early abort: if the CLI subprocess transport is dead,
+            # every tool use will fail with "Stream closed".  Instead of
+            # letting the agent retry dozens of times, deny with
+            # interrupt=True to end the turn immediately.  The finally
+            # block in _drive_session / _send_query will reconnect and
+            # retry the whole message on a fresh CLI process.
+            _transport_alive = manager._sdk.is_transport_alive(info.client)
+            if not _transport_alive:
+                # Flag for self-healing so the finally block reconnects
+                info._stream_heal_needed = True
+                if not hasattr(info, '_stream_heal_count'):
+                    info._stream_heal_count = 0
+                info._stream_heal_count += 1
+                logger.warning(
+                    "STREAM_HEAL_TRIGGER site=can_use_tool_transport_dead sid=%s "
+                    "tool=%s state=%s in_post_turn=%s listener_superseded=%s "
+                    "heal_count=%d",
+                    resolved_id, tool_name,
+                    getattr(info.state, 'value', info.state),
+                    getattr(info, '_in_post_turn', False),
+                    getattr(info, '_listener_superseded', False),
+                    info._stream_heal_count,
+                )
+                # Log a single user-visible message (only on first detection)
+                if info._stream_heal_count == 1:
+                    _heal_entry = LogEntry(
+                        kind="system",
+                        text="Connection lost \u2014 aborting turn, will reconnect and retry automatically",
+                        is_error=True,
+                    )
+                    with info._lock:
+                        info.entries.append(_heal_entry)
+                        _heal_idx = len(info.entries) - 1
+                    manager._emit_entry(resolved_id, _heal_entry, _heal_idx)
+                return manager._sdk.make_permission_result_deny(
+                    message="Transport disconnected — reconnecting",
+                    interrupt=True,
+                )
+
+            # ── AskUserQuestion redirect ──
+            # VibeNode has no interactive question UI, so this tool is a dead end
+            # however it resolves: auto-approving it returns an empty "answered"
+            # result that silently ends the turn, and prompting for it shows the
+            # user an unanswerable allow/deny dialog.  Instead, DENY without
+            # interrupt — the message below is fed back to the model as the tool
+            # result, telling it to decide HOW questions itself and to answer
+            # WHAT questions with a plain prose message (options + recommendation)
+            # rather than blocking.  This runs BEFORE every auto-approval path so
+            # the policy ("auto", "almost_always", etc.) can't let the question
+            # through.  See the module-level ASK_USER_QUESTION_REDIRECT_MESSAGE
+            # for the full rationale.
+            if INTERCEPT_ASK_USER_QUESTION and tool_name == ASK_USER_QUESTION_TOOL_NAME:
+                logger.info(
+                    "AskUserQuestion intercepted for %s — redirecting model to "
+                    "proceed instead of blocking on an unanswerable question",
+                    resolved_id,
+                )
+                # Surface the intercept in the session timeline so the user can
+                # see a question was raised (and where to look for it at the end
+                # of the response).  Must never break the permission flow.
+                try:
+                    _aq_entry = LogEntry(
+                        kind="permission",
+                        text=(
+                            "AskUserQuestion intercepted — VibeNode doesn't ask "
+                            "mid-task questions. The agent was told to decide "
+                            "implementation details itself (any reversible "
+                            "choice) and, if the question was about what to do "
+                            "rather than how, to reply with the options and its "
+                            "recommendation in a normal message."
+                        ),
+                        name=tool_name,
+                        is_error=False,
+                    )
+                    with info._lock:
+                        info.entries.append(_aq_entry)
+                        _aq_idx = len(info.entries) - 1
+                    manager._emit_entry(resolved_id, _aq_entry, _aq_idx)
+                except Exception as _aq_log_err:
+                    logger.warning(
+                        "Failed to log AskUserQuestion intercept: %s", _aq_log_err
+                    )
+                return manager._sdk.make_permission_result_deny(
+                    message=ASK_USER_QUESTION_REDIRECT_MESSAGE,
+                    interrupt=False,
+                )
+
+            # ── CRITICAL: make_permission_result_allow always includes tool_input ──
+            # The CLI 2.x expects updatedInput to be the full tool input dict.
+            # Sending None/null crashes the CLI sandbox validator with:
+            #   "undefined is not an object (evaluating 'H.includes')"
+            # See sdk_transport_adapter.py module docstring for full explanation.
+            # ─────────────────────────────────────────────────────────────────
+
+            # Auto-approve if user previously clicked "Always" for this tool
+            if tool_name in info.always_allowed_tools:
+                manager._log_auto_approved(
+                    resolved_id, info, tool_name, tool_input, "always-allow"
+                )
+                return manager._sdk.make_permission_result_allow(
+                    tool_input if isinstance(tool_input, dict) else {}
+                )
+
+            # "Almost Always" — auto-approve unless the command looks dangerous
+            # or the write targets a protected file (cwd lets the check also
+            # catch writes that land outside this session's project tree).
+            if tool_name in info.almost_always_allowed_tools:
+                if manager._is_dangerous(tool_name, tool_input, cwd=info.cwd):
+                    logger.warning(
+                        "Almost-always BLOCKED dangerous %s: %s",
+                        tool_name,
+                        (tool_input.get("command", "") if isinstance(tool_input, dict) else ""),
+                    )
+                    manager._log_auto_approved(
+                        resolved_id, info, tool_name, tool_input,
+                        "almost-always-blocked"
+                    )
+                    # Fall through to manual prompt below
+                else:
+                    manager._log_auto_approved(
+                        resolved_id, info, tool_name, tool_input, "almost-always"
+                    )
+                    return manager._sdk.make_permission_result_allow(
+                        tool_input if isinstance(tool_input, dict) else {}
+                    )
+
+            # "Claude Auto" never stops to ask.  A destructive action is
+            # rejected outright and the model is told to find a safer way —
+            # deny WITHOUT interrupt, so the message becomes the tool result
+            # and the turn continues.  Runs after the per-session "Always"
+            # grants above (an explicit user choice still wins) and before
+            # the auto-approve check below.
+            _ti = tool_input if isinstance(tool_input, dict) else {}
+            if manager._pm.should_auto_deny(tool_name, _ti, cwd=info.cwd):
+                logger.info("Claude Auto denied dangerous %s for %s",
+                            tool_name, resolved_id)
+                manager._log_auto_approved(
+                    resolved_id, info, tool_name, tool_input, "claude-auto-denied"
+                )
+                return manager._sdk.make_permission_result_deny(
+                    message=manager._pm.CLAUDE_AUTO_DENY_MESSAGE,
+                    interrupt=False,
+                )
+
+            # Server-side policy check -- resolve without browser round-trip
+            if manager._should_auto_approve(tool_name, tool_input if isinstance(tool_input, dict) else {},
+                                            cwd=info.cwd):
+                logger.debug("Auto-approved %s via server policy", tool_name)
+                manager._log_auto_approved(
+                    resolved_id, info, tool_name, tool_input, "server-policy"
+                )
+                return manager._sdk.make_permission_result_allow(
+                    tool_input if isinstance(tool_input, dict) else {}
+                )
+
+            # Use threading.Event (fully thread-safe) with anyio.sleep polling.
+            # anyio.Event + call_soon_threadsafe doesn't reliably wake the waiter.
+            perm_event = threading.Event()
+            perm_result_holder = [None]  # [0] = (PermissionResult, always, almost_always)
+            info.pending_permission = (perm_event, perm_result_holder)
+            info.pending_tool_name = tool_name
+            info.pending_tool_input = tool_input if isinstance(tool_input, dict) else {}
+            info._pending_since = time.time()
+
+            # Set state to WAITING
+            prev_state = info.state
+            info.state = SessionState.WAITING
+            # Write-through (SessionDurable): a restart must know a prompt
+            # was open.
+            manager._durable_save(info)
+
+            # Emit permission via push_callback.
+            # Use resolved_id so the frontend matches the current session key.
+            perm_data = {
+                'session_id': resolved_id,
+                'tool_name': tool_name,
+                'tool_input': info.pending_tool_input,
+            }
+            state_data = info.to_state_dict()
+            _push = manager._push_callback
+            if _push:
+                _push('session_state', state_data)
+                _push('session_permission', perm_data)
+
+            try:
+                # Poll threading.Event. Use anyio.sleep to yield to scheduler.
+                # If that doesn't work, fall back to asyncio.sleep.
+                for _poll_i in range(36000):  # 1 hour max
+                    if perm_event.is_set():
+                        break
+                    # Early bail: if client disconnected while we're waiting
+                    # for permission, auto-allow so the tool runs instead of
+                    # failing with "Stream closed".
+                    if not info.client:
+                        logger.warning(
+                            "Permission poll: client gone for %s — "
+                            "auto-allowing %s to avoid Stream closed",
+                            resolved_id, tool_name,
+                        )
+                        info.pending_permission = None
+                        info.pending_tool_name = ""
+                        info.pending_tool_input = {}
+                        info.state = SessionState.WORKING
+                        manager._emit_state(info)
+                        return manager._sdk.make_permission_result_allow(
+                            tool_input if isinstance(tool_input, dict) else {}
+                        )
+                    try:
+                        await anyio.sleep(0.1)
+                    except Exception:
+                        await asyncio.sleep(0.1)
+
+                result_tuple = perm_result_holder[0]
+                if result_tuple is None:
+                    result_tuple = (manager._sdk.make_permission_result_deny(message="No result"), False, False)
+                # Support both 2-tuple (legacy) and 3-tuple
+                if len(result_tuple) == 2:
+                    permission_result, always = result_tuple
+                    almost_always = False
+                else:
+                    permission_result, always, almost_always = result_tuple
+
+                # Remember "Always Allow" for this tool for the rest of the session
+                if isinstance(permission_result, PermissionResult) and permission_result.action == PermissionAction.ALLOW:
+                    if always:
+                        info.always_allowed_tools.add(tool_name)
+                    elif almost_always:
+                        info.almost_always_allowed_tools.add(tool_name)
+
+                # Clean up permission state
+                info.pending_permission = None
+                info.pending_tool_name = ""
+                info.pending_tool_input = {}
+                # Write-through (SessionDurable): the answered prompt and any
+                # new "Always" grant.
+                manager._durable_save(info)
+
+                # Back to working — but NOT if this was an interrupt.
+                # The interrupt handler already set state to IDLE; emitting
+                # WORKING here would race with it and flip the UI back.
+                is_interrupt = (
+                    isinstance(permission_result, PermissionResult)
+                    and permission_result.action == PermissionAction.DENY
+                    and permission_result.interrupt
+                )
+                if not is_interrupt:
+                    info.state = SessionState.WORKING
+                    manager._emit_state(info)
+
+                return permission_result
+
+            except BaseException:
+                # Handles cancellation (anyio uses BaseException subclasses)
+                info.pending_permission = None
+                info.pending_tool_name = ""
+                info.pending_tool_input = {}
+                info.state = prev_state
+                manager._emit_state(info)
+                return manager._sdk.make_permission_result_deny(
+                    message="Permission request cancelled", interrupt=True
+                )
+
+        return can_use_tool
+
+    # ------------------------------------------------------------------
+    # Message processing
+    # ------------------------------------------------------------------
+
+    async def _process_message(self, session_id: str, message: VibeNodeMessage) -> None:
+        """Convert a VibeNodeMessage into log entries and emit them.
+
+        All SDK-specific isinstance() checks have been replaced with
+        message.kind and block dict lookups.  The normalization from raw
+        SDK types to VibeNodeMessage happens in AgentSDK.receive_response().
+
+        Session-id resolution: the caller may hold a stale (pre-remap)
+        ID — most notably the post-turn listener, which is launched from
+        ``_drive_session`` BEFORE the first turn's RESULT triggers the
+        SDK-assigned-id remap.  Without resolving here, every subsequent
+        ``_process_message`` call from the listener looks up an alias
+        that no longer exists in ``_sessions``, finds ``None``, and
+        returns silently — the wake-up's RESULT never sets
+        ``state=IDLE``, the queued message stays stranded, and the
+        session looks frozen.  Resolving via ``_resolve_id`` is cheap
+        (dict lookup) and the only correct fix.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return
+
+        if message.kind == MessageKind.ASSISTANT:
+            # First-content-of-new-post-compact-turn clears the
+            # "compacting" substatus.  Init alone is too early — the SDK
+            # announces a new context but the agent then takes several
+            # seconds to rebuild and start responding, during which the
+            # user would see "Working…" while perceptually compaction
+            # is still in progress.  Holding "compacting" through init
+            # and clearing here gives the user an honest indicator that
+            # spans the full perceived-compaction window.
+            #
+            # Guarded by _post_compact_init_seen so an ASSISTANT that
+            # arrives BETWEEN compact_boundary and init (late-streaming
+            # pre-compact content) doesn't strip the substatus prematurely.
+            if (info.substatus == 'compacting'
+                    and getattr(info, '_post_compact_init_seen', False)):
+                info.substatus = ""
+                info._post_compact_init_seen = False
+                self._emit_state(info)
+            info._turn_content_started = True
+            for block in message.blocks:
+                bk = block.get("kind", "")
+
+                if bk == BlockKind.TEXT.value:
+                    _asst_text = (block.get("text", "") or "")[:50000]
+
+                    # Detect the Anthropic "modified thinking block" 400 and
+                    # flag the session for reconnect + auto-retry.  The CLI
+                    # surfaces this API error as assistant text (no transport
+                    # exception is raised), so without this the session goes
+                    # IDLE with the raw error shown and EVERY subsequent send
+                    # replays the same poisoned history and fails identically.
+                    #
+                    # We reuse the existing stream-heal machinery (mirrors the
+                    # "Stream closed" tool_result branch below): the finally
+                    # block reconnects via _reconnect_client — which runs
+                    # repair_incomplete_turn to strip the tampered thinking
+                    # blocks from the JSONL — then re-reads the cleaned
+                    # transcript and resends the last user message.  The
+                    # heal_count <= 3 guard bounds the retries.
+                    if _is_thinking_block_modified_error(_asst_text):
+                        # The CLI's in-memory transcript is poisoned with
+                        # empty-but-signed thinking blocks; the API rejected
+                        # this turn and the CLI surfaced the 400 as plain
+                        # assistant text (no transport exception).  Every
+                        # follow-up send replays the same bad in-memory
+                        # history and 400s identically until we tear down
+                        # the CLI and replay the (healed) on-disk transcript.
+                        if not hasattr(info, '_stream_heal_count'):
+                            info._stream_heal_count = 0
+                        info._stream_heal_count += 1
+                        logger.warning(
+                            "STREAM_HEAL_TRIGGER site=asst_thinking_block_400 "
+                            "sid=%s state=%s heal_count=%d snippet=%r "
+                            "— in-place heal+retry",
+                            session_id,
+                            getattr(info.state, 'value', info.state),
+                            info._stream_heal_count, _asst_text[:200],
+                        )
+                        # 1) Heal the on-disk JSONL so --resume replays a
+                        #    clean transcript.  Synchronous: the 400 already
+                        #    cost a full RTT — a few ms of file I/O is
+                        #    invisible to the user.
+                        try:
+                            self._store.repair_incomplete_turn(
+                                self._resolve_id(session_id), cwd=info.cwd or ""
+                            )
+                        except Exception as _rep_err:
+                            logger.warning(
+                                "thinking-400 disk heal failed for %s: %s",
+                                session_id, _rep_err,
+                            )
+
+                        # 2) Find the user message we need to re-send.
+                        last_user_text = None
+                        with info._lock:
+                            for e in reversed(info.entries):
+                                if e.kind == "user" and not getattr(e, "restored", False):
+                                    last_user_text = e.text
+                                    break
+
+                        # 3) User-visible status — replaces the raw API error.
+                        entry = LogEntry(
+                            kind="system",
+                            text="Recovering from interrupted-response error "
+                                 "— retrying your message…",
+                        )
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+
+                        # 4) Detach the poisoned client and force state to
+                        #    IDLE *before* the retry so send_message takes the
+                        #    fast path (immediate dispatch) instead of the
+                        #    queue path (which only drains after the current
+                        #    task fully unwinds — observed delay 80+ seconds).
+                        #    _interrupted=True + _superseded=True make the
+                        #    current _send_query's finally bail without
+                        #    re-touching state.  send_message itself re-clears
+                        #    _interrupted on the retry path so it's transient.
+                        _doomed = info.client
+                        info.client = None
+                        info.state = SessionState.IDLE
+                        info._interrupted = True
+                        info._listener_superseded = True
+                        # Dispose the poisoned CLI subprocess in the background;
+                        # don't await on the same loop tick we're reading from.
+                        if _doomed is not None:
+                            async def _kill_poisoned_client(c):
+                                try:
+                                    await self._sdk.disconnect(c)
+                                except Exception:
+                                    pass
+                            asyncio.create_task(_kill_poisoned_client(_doomed))
+
+                        # 5) Bounded auto-retry.  Schedule on the loop so
+                        #    locking + state semantics behave exactly like a
+                        #    fresh user send.  send_message will see state=IDLE
+                        #    and dispatch immediately; _send_query will see
+                        #    client=None and reconnect.  The whole round-trip
+                        #    is typically <5 s vs. the prior 80+ s queue path.
+                        if info._stream_heal_count <= 3 and last_user_text:
+                            self._loop.call_soon_threadsafe(
+                                lambda txt=last_user_text:
+                                    self.send_message(
+                                        session_id, txt, _self_heal=True
+                                    )
+                            )
+                        elif info._stream_heal_count > 3:
+                            # Persistent failure — surface to user, stop spinning.
+                            entry = LogEntry(
+                                kind="system",
+                                text="Repeated interrupted-response errors — "
+                                     "please resend your message manually.",
+                                is_error=True,
+                            )
+                            with info._lock:
+                                info.entries.append(entry)
+                                entry_index = len(info.entries) - 1
+                            self._emit_entry(session_id, entry, entry_index)
+                        # Skip rendering the raw API error as an assistant
+                        # bubble — the system entry above explains it and the
+                        # retry supersedes it.
+                        continue
+
+                    entry = LogEntry(kind="asst", text=_asst_text)
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
+
+                elif bk == BlockKind.TOOL_USE.value:
+                    inp = block.get("input", {})
+                    if not isinstance(inp, dict):
+                        inp = {}
+                    desc = self._extract_tool_desc(inp)
+                    entry = LogEntry(
+                        kind="tool_use",
+                        name=block.get("name", "") or "",
+                        desc=desc,
+                        id=block.get("id", "") or "",
+                    )
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
+
+                    # Track file modifications for rewind/snapshot support
+                    tool_name = entry.name
+                    logger.info("Tool use: %s (input keys: %s)", tool_name, list(inp.keys())[:5])
+                    if tool_name in ('Edit', 'Write', 'MultiEdit', 'NotebookEdit'):
+                        fp = inp.get('file_path', '') or inp.get('path', '')
+                        logger.info("  File tracking: tool=%s fp=%s", tool_name, fp[:80] if fp else "(empty)")
+                        if fp:
+                            self._touch_tracked_file(info, fp)
+                            info._turn_had_direct_edit = True
+                            logger.info("  tracked_files now has %d entries", len(info.tracked_files))
+
+                    # Wake-up detection: tools that schedule a deferred SDK
+                    # auto-resume cycle (e.g. ScheduleWakeup, Bash with
+                    # run_in_background=True).  When the agent uses one of
+                    # these, the SDK keeps the session alive past the
+                    # turn's RESULT and later injects a synthetic turn
+                    # (init -> content -> RESULT).  We flag the session
+                    # so the post-turn listener can suppress queue
+                    # auto-dispatch — otherwise a queued message races
+                    # the wake-up content for the SDK buffer and the
+                    # session ends up "broken" (queue dispatch fires on
+                    # the wake-up's init IDLE-emit, cancels the listener,
+                    # sends a new query that reads the wake-up's
+                    # remaining content as its own response).
+                    #
+                    # Set, never cleared here — cleared on user-driven
+                    # turn start (_send_query / _drive_session) and on
+                    # auto-resume turn start (_enter_auto_resume).  This
+                    # also catches sub-agent (Task) tool uses naturally
+                    # because the SDK normalizes sub-agent messages as
+                    # AssistantMessage just like parent-agent messages.
+                    if self._tool_creates_wakeup(tool_name, inp):
+                        info._wakeup_pending = True
+                        # Only a real ScheduleWakeup earns the "Awaiting
+                        # wake-up…" label.  A background Bash gates the queue
+                        # for race-safety but must not claim a timer exists.
+                        if self._is_scheduled_wakeup(tool_name):
+                            info._wakeup_is_scheduled = True
+                        # Track the longest expected wake delay this turn so
+                        # the RESULT branch can set a realistic phantom-
+                        # wake-up deadline (see _wakeup_queue_watchdog).
+                        info._wakeup_max_delay = max(
+                            info._wakeup_max_delay,
+                            self._wakeup_expected_delay(tool_name, inp),
+                        )
+                        # NOTE: we do NOT set substatus here, even though
+                        # earlier versions did.  Setting it during the turn
+                        # made the working bar say "Awaiting wake-up…" while
+                        # the agent was still actively running tools after
+                        # the schedule call.
+                        # The substatus is applied AT RESULT (in the RESULT
+                        # branch below) once the turn actually ends and the
+                        # session is truly idle-waiting-for-wake-up.
+                        logger.info("Wake-up pending flagged for %s (tool=%s)",
+                                    session_id[:12], tool_name)
+
+                    # Silent-wait backstop input (HealthMonitor job 5): this
+                    # task launched work that outlives the turn, so if the
+                    # session later idles "waiting" on it, the watchdog checks
+                    # whether anything is actually still alive.  Timestamp only.
+                    if self._tool_launches_background(tool_name, inp):
+                        info._bg_work_at = time.time()
+
+                elif bk == BlockKind.THINKING.value:
+                    # Skip thinking blocks -- they're internal reasoning
+                    pass
+
+        elif message.kind == MessageKind.USER:
+            # Sub-agent detection: VibeNodeMessage.is_sub_agent is set by
+            # the normalization layer based on parent_tool_use_id.
+            is_sub_agent = message.is_sub_agent
+
+            # Blocks are already normalized to dicts by receive_response().
+            for block in message.blocks:
+                bk = block.get("kind", "")
+
+                if bk == BlockKind.TOOL_RESULT.value:
+                    rt = (block.get("text", "") or "")[:20000]
+                    is_err = bool(block.get("is_error", False))
+
+                    # Detect "Stream closed" permission failures and flag session
+                    # for auto-retry after the current turn ends.  The turn will
+                    # finish (ResultMessage), then _send_query / _drive_session
+                    # will reconnect the client and resend the last user message
+                    # so the failed tools actually execute.
+                    #
+                    # Match both the bare "Stream closed" string AND the CLI's
+                    # control-channel error "Tool permission request failed:
+                    # Error: Stream closed" — the latter is what the Node CLI
+                    # writes to the JSONL when its permission-request stream is
+                    # broken but the main stdout stream is still alive, which
+                    # produces 10+ failed tool calls in a single turn without
+                    # any of the existing transport-death detectors firing.
+                    if is_err and ("Stream closed" in rt
+                                   or "Tool permission request failed" in rt):
+                        if not hasattr(info, '_stream_heal_count'):
+                            info._stream_heal_count = 0
+                        info._stream_heal_count += 1
+                        info._stream_heal_needed = True
+                        logger.warning(
+                            "STREAM_HEAL_TRIGGER site=tool_result_stream_closed sid=%s "
+                            "state=%s in_post_turn=%s listener_superseded=%s "
+                            "heal_count=%d tool_result_snippet=%r",
+                            session_id,
+                            getattr(info.state, 'value', info.state),
+                            getattr(info, '_in_post_turn', False),
+                            getattr(info, '_listener_superseded', False),
+                            info._stream_heal_count, rt[:200],
+                        )
+                        # Show the user what's happening (not an error, a status)
+                        entry = LogEntry(
+                            kind="system",
+                            text="Stream error detected — will auto-reconnect and retry",
+                        )
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        # Still emit the original error for transparency but
+                        # continue processing — the retry will happen after the
+                        # turn ends.
+
+                    entry = LogEntry(
+                        kind="tool_result",
+                        text=rt,
+                        tool_use_id=block.get("tool_use_id", "") or "",
+                        is_error=is_err,
+                    )
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
+
+                elif bk == BlockKind.TEXT.value:
+                    user_text = (block.get("text", "") or "")[:20000]
+
+                    # Skip internal/sub-agent user messages — they're not
+                    # from the human and shouldn't show as user bubbles
+                    if is_sub_agent:
+                        logger.debug("Skipping sub-agent user text (parent_tool_use_id set)")
+                        continue
+
+                    # Skip slash commands echoed back by CLI (e.g. /compact)
+                    stripped = user_text.strip()
+                    if stripped.startswith('/') and ' ' not in stripped:
+                        logger.debug("Skipping CLI slash command echo: %s", stripped[:50])
+                        continue
+
+                    # Smart termination send-back: drawn as a card in the chat
+                    # (live-panel.js), never as a bubble the user seems to
+                    # have typed.  Checked before the generic system markers,
+                    # which also list it.
+                    from shared.transcripts import sent_back_entry as _sent_back
+                    _sb = _sent_back(stripped)
+                    if _sb:
+                        entry = LogEntry(kind=_sb["kind"], text=_sb["text"],
+                                         name=_sb["name"], desc=_sb["desc"])
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        continue
+
+                    # Detect SDK-injected system content (continuation
+                    # summaries, local-command output, system-reminders).
+                    # Render as collapsed system entry, not user bubble.
+                    if _is_system_content(stripped, self._BACKEND.system_markers):
+                        logger.debug("Rendering SDK system content as system entry (len=%d)", len(stripped))
+                        # Extract a short human-readable label
+                        label = _system_content_label(stripped)
+                        # Deduplicate: don't emit if an identical system entry
+                        # already exists in the tail (e.g. _interrupt_session
+                        # already added "Session interrupted by user").
+                        with info._lock:
+                            already = any(
+                                getattr(e, 'text', '') == label
+                                for e in info.entries[-3:]
+                            ) if info.entries else False
+                        if already:
+                            continue
+                        entry = LogEntry(kind="system", text=label)
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        continue
+
+                    # Never emit user text entries — they're already shown:
+                    # - Initial prompt: added by _drive_session
+                    # - Follow-ups: added by send_message
+                    # - Frontend: shows optimistic bubble immediately
+                    # Just add to history for get_session_log, don't emit
+                    with info._lock:
+                        # Only add if not a duplicate of the last user entry
+                        last_user = None
+                        for e in reversed(info.entries):
+                            if e.kind == "user":
+                                last_user = e
+                                break
+                        if not last_user or last_user.text.strip() != stripped:
+                            # The CLI does not echo what the engine sends it
+                            # (no --replay-user-messages), so user text that
+                            # arrives here was put in by the CLI itself: a
+                            # background job's notice, a wake-up the session
+                            # scheduled.  Mark who sent it, so the chat and
+                            # Smart termination never take it for the owner.
+                            # A text close to one of the owner's recent messages is
+                            # left unmarked, in case a CLI ever echoes.
+                            from shared.transcripts import automated_source as _auto_src
+                            _head = stripped[:200]
+                            _his_recent = any(
+                                e.kind == "user" and not e.auto and (
+                                    e.text.strip().startswith(_head) or stripped.startswith(e.text.strip()[:200]))
+                                for e in info.entries[-8:] if (e.text or "").strip())
+                            _auto = _auto_src(stripped) or ("" if _his_recent else "Scheduled check-in")
+                            info.entries.append(LogEntry(kind="user", text=user_text, auto=_auto))
+
+        elif message.kind == MessageKind.SYSTEM:
+            subtype = message.subtype or ""
+            data = message.data or {}
+            logger.info("SystemMessage subtype=%s keys=%s", subtype, list(data.keys())[:10])
+
+            # Silent-wait backstop input (HealthMonitor job 5): a CLI
+            # background-task lifecycle event proves background work exists
+            # for this task, and (task_progress fires per tool use of a
+            # running agent) doubles as a liveness heartbeat.
+            if subtype in self._TASK_EVENT_SUBTYPES:
+                info._bg_work_at = time.time()
+
+            # Detect compaction events — CLI sends "compact_boundary" subtype
+            if subtype == self._BACKEND.compaction_marker:
+                # Guard against stale SDK-buffered compact_boundary messages.
+                # The SDK delivers compact_boundary AFTER ResultMessage, so it
+                # stays in the internal MemoryObjectStream buffer and gets
+                # picked up at the START of the next turn before any content.
+                # A legitimate compact_boundary always arrives either:
+                #   (a) after some assistant content (auto-compact mid-task), or
+                #   (b) at the start of a /compact turn (substatus already set).
+                # If neither is true, this is a stale leftover — discard it.
+                if not info._turn_content_started and info.substatus != 'compacting':
+                    logger.info("Discarding stale compaction marker for %s (buffered from prior turn)", session_id)
+                    return
+                compact_meta = data.get('compactMetadata', {})
+                pre_tokens = compact_meta.get('preTokens', 0)
+                trigger = compact_meta.get('trigger', 'auto')
+                logger.info("Compact boundary: trigger=%s preTokens=%d", trigger, pre_tokens)
+
+                # Set WORKING so _emit_state won't auto-clear the substatus
+                # (the substatus-clear guard fires on IDLE/STOPPED only).
+                # This covers both mid-turn and post-turn (deferred IDLE) cases.
+                info.state = SessionState.WORKING
+                info.substatus = "compacting"
+                # Reset the "saw post-compact init" flag — the substatus must
+                # survive the upcoming init and only clear when the agent
+                # produces actual new-turn content.  See _post_compact_init_seen
+                # field docstring and the init / ASSISTANT branches below.
+                info._post_compact_init_seen = False
+                # Store pre-compaction token count for UI display
+                if pre_tokens:
+                    info.usage['pre_compact_tokens'] = pre_tokens
+                self._emit_state(info)
+
+                # Human-readable log entry
+                tk_str = f"{pre_tokens // 1000}k" if pre_tokens >= 1000 else str(pre_tokens)
+                label = f"Compacting context ({tk_str} tokens, {trigger})…"
+                entry = LogEntry(kind="system", text=label)
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+
+            elif subtype == 'turn_duration':
+                # Per-turn timing info — log but don't emit to UI
+                logger.info("Turn duration for %s: %s", session_id,
+                            {k: v for k, v in data.items() if k != 'type'})
+
+            elif subtype == 'init':
+                # Record the resolved model ID so /api/models always knows
+                # which models this installation has actually used.
+                resolved_model = data.get("model", "")
+                if resolved_model and resolved_model.startswith("claude-"):
+                    # Init message is the CLI's ground truth for the resolved
+                    # model id — funnel it through the single sink.  When it
+                    # actually CHANGES the mirror (a resume that pinned a new
+                    # model, a live switch resolving to a dated/[1m] id, or a
+                    # CLI default that differs from what we recorded), tell
+                    # every client and persist it: the badge on other devices
+                    # otherwise waits for the next state transition, and the
+                    # registry seed for the next bare wake would be stale.
+                    # ``changed`` is False on a steady-state turn, so this
+                    # costs nothing on the hot path.
+                    if self._set_confirmed_model(info, resolved_model,
+                                                 save_registry=True):
+                        self._broadcast_model_changed(
+                            session_id, info, info.model)
+
+                # Adopt the CLI's real session id the instant it announces it,
+                # not only when a turn completes.  A first turn that crashes
+                # before RESULT otherwise strands our launch id as a fileless
+                # phantom "working" row (see _remap_session_id).  Done AFTER the
+                # model broadcast above so that still emits under the launch id
+                # the client currently knows (historical order).  Idempotent,
+                # so the later RESULT re-firing this is harmless.
+                self._remap_session_id(session_id, data.get("session_id"), info)
+
+                # End of the SDK's compaction phase (or session re-init).
+                # Substatus handling is subtle — the UI's "Compacting…" label
+                # must span the *perceived* compaction time, not just the
+                # SDK's brief compact_boundary→init window.
+                #
+                # Preserve:
+                #  * "auto-resuming" — init also fires at the start of an
+                #    SDK auto-resume turn (after a background-task or
+                #    ScheduleWakeup notification); stripping it here would
+                #    flicker the UI back to "Working…" the moment the
+                #    wake-up's init lands.
+                #  * "compacting" — mark _post_compact_init_seen so the next
+                #    ASSISTANT block clears it.  Without this, init clears
+                #    "compacting" the moment the SDK announces the new
+                #    context, but the agent then takes several seconds to
+                #    rebuild and respond — the user sees "Compacting…"
+                #    flash and then "Working…" while compaction is
+                #    perceptually still in progress.  Holding the substatus
+                #    through init keeps the label honest.
+                was_compacting = info.substatus == 'compacting'
+                # Clear substatus on init unconditionally.  ``init`` is the
+                # SDK's signal that compaction has FINISHED (new context is
+                # ready) — keeping "Compacting…" visible through the
+                # agent's post-init context-rebuild period was stale and
+                # left the label on after compacting had finished.  Same
+                # principle as the wake-up fix in _enter_auto_resume:
+                # once the state machine has moved past the event the
+                # substatus was describing, the label stops being honest.
+                # For non-compacting inits (fresh session, post-wake-up
+                # init after _enter_auto_resume already cleared upstream)
+                # this is a no-op.  The ASSISTANT-handler clearing branch
+                # at the top of the ASSISTANT case below is left in place
+                # as a defensive backstop.
+                info.substatus = ""
+                info._post_compact_init_seen = False
+                # Restore IDLE only if we're in post-turn context
+                # (_awaiting_compact_drain=True means RESULT already came
+                # and we're draining the buffer — safe to go IDLE now).
+                # Mid-turn compaction must NOT set IDLE here — the session
+                # is still generating a response and will reach RESULT
+                # normally.
+                if was_compacting and info._awaiting_compact_drain:
+                    info.state = SessionState.IDLE
+                self._emit_state(info)
+                if was_compacting:
+                    entry = LogEntry(kind="system", text="Context compacted")
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
+            else:
+                # Forward any other system message as a push event for debugging
+                if self._push_callback:
+                    self._push_callback('system_message', {
+                        'session_id': session_id,
+                        'subtype': subtype,
+                        'data': data,
+                    })
+
+        elif message.kind == MessageKind.RESULT:
+            # Clear stale substatus on result (compaction is done if it was
+            # in progress).  Then apply the sleeping substatus IFF the turn
+            # scheduled a wake-up: we set it HERE at RESULT (not earlier in
+            # the tool_use handler) so the working bar shows "Working…"
+            # during the trailing portion of the turn instead of jumping
+            # prematurely to "Awaiting wake-up…".
+            if info.substatus and not (
+                info.substatus == "auto-resuming"
+                and getattr(info, '_wakeup_pending', False)
+            ):
+                info.substatus = ""
+
+            # Apply the sleeping-substatus NOW that the turn has truly
+            # ended.  _emit_state's auto-clear has an exception that
+            # preserves "auto-resuming" through the post-turn IDLE window
+            # while _wakeup_pending is True.  When the wake-up fires and
+            # _enter_auto_resume clears _wakeup_pending=False, the next
+            # IDLE emit's auto-clear sweeps the substatus normally.
+            if getattr(info, '_wakeup_pending', False):
+                # Show "Awaiting wake-up…" ONLY for a real scheduled wake-up
+                # (ScheduleWakeup).  A background Bash is not a timer — it
+                # resumes if/when its process exits, maybe never — so we keep
+                # the session as plain Idle and never promise a wake-up that
+                # doesn't exist.  The queue stays briefly gated either way
+                # (race-safety), bounded by the starvation watchdog.
+                if getattr(info, '_wakeup_is_scheduled', False):
+                    info.substatus = "auto-resuming"
+                # Arm the phantom-wake-up deadline: the moment by which this
+                # wake-up MUST fire or the watchdog gives up and clears the
+                # awaiting state / reopens the gate.  Use the longest expected
+                # delay seen this turn (exact for ScheduleWakeup, a bounded
+                # ceiling for background Bash) plus delivery grace.  This is
+                # what makes an indefinitely-hung "Awaiting wake-up…"
+                # impossible.
+                _base_delay = (
+                    info._wakeup_max_delay
+                    if info._wakeup_max_delay > 0
+                    else self._WAKEUP_UNKNOWN_DELAY_WAIT
+                )
+                info._wakeup_deadline = (
+                    time.time() + _base_delay + self._WAKEUP_DEADLINE_GRACE
+                )
+            else:
+                info._wakeup_deadline = 0.0
+            # Reset the per-turn accumulator for the next turn.
+            info._wakeup_max_delay = 0.0
+
+            info.cost_usd = message.cost_usd or 0.0
+
+            # Extract token usage from ResultMessage.
+            # ResultMessage.usage is cumulative across the session — if we have
+            # per-call data from a message_start StreamEvent, keep it.
+            raw_usage = message.usage
+            if raw_usage and isinstance(raw_usage, dict):
+                prev_pct = info.usage.get('pre_compact_tokens')
+                if not info.usage.get('_per_call'):
+                    info.usage = dict(raw_usage)
+                if prev_pct and 'pre_compact_tokens' not in info.usage:
+                    info.usage['pre_compact_tokens'] = prev_pct
+                logger.info("Usage for %s: %s (per_call=%s)", session_id,
+                            {k: v for k, v in raw_usage.items() if isinstance(v, (int, float))},
+                            bool(info.usage.get('_per_call')))
+
+            # Extract session timing metadata
+            duration_ms = message.duration_ms or 0
+            num_turns = message.num_turns or 0
+            if duration_ms or num_turns:
+                info.usage['duration_ms'] = duration_ms
+                info.usage['num_turns'] = num_turns
+
+            # The session has now produced a RESULT — by this point the SDK id
+            # has been remapped to a real resumable UUID.  A transport crash from
+            # here on can --resume; a crash BEFORE this cannot (see escalation).
+            info._ever_got_result = True
+
+            is_error = message.is_error
+            if is_error:
+                # Classify the error to decide whether an automatic retry is
+                # worthwhile.  Transient failures (overload/429/529/5xx/network)
+                # are resent on an exponential backoff; permanent ones
+                # (max-turns, invalid request, auth) surface the error and a
+                # manual Retry button instead.  See _classify_result_error.
+                #
+                # We only FLAG the retry here (info._api_retry_needed); the
+                # actual backoff timer is armed in the drive-loop finally block
+                # once turn state has fully settled — mirroring how
+                # _stream_heal_needed is handled.
+                _result_text = ""
+                try:
+                    _result_text = (message.data or {}).get('result', '') or ''
+                except Exception:
+                    _result_text = ""
+                _err_class = self._classify_result_error(message.subtype, _result_text)
+                # SELF-REPORTING MISS DETECTOR.  The usage-limit patterns are
+                # derived from the CLI binary's strings, but the CLI rewords
+                # this copy between releases.  If an error mentions a quota yet
+                # did NOT classify as one, say so loudly with the raw text — a
+                # missed limit silently degrades to a useless backoff, and
+                # without this line the only way to find out is a user noticing
+                # "Auto-retrying" where the model-switch CTA should have been.
+                if _err_class != "usage_limit" and _result_text:
+                    if self._LIMIT_NOUN_RE.search(_result_text):
+                        logger.warning(
+                            "Possible UNRECOGNISED usage limit on %s — classified "
+                            "as %r. Raw result text: %r",
+                            session_id[:12], _err_class, _result_text[:500],
+                        )
+                # Never arm a retry if there's no user message to replay (e.g. a
+                # bare connect failure with an empty transcript).  Uses the
+                # trim-aware helper: a long autonomous turn trims the user's
+                # message out of memory, and the old inline scan then disabled
+                # every retry for exactly the sessions that most need one.
+                _has_user_msg = self._has_user_message(info)
+                _can_retry = (
+                    _err_class == "transient"
+                    and info._api_retry_count < self._API_RETRY_MAX
+                    and _has_user_msg
+                )
+                if _can_retry:
+                    info._api_retry_needed = True
+                    info.retry_reason = self._retry_reason_text(_result_text)
+                    info.error = ""  # not a dead-end — an auto-retry is coming
+                    # (The retry prompt — continue vs. re-send original — is
+                    # decided in _fire_api_retry from the transcript: whether the
+                    # failed turn produced any real assistant text yet.)
+                    entry = LogEntry(
+                        kind="system",
+                        text="Turn ended with a transient error (%s) — auto-retry scheduled…"
+                             % info.retry_reason,
+                        is_error=True,
+                    )
+                elif _err_class == "usage_limit":
+                    # Quota exhausted.  No backoff is armed (see
+                    # _apply_usage_limit); the UI turns limit_reset_at +
+                    # limited_model into a one-click model-switch CTA.  The
+                    # turn also continues by itself once the limit resets
+                    # (_schedule_limit_resume): the user should never have to
+                    # notice that the limit expired.
+                    self._apply_usage_limit(info, _result_text)
+                    _resume = self._schedule_limit_resume(info)
+                    logger.info(
+                        "Session %s hit a usage limit on %s (resets_at=%s, "
+                        "auto-continue=%s, switch_to=%s)",
+                        session_id, info.limited_model or "?",
+                        info.limit_reset_at or "unknown",
+                        time.strftime("%H:%M:%S", time.localtime(info._limit_resume_at))
+                        if _resume else "off",
+                        info.limit_switch_to or "-",
+                    )
+                    entry = LogEntry(kind="system", text=info.error, is_error=True)
+                else:
+                    info._api_retry_needed = False
+                    if (_err_class == "transient" and _has_user_msg
+                            and info._api_retry_count >= self._API_RETRY_MAX):
+                        # Transient, but we've exhausted the auto-retry budget.
+                        n = info._api_retry_count
+                        info.error = ("Auto-retry gave up after %d attempt%s — "
+                                      "use Retry to try again"
+                                      % (n, "" if n == 1 else "s"))
+                        _txt = ("Auto-retry gave up after %d attempt%s. "
+                                "Use Retry to try again." % (n, "" if n == 1 else "s"))
+                    else:
+                        info.error = "Session ended with error"
+                        _txt = "Session ended with error"
+                    entry = LogEntry(kind="system", text=_txt, is_error=True)
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+            else:
+                # Successful (non-error) turn — clear any accumulated auto-retry
+                # budget so a later, unrelated failure starts its backoff fresh.
+                if info._api_retry_count or info.retry_at or info._api_retry_needed:
+                    info._api_retry_needed = False
+                    info._api_retry_count = 0
+                    info.retry_at = 0.0
+                    info.retry_attempt = 0
+                    info.retry_max = 0
+                    info.retry_reason = ""
+                # A turn that completed proves the quota is no longer blocking
+                # this session (either it reset, or the user switched models),
+                # so the usage-limit CTA must retract with the error banner.
+                self._clear_usage_limit(info)
+                # A turn that completed successfully resolves any prior error
+                # banner.  info.error is otherwise cleared ONLY on a genuine new
+                # user message (send_message L786) — NOT on an auto-retry or
+                # manual-Retry resend (those skip that clear to preserve the
+                # accumulating attempt counter).  Without this, a successful
+                # RETRY would leave the stale "Session ended with error" /
+                # "Auto-retry gave up" banner + Retry button showing even though
+                # the session is now perfectly fine.
+                if info.error:
+                    info.error = ""
+
+            # Remap session ID if the SDK assigned a different one.  The init
+            # handler usually did this already (so a first-turn crash can't
+            # strand a phantom); this is the backstop for the no-init path.
+            self._remap_session_id(session_id, message.session_id, info)
+
+            # Don't clobber state if the listener has been superseded —
+            # ``send_message`` has flipped state to WORKING for a new
+            # query and we must not undo that.  This case fires when a
+            # late auto-resume RESULT was already in the SDK buffer at
+            # the moment the listener was cancelled; the listener's
+            # check #1 is supposed to drop it before _process_message
+            # runs, but defense in depth here covers the GIL race where
+            # Flask thread sets the flag between this listener thread's
+            # check and the state assignment.  We use info._lock so the
+            # check+assignment is atomic with ``send_message``'s lock-
+            # protected state flip.
+            with info._lock:
+                if not getattr(info, '_listener_superseded', False):
+                    info.state = SessionState.IDLE
+                # Defer the IDLE emit: compact_boundary may be buffered
+                # immediately after this ResultMessage (auto-compaction
+                # post-turn notification).  _post_turn_compact_drain()
+                # in _send_query/_drive_session will pick it up and emit
+                # WORKING+compacting instead; only if no compact_boundary
+                # is found does it fall through to emit IDLE normally.
+                info._awaiting_compact_drain = True
+
+        elif message.kind == MessageKind.STREAM_EVENT:
+            # Forward raw streaming events for partial message display
+            event_data = message.data or {}
+
+            # Extract per-call context usage.  This is the AUTHORITATIVE
+            # context window size, unlike ResultMessage.usage which is
+            # cumulative across the session.  Which event carries it, and
+            # the two payload shapes the SDK has used for it, are backend
+            # knowledge (ClaudeKnowledge.stream_usage).  Without both shapes
+            # normalized, per-call usage is silently never extracted: no session_usage push, no context reading in the UI.
+            parsed = self._BACKEND.stream_usage(event_data)
+            evt_type, evt_data = parsed["type"], parsed["payload"]
+            # Log first StreamEvent per session for diagnostics (shape of event/data)
+            if not getattr(info, '_stream_evt_logged', False):
+                logger.info("StreamEvent for %s: event_type=%r data_type=%s data_keys=%s",
+                            session_id, evt_type,
+                            type(evt_data).__name__,
+                            list(evt_data.keys())[:8] if isinstance(evt_data, dict) else '(not dict)')
+                info._stream_evt_logged = True
+            if parsed["usage_start"]:
+                logger.info("Usage-start event for %s: payload keys %s, has usage: %s",
+                            session_id,
+                            list(evt_data.keys()) if isinstance(evt_data, dict) else '(not dict)',
+                            parsed["usage"] is not None)
+            call_usage = parsed["usage"]
+            if isinstance(call_usage, dict):
+                # Preserve pre_compact_tokens if set
+                prev_pct = info.usage.get('pre_compact_tokens')
+                info.usage = dict(call_usage)
+                info.usage['_per_call'] = True
+                if prev_pct:
+                    info.usage['pre_compact_tokens'] = prev_pct
+                logger.info("Per-call usage for %s: input=%s cache_read=%s cache_create=%s",
+                            session_id, call_usage.get('input_tokens'),
+                            call_usage.get('cache_read_input_tokens'),
+                            call_usage.get('cache_creation_input_tokens'))
+                # Push lightweight usage update to frontend
+                if self._push_callback:
+                    self._push_callback('session_usage', {
+                        'session_id': session_id,
+                        'usage': info.usage,
+                    })
+
+            if self._push_callback:
+                self._push_callback('stream_event', {
+                    'session_id': session_id,
+                    'event': event_data,
+                })
+
+    # The backend's vocabulary (base.BackendKnowledge).  Bound at class level
+    # because the model-naming helpers are classmethods the tests call on the
+    # class; it is the default backend's, like ``ClaudeAgentSDK`` in __init__.
+    _BACKEND = CLAUDE_KNOWLEDGE
+
+    # Tools that schedule a deferred SDK auto-resume cycle.  Used in
+    # _process_message to flag the session so the post-turn listener
+    # can suppress queue auto-dispatch while waiting for the wake-up.
+    #
+    # ScheduleWakeup is the explicit wake-up tool.  Bash with
+    # run_in_background=True triggers a task_notification when the
+    # background process exits.  Other names are matched
+    # case-insensitively via substring so renames / vendor variants
+    # (e.g. ``schedule_wakeup``, ``WakeUp``, ``BackgroundTask``) are
+    # still caught without code changes.
+    _WAKEUP_TOOL_NAMES = _BACKEND.wakeup_tool_names
+    _WAKEUP_TOOL_SUBSTRINGS = ("schedulewake", "wakeup", "backgroundtask")
+
+    # CLI background-task lifecycle events (SystemMessage subtypes, observed
+    # in daemon logs for CLI 2.1.29x).  Any of them proves the session has
+    # background work, and they keep arriving while it runs (task_progress
+    # fires per tool use of a running agent).  Feeds ``_bg_work_at`` for the
+    # silent-wait backstop (HealthMonitor job 5).
+    _TASK_EVENT_SUBTYPES = frozenset({
+        "task_started", "task_progress", "task_notification",
+        "task_updated", "background_tasks_changed",
+    })
+
+    # ── Starvation watchdog tuning (see _wakeup_queue_watchdog) ──────────
+    # The wake-up dispatch gate (_emit_state / queue_message) holds a
+    # queued user message while a post-turn listener owns the SDK buffer
+    # AND a wake-up is pending, so the queued message can't race the
+    # wake-up's content into the buffer.  But when an agent re-schedules a
+    # wake-up on EVERY turn (e.g. a continuous Bash run_in_background
+    # loop), `_wakeup_pending` is re-armed at every RESULT and the gate
+    # never opens — the user's queue is starved indefinitely (seen: queued
+    # messages sat undispatched behind dozens of background-Bash wake-ups).
+    #
+    # The watchdog bounds that wait.  If a queued message has been blocked
+    # behind the gate longer than this many seconds, the watchdog force-
+    # dispatches it the same way a manual user send would during a sleep
+    # window (supersede the listener, drain stale content, run the query).
+    # Overridable via env so ops can tune without a code change.
+    _WAKEUP_QUEUE_STARVATION_TIMEOUT = float(
+        os.environ.get("VIBENODE_WAKEUP_QUEUE_STARVATION_TIMEOUT", "120")
+    )
+    # How often the watchdog sweeps all sessions.  Cheap (one queue-length
+    # read per session); kept well below the starvation timeout so the
+    # effective force-dispatch latency is timeout + at most one interval.
+    _WAKEUP_QUEUE_WATCHDOG_INTERVAL = 30.0
+
+    # ── Phantom wake-up deadline (see _wakeup_queue_watchdog branch A) ───
+    # A scheduled wake-up that NEVER fires must not leave the session stuck
+    # on "Awaiting wake-up…" forever.  At RESULT we record a deadline by
+    # which the wake-up must arrive; past it the watchdog clears the
+    # awaiting state back to plain Idle.  For ScheduleWakeup we know the
+    # exact delay (SDK-clamped to <=3600s); for background Bash the
+    # completion time is unknowable, so we assume this ceiling.  Overridable
+    # via env.  The wake-up can STILL fire after we clear the display (the
+    # listener stays alive) — we only stop lying that it's pending.
+    _WAKEUP_UNKNOWN_DELAY_WAIT = float(
+        os.environ.get("VIBENODE_WAKEUP_MAX_WAIT", "1800")
+    )
+    # Slack added on top of the expected wake time before we call it phantom
+    # (covers SDK delivery latency so we never falsely clear a real wake-up).
+    _WAKEUP_DEADLINE_GRACE = 120.0
+    # SDK clamp on ScheduleWakeup.delaySeconds — used to bound a claimed delay.
+    _WAKEUP_SCHEDULE_MAX = 3600.0
+
+    # ── API-error auto-retry policy ──────────────────────────────────────
+    # When a turn ends with a *transient* API error result (overload/429/529/
+    # 5xx/network/timeout), the session automatically tries to CONTINUE on an
+    # exponential backoff: base_delay = min(BASE * FACTOR**attempt, CAP), then a
+    # random jitter of +/-JITTER is applied (so many sessions don't retry in
+    # lockstep and hammer the API at the same instants).
+    #
+    # The defaults are tuned for *unattended overnight resilience*, not fast
+    # recovery: an overnight task that hits a multi-hour outage should keep
+    # trying until the API comes back, while still polling often enough (cap
+    # 30 min between tries) to resume promptly once it does.  With BASE=10,
+    # FACTOR=2, CAP=1800, MAX=30 the interval ramps 10s, 20s, 40s, 80s, … up to
+    # the 30-min cap (~attempt 9), then holds there — giving a total retry
+    # window of ~14 hours across 30 attempts before it finally gives up and
+    # surfaces a manual Retry button.  That comfortably survives a 2-hour (or
+    # full overnight) outage.
+    #
+    # This complements the *transport*-error self-heal (_stream_heal_needed)
+    # which covers "Stream closed"/process death; an API error RESULT never
+    # sets that flag, so without this it dead-ends at IDLE.
+    # All knobs are overridable via env for testing / per-deployment tuning.
+    _API_RETRY_MAX = int(os.environ.get("VIBENODE_API_RETRY_MAX", "30"))
+    _API_RETRY_BASE = float(os.environ.get("VIBENODE_API_RETRY_BASE", "10"))
+    _API_RETRY_FACTOR = float(os.environ.get("VIBENODE_API_RETRY_FACTOR", "2"))
+    _API_RETRY_CAP = float(os.environ.get("VIBENODE_API_RETRY_CAP", "1800"))  # 30 min max between tries
+    _API_RETRY_JITTER = float(os.environ.get("VIBENODE_API_RETRY_JITTER", "0.2"))  # +/-20%
+    # The prompt the auto-retry resends.  We deliberately do NOT replay the
+    # original instruction — the failed turn may have already done partial work
+    # (edits, commits, tool calls), and re-running the instruction would
+    # duplicate it.  "Continue from where you left off" resumes the in-progress
+    # work using the session transcript the SDK already has.
+    _API_RETRY_CONTINUE_PROMPT = os.environ.get(
+        "VIBENODE_API_RETRY_CONTINUE_PROMPT", "Continue from where you left off.")
+
+    # ── Auto-continue after a usage limit ──
+    # Besides the model-switch CTA, a session stopped by a usage limit
+    # continues by itself once the limit resets.  It rides the
+    # API-retry timer, so the countdown, Cancel and Retry-now all work, and
+    # the CTA stays so the user can still switch models instead of waiting.
+    _LIMIT_AUTO_RESUME = os.environ.get("VIBENODE_LIMIT_AUTO_RESUME", "1") != "0"
+    # Continue this long after the stated reset.  The CLI renders the reset
+    # rounded to the minute, and a request landing exactly on it can still be
+    # refused.
+    _LIMIT_RESUME_GRACE = float(os.environ.get("VIBENODE_LIMIT_RESUME_GRACE", "90"))
+    # No reset time in the message: check again this often.  Each check is a
+    # single request that fails fast while the limit holds, and every attempt
+    # still counts toward _API_RETRY_MAX, so the probing is bounded.
+    _LIMIT_PROBE_INTERVAL = float(os.environ.get("VIBENODE_LIMIT_PROBE_INTERVAL", "1800"))
+    # The stated reset is already in the past (it just happened): continue
+    # after this short pause instead of waiting a full probe interval.
+    _LIMIT_JUST_RESET_DELAY = 120.0
+
+    # ── Usage-limit auto-switch ──
+    # A session stopped by a MODEL-specific usage limit on a model of a family
+    # on the left switches to the NEWEST model of the family on the right and
+    # carries on with its turn, instead of waiting days for the reset.  Keyed
+    # by family, not id, so every future Fable version triggers it and the
+    # newest Opus is always the target, with no code change when either ships.
+    # Account-wide limits (the 5-hour "session limit", the "weekly limit",
+    # credits) bind every model, so they never switch.  See _limit_switch_plan
+    # and _apply_limit_switch.
+    _LIMIT_SWITCH_FAMILIES = _BACKEND.limit_switch_families
+    _LIMIT_AUTO_SWITCH = os.environ.get("VIBENODE_LIMIT_AUTO_SWITCH", "1") != "0"
+    # Pause before switching: long enough to see the banner and press Cancel,
+    # short enough to feel immediate.  Rides the auto-retry countdown, so
+    # Cancel and the queue gate work during it.
+    _LIMIT_SWITCH_DELAY = float(os.environ.get("VIBENODE_LIMIT_SWITCH_DELAY", "5"))
+    # A usage-tracker reading older than this cannot vouch for the account
+    # windows now (see _account_windows_have_room).  Every turn refreshes it.
+    _USAGE_READING_FRESH_S = 900.0
+
+    # What a limit binds, from the name the CLI gives it ("You've hit your
+    # Fable limit · resets …").  The CLI's own table (2.1.291): five_hour
+    # "session limit", seven_day "weekly limit", seven_day_opus "Opus limit",
+    # seven_day_sonnet "Sonnet limit", seven_day_overage_included "Fable
+    # limit", overage "usage credit limit"; plus spend limits, team budgets and
+    # the credit balance.  The CLI itself classes the first two as
+    # "session"/"weekly" and the model names as "model" (its bS() helper).
+    # A model name next to "limit" is checked FIRST, so a variant such as
+    # "weekly Fable limit" still reads as Fable's own.
+    _LIMIT_MODEL_SCOPE_RE = re.compile(
+        r"\b(fable|opus|sonnet|haiku)\b[\w .\-]{0,20}?\blimit\b", re.I)
+    _LIMIT_ACCOUNT_SCOPE_RE = re.compile(
+        r"\b(?:session|weekly|5-hour|five-hour|daily|monthly|spend|credit|plan)"
+        r"\b[\w .'\-]{0,20}?\blimit\b|usage credits?|shared budget|credit balance",
+        re.I,
+    )
+
+    # Model naming is backend knowledge (claude_layout.ClaudeKnowledge).
+    # These wrappers keep the manager's (and its tests') names.
+    @classmethod
+    def _strip_markers(cls, model_id: str) -> str:
+        return cls._BACKEND.strip_markers(model_id)
+
+    @classmethod
+    def _model_family(cls, model_id: str) -> str:
+        return cls._BACKEND.model_family(model_id)
+
+    @classmethod
+    def _model_version(cls, model_id: str) -> tuple:
+        return cls._BACKEND.model_version(model_id)
+
+    @classmethod
+    def _model_label(cls, model_id: str) -> str:
+        return cls._BACKEND.model_label(model_id)
+
+    @classmethod
+    def _newest_in_family(cls, model_ids, family: str) -> str:
+        return cls._BACKEND.newest_in_family(model_ids, family)
+
+    def _known_models(self) -> list:
+        """Model ids VibeNode knows of: every model a session has confirmed
+        plus the ones the picker always offers (src/shared/models.py).  The
+        fallback source for _newest_model_of when the session's CLI does not
+        report its own list.  Never raises."""
+        try:
+            from shared.models import known_model_ids
+            return known_model_ids()
+        except Exception:
+            return []
+
+    def _newest_model_of(self, info: "SessionInfo", family: str) -> str:
+        """The newest model of ``family`` this session can switch to, or ''.
+
+        From, in order:
+
+          1. the session's own CLI process (``ClaudeAgentSDK.supported_models``):
+             its family alias resolved (``opus`` -> its newest Opus).  This
+             covers models released after VibeNode was updated, and never picks
+             one the running process would reject.  An alias the CLI lists
+             without a resolved id is returned as the alias itself; the CLI
+             resolves it, and _apply_limit_switch reads back what it ran;
+          2. the highest version of the family that CLI lists;
+          3. VibeNode's model list (confirmed + always-offered), for a CLI
+             that does not report its models.
+
+        A 1M-context session (``[1m]`` on the limited id) keeps 1M: its context
+        may not fit in 200K.  That holds for an alias too: CLI 2.1.291 accepts
+        ``opus[1m]`` and runs ``claude-opus-5-5[1m]`` (probed).
+        """
+        try:
+            listed = self._sdk.supported_models(info.client) if info.client else []
+        except Exception:
+            listed = []
+        return self._BACKEND.newest_model_of(family, listed, self._known_models,
+                                             info.limited_model or "")
+
+    def _limit_scope(self, result_text: str, family: str = "") -> str:
+        """What a limit message binds: "model" (only ``family``'s own limit:
+        switching helps), "account" (every model is out: switching cannot
+        help), or "" when the wording does not say.  A message naming ANOTHER
+        model's limit says nothing about this one: "".  With no ``family``,
+        any model's limit counts."""
+        txt = result_text or ""
+        m = self._LIMIT_MODEL_SCOPE_RE.search(txt)
+        if m:
+            return "model" if not family or m.group(1).lower() == family else ""
+        if self._LIMIT_ACCOUNT_SCOPE_RE.search(txt):
+            return "account"
+        return ""
+
+    def _account_windows_have_room(self) -> bool:
+        """For a limit whose wording names no window: True when a FRESH usage
+        tracker reading (src/engine/usage_limits.py, refreshed by every turn's
+        rate_limit_event) shows both account-wide windows below 100%, so the
+        limit that was hit must be the model's own.  False when either is full,
+        or when the tracker cannot vouch for now: no reading, a reading older
+        than ``_USAGE_READING_FRESH_S``, or one for a window that has since
+        ended (a file left from a long-gone session must not read as room)."""
+        windows = (getattr(self, "_usage_state", None) or {}).get("windows") or {}
+        now = time.time()
+        for key in ("five_hour", "seven_day"):
+            w = windows.get(key)
+            if not isinstance(w, dict):
+                return False
+            try:
+                resets = float(w.get("resets_at") or 0)
+                seen = float(w.get("seen_at") or 0)
+                if resets <= now or now - seen > self._USAGE_READING_FRESH_S:
+                    return False
+                if float(w.get("utilization", 1.0)) >= 1.0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    def _limit_switch_plan(self, info: "SessionInfo"):
+        """Where and when a usage-limited session continues on another model:
+        ``(model, epoch)``, or None to wait for its own limit to reset.
+
+        Only for a limit that binds the model (``_limit_scope``; an account-wide
+        limit stops every model) on a family the session can leave.  The
+        options are the newest model of the mapped family
+        (``_LIMIT_SWITCH_FAMILIES``: any Fable -> the newest Opus) and, after
+        an auto-switch, the model the session left (``_limit_origin``).  Each
+        is free now, or when its own limit, as seen in this session
+        (``_limit_until``), resets.  The soonest wins, and only if it beats
+        waiting here.  So a Fable limit switches to Opus at once, and if Opus
+        then hits its own limit, the session goes back to Fable when Fable's
+        limit resets, if that comes first.
+
+        Off with ``VIBENODE_LIMIT_AUTO_SWITCH=0``, and with
+        ``VIBENODE_LIMIT_AUTO_RESUME=0`` (which turns off every automatic
+        continue after a limit).
+        """
+        if not (self._LIMIT_AUTO_SWITCH and self._LIMIT_AUTO_RESUME):
+            return None
+        family = self._model_family(info.limited_model)
+        if not family:
+            return None
+        scope = getattr(info, "_limit_scope", "")
+        if scope == "account" or (scope != "model" and not self._account_windows_have_room()):
+            return None
+        now = time.time()
+        reset = float(info.limit_reset_at or 0.0)
+        if 0 < reset <= now:
+            return None                     # it just reset: _schedule_limit_resume continues shortly
+        stay_at = reset + self._LIMIT_RESUME_GRACE if reset else now + self._LIMIT_PROBE_INTERVAL
+        info._limit_until[family] = stay_at
+        options = []
+        to_family = self._LIMIT_SWITCH_FAMILIES.get(family)
+        if to_family:
+            newest = self._newest_model_of(info, to_family)
+            if newest:
+                options.append(newest)
+        origin = getattr(info, "_limit_origin", "")
+        # Back to the model an auto-switch left: only for a limit known to be
+        # this model's own.  On unrecognised wording the two models could
+        # trade places every probe interval on a limit neither can pass.
+        if origin and scope == "model" and self._model_family(origin) not in ("", family):
+            options.append(origin)
+        best = None
+        for model in options:
+            free_at = float(info._limit_until.get(self._model_family(model), 0.0))
+            at = now + self._LIMIT_SWITCH_DELAY if free_at <= now else free_at
+            if best is None or at < best[1]:
+                best = (model, at)
+        if best is None or best[1] >= stay_at:
+            return None
+        return best
+
+    @staticmethod
+    def _api_retry_delay(attempt: int) -> float:
+        """Deterministic exponential backoff base delay (seconds) for retry index
+        ``attempt`` (0-based), BEFORE jitter.
+
+        Pure function (no clock, no randomness, no I/O) so it can be unit-tested
+        directly.  Jitter is applied separately in _apply_jitter so the base
+        schedule stays deterministic.
+        base = min(BASE * FACTOR**attempt, CAP).  attempt is clamped at >= 0.
+        """
+        a = max(0, attempt)
+        return min(
+            SessionManager._API_RETRY_BASE * (SessionManager._API_RETRY_FACTOR ** a),
+            SessionManager._API_RETRY_CAP,
+        )
+
+    @classmethod
+    def _apply_jitter(cls, base_delay: float) -> float:
+        """Apply symmetric +/-JITTER randomness to a base backoff delay.
+
+        Returns base_delay * (1 +/- up-to-JITTER), floored at 0.5s so a jittered
+        early delay can't collapse to ~0.  De-syncs many sessions so they don't
+        all hammer the API on the same cadence during a shared outage.
+        """
+        j = cls._API_RETRY_JITTER
+        if j <= 0:
+            return base_delay
+        return max(0.5, base_delay * (1.0 + random.uniform(-j, j)))
+
+    @staticmethod
+    def _fmt_duration(secs: float) -> str:
+        """Human-friendly duration for log/UI text: '45s', '12m 30s', '2h 5m'."""
+        s = max(0, int(round(secs)))
+        if s < 60:
+            return "%ds" % s
+        m, sec = divmod(s, 60)
+        if m < 60:
+            return "%dm %ds" % (m, sec) if sec else "%dm" % m
+        h, mm = divmod(m, 60)
+        return "%dh %dm" % (h, mm) if mm else "%dh" % h
+
+    # ── Usage-limit detection ────────────────────────────────────────────
+    #
+    # These patterns are derived from the STRINGS IN THE INSTALLED CLI BINARY,
+    # not guessed.  Verified present (see the `rateLimitType` enum and the
+    # billing copy inside the CLI bundle):
+    #
+    #   rateLimitType : five_hour | seven_day | seven_day_opus |
+    #                   seven_day_sonnet | seven_day_overage_included | overage
+    #   rendered      : "Usage limit reached", "<Type> reached"
+    #                   "you have reached your weekly usage limit"
+    #                   "You're out of usage credits. Switch to another model…"
+    #                   "Your organization is out of usage credits."
+    #                   "org's monthly usage limit", "usage_cap_reached"
+    #
+    # A LITERAL list is the wrong shape here — the CLI renders the same
+    # condition a dozen ways ("Usage limit reached" vs "you have reached your
+    # weekly usage limit" vs "out of usage credits"), and a literal list misses
+    # every phrasing nobody thought to enumerate.  So we test the SHAPE:
+    # a limit noun AND an exhaustion verb, with explicit negative guards for
+    # the strings that mention a limit while NOT being one.
+    #
+    # Note the CLI's own remedy for running out of credits is literally
+    # "Switch to another model to continue" — which is exactly what this
+    # classification drives the UI to offer.
+
+    # Things that name a quota/allowance.
+    # The CLI renders the 5-hour window as "You've hit your session limit ·
+    # resets 5pm (America/New_York)".  Without "session limit" and "hit" in
+    # these lists that message reads as an ordinary error and the session
+    # dead-ends instead of resuming.  Hence the named-window nouns below.
+    _LIMIT_NOUN_RE = re.compile(
+        r"usage limit|usage credits?|usage[_ ]cap|monthly usage|weekly usage"
+        r"|quota|credit balance|spend limit|credit limit|usage-credits"
+        r"|(?:session|5-hour|five-hour|weekly|daily|monthly|opus|sonnet|fable"
+        r"|haiku|plan) limits?\b",
+        re.I,
+    )
+    # Things that say it is EXHAUSTED (as opposed to merely mentioned).
+    _LIMIT_EXHAUSTED_RE = re.compile(
+        r"reached|exceed(?:ed)?|out of|used up|too low|insufficient"
+        r"|cap_reached|exhausted|no (?:remaining|more)|\bhit\b",
+        re.I,
+    )
+    # Strings that mention a limit but are NOT an exhaustion — checked first.
+    # Without these, the CLI's own reset/approaching notices would be
+    # misclassified as limits and park a perfectly healthy session behind a CTA.
+    # NOTE ON SCOPE: these must stay NARROW.  An earlier draft also excluded
+    # /resets? (at|in)/ and /limit reset/, which broke the most common real
+    # phrasing there is — "Usage limit reached. Your limit will reset at 6pm."
+    # states its reset time and is unambiguously a limit.  Requiring an
+    # exhaustion verb already rejects the reset/approaching notices on its own
+    # (none of them say "reached"/"out of"), so these guards only need to cover
+    # strings that pair a limit noun WITH an exhaustion word while still not
+    # being a failure.
+    _LIMIT_NEGATIVE_RE = re.compile(
+        r"has reset|have reset|available again"
+        r"|not your usage limit"          # "Server is temporarily limiting requests (not your usage limit)"
+        r"|upgrade to increase"           # marketing copy, not a failure
+        # Warnings ahead of a limit, which matter now that "hit" counts as
+        # exhaustion: "you'll hit your session limit soon" is not a failure.
+        r"|approaching|about to (?:hit|reach)|close to (?:hitting|reaching)"
+        r"|(?:will|you'll|you will) (?:soon )?(?:hit|reach)",
+        re.I,
+    )
+    # Reset instant, in every encoding the CLI/API is known to use:
+    #   "…|1756612800"                      (legacy pipe form, older builds)
+    #   "resetsAtSeconds":1756612800        (current CLI internal field)
+    #   "resetsAt": 1756612800              (API/analytics field)
+    #   "resets_at_seconds": 1756612800
+    _LIMIT_RESET_RE = re.compile(
+        r"(?:resets?[_ ]?at(?:[_ ]?seconds)?\"?\s*[:=]\s*|\|\s*)(\d{9,16})",
+        re.I,
+    )
+    # The human clock form the CLI renders today, with an optional date and an
+    # optional IANA zone:
+    #   "resets 5pm (America/New_York)"        (5-hour session window)
+    #   "resets 5:30pm (America/New_York)"
+    #   "resets Oct 9, 5pm (America/New_York)" (weekly windows)
+    #   "Your limit will reset at 6pm."
+    _LIMIT_RESET_CLOCK_RE = re.compile(
+        r"resets?\s+(?:at\s+|on\s+)?"
+        r"(?:(?P<mon>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+"
+        r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+(?:at\s+)?)?"
+        r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>[ap])\.?m\b\.?"
+        r"(?:\s*\((?P<tz>[A-Za-z_]+(?:/[A-Za-z0-9_+\-]+)+)\))?",
+        re.I,
+    )
+    _MONTHS = {m: i for i, m in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun",
+         "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+    # A clock time this far in the past is "the reset just happened" (the CLI
+    # rounds the displayed time), not "the same time tomorrow".
+    _LIMIT_CLOCK_RECENT_PAST = 2 * 3600
+
+    @staticmethod
+    def _parse_reset_clock(txt: str, now: float) -> float:
+        """Epoch of a human "resets 5pm (America/New_York)" clause, or 0.0.
+
+        The next occurrence of that wall-clock time in that zone.  A time
+        already passed today means tomorrow, unless it passed less than
+        ``_LIMIT_CLOCK_RECENT_PAST`` ago: then the reset just happened and the
+        past instant is returned as is (callers resume promptly).  An unknown
+        or unloadable zone falls back to the machine's local time, which is
+        what the CLI renders in anyway.  Never raises.
+        """
+        m = SessionManager._LIMIT_RESET_CLOCK_RE.search(txt or "")
+        if not m:
+            return 0.0
+        try:
+            from datetime import datetime, timedelta
+            hour = int(m.group("hour"))
+            minute = int(m.group("minute") or 0)
+            if not (1 <= hour <= 12 and 0 <= minute <= 59):
+                return 0.0
+            hour = hour % 12 + (12 if m.group("ampm").lower() == "p" else 0)
+            tz = None
+            if m.group("tz"):
+                try:
+                    from zoneinfo import ZoneInfo
+                    tz = ZoneInfo(m.group("tz"))
+                except Exception:
+                    tz = None   # no tzdata on this machine: use local time
+            now_dt = (datetime.fromtimestamp(now, tz) if tz is not None
+                      else datetime.fromtimestamp(now).astimezone())
+            cand = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if m.group("mon"):
+                month = SessionManager._MONTHS[m.group("mon")[:3].lower()]
+                cand = cand.replace(month=month, day=int(m.group("day")))
+                if cand.timestamp() < now - SessionManager._LIMIT_CLOCK_RECENT_PAST:
+                    cand = cand.replace(year=cand.year + 1)
+            elif cand.timestamp() < now - SessionManager._LIMIT_CLOCK_RECENT_PAST:
+                cand = cand + timedelta(days=1)
+            elif cand.timestamp() > now + 24 * 3600 - SessionManager._LIMIT_CLOCK_RECENT_PAST:
+                # Midnight edge case: "resets 11:54pm" seen at 00:14am means
+                # YESTERDAY 11:54pm (just reset), not TOMORROW 11:54pm.  The
+                # mirror of the "today-in-past -> tomorrow" branch above.
+                cand = cand - timedelta(days=1)
+            return cand.timestamp()
+        except (ValueError, KeyError, OverflowError, OSError):
+            return 0.0
+
+    @staticmethod
+    def _parse_usage_limit(result_text: str, now: Optional[float] = None):
+        """Detect a plan/quota exhaustion and extract its reset instant.
+
+        Returns ``(is_usage_limit, reset_epoch)``.  ``reset_epoch`` is 0.0 when
+        the message carries no reset time at all.  The UI then shows the CTA
+        without a countdown rather than inventing a number.
+
+        Machine-readable epochs are preferred.  Otherwise the human clock form
+        ("resets 5pm (America/New_York)") is resolved against ``now``, which
+        defaults to the current time and is injectable for tests.  No I/O.
+        """
+        txt = (result_text or "").strip()
+        if not txt:
+            return (False, 0.0)
+        # Negative guards win: "Usage limit has reset", "Approaching your
+        # 5-hour usage limit" and "Server is temporarily limiting requests
+        # (not your usage limit)" all name a limit without being one.
+        if SessionManager._LIMIT_NEGATIVE_RE.search(txt):
+            return (False, 0.0)
+        if not (SessionManager._LIMIT_NOUN_RE.search(txt)
+                and SessionManager._LIMIT_EXHAUSTED_RE.search(txt)):
+            return (False, 0.0)
+        reset = 0.0
+        m = SessionManager._LIMIT_RESET_RE.search(txt)
+        if m:
+            try:
+                val = float(m.group(1))
+                # Heuristic: anything past ~year 2286 in seconds is really ms.
+                if val > 1e11:
+                    val /= 1000.0
+                reset = val
+            except (TypeError, ValueError):
+                reset = 0.0
+        if not reset:
+            reset = SessionManager._parse_reset_clock(
+                txt, time.time() if now is None else now)
+        return (True, reset)
+
+    def _apply_usage_limit(self, info: "SessionInfo", result_text: str) -> None:
+        """Record a detected usage limit on the session and disarm auto-retry.
+
+        The exponential backoff is explicitly NOT armed here: a quota does not
+        clear on a backoff measured in seconds, so retrying only burns the
+        bounded retry budget (``_API_RETRY_MAX``) that a genuine transient
+        outage later needs.  The session parks IDLE with a structured error the
+        UI turns into a one-click model-switch CTA.  Continuing once the limit
+        resets is a separate, timed decision: ``_schedule_limit_resume``.
+        """
+        _is_limit, reset = self._parse_usage_limit(result_text)
+        info.limit_reset_at = reset if _is_limit else 0.0
+        # Remember WHICH model ran out so the CTA can exclude it from the
+        # alternatives it offers.  info.model is the CLI-confirmed id.
+        info.limited_model = info.model or ""
+        # Whether switching models can get past it (_limit_switch_plan).
+        info._limit_scope = self._limit_scope(
+            result_text, self._model_family(info.limited_model))
+        info._api_retry_needed = False
+        info.retry_at = 0.0
+        info.retry_attempt = 0
+        info.retry_max = 0
+        info.retry_reason = ""
+        when = ""
+        if reset:
+            remaining = reset - time.time()
+            if remaining > 0:
+                when = " — resets in %s" % self._fmt_duration(remaining)
+        info.error = "Usage limit reached%s. Switch models to keep working." % when
+
+    def _clear_usage_limit(self, info: "SessionInfo") -> None:
+        """Forget a recorded usage limit (new user message / successful turn /
+        model switch).  Safe to call unconditionally.  A pending auto-switch
+        goes with it: a manual switch or a turn that went through supersedes
+        it."""
+        info.limit_reset_at = 0.0
+        info.limited_model = ""
+        info.limit_switch_to = ""
+
+    def _schedule_limit_resume(self, info: "SessionInfo",
+                               allow_switch: bool = True) -> bool:
+        """Arrange for a usage-limited turn to continue.
+
+        Call right after ``_apply_usage_limit``.  Flags the retry the same way
+        a transient error does (``_api_retry_needed``), so the drive-loop
+        ``finally`` arms it through ``_arm_api_retry``.  ``_limit_resume_at``
+        tells that function when to fire instead of backing off:
+
+        * the limit binds the model and another one can run sooner (any Fable
+          version -> the newest Opus, or back to the model an earlier
+          auto-switch left; see ``_limit_switch_plan``): switch then and
+          continue, normally after ``_LIMIT_SWITCH_DELAY``.
+          ``allow_switch=False`` skips this (a failed switch, or Cancel);
+        * reset known and ahead: continue ``_LIMIT_RESUME_GRACE`` after it;
+        * reset stated but already passed (it just happened): continue after
+          ``_LIMIT_JUST_RESET_DELAY``, doubling per consecutive attempt;
+        * no reset time in the message: check again after
+          ``_LIMIT_PROBE_INTERVAL``.
+
+        Returns True if a resume was flagged.  Not flagged when the retry budget
+        is spent or there is no turn to resume, nor (for the wait-for-reset
+        plans) when switched off with ``VIBENODE_LIMIT_AUTO_RESUME=0``.
+        """
+        if info._api_retry_count >= self._API_RETRY_MAX:
+            return False
+        if not self._has_user_message(info):
+            return False
+        if allow_switch:
+            plan = self._limit_switch_plan(info)
+            if plan:
+                info.limit_switch_to, info._limit_resume_at = plan
+                info._api_retry_needed = True
+                info.retry_reason = "Switching to %s" % self._model_label(plan[0])
+                return True
+        if not self._LIMIT_AUTO_RESUME:
+            return False
+        now = time.time()
+        reset = float(getattr(info, "limit_reset_at", 0.0) or 0.0)
+        if reset > now:
+            info._limit_resume_at = reset + self._LIMIT_RESUME_GRACE
+        elif reset > 0:
+            # The stated reset already passed.  The first time, it just
+            # happened; resume shortly.  If we keep landing on the limit
+            # anyway (rounded or stale reset time), double the wait each
+            # attempt (2, 4, 8, 16 min, then the probe interval) instead of
+            # hitting the wall every 2 minutes until the budget runs out.
+            info._limit_resume_at = now + min(
+                self._LIMIT_PROBE_INTERVAL,
+                self._LIMIT_JUST_RESET_DELAY * (2 ** min(info._api_retry_count, 10)),
+            )
+        else:
+            info._limit_resume_at = now + self._LIMIT_PROBE_INTERVAL
+        info._api_retry_needed = True
+        info.retry_reason = "Usage limit"
+        return True
+
+    @staticmethod
+    def _classify_result_error(subtype: str, result_text: str) -> str:
+        """Classify an ``is_error`` ResultMessage as retryable or not.
+
+        Returns:
+            "usage_limit" — an account/plan quota is exhausted.  Retrying the
+                           same model cannot succeed until the reset instant,
+                           so no backoff is armed; the UI offers a model switch.
+            "transient"  — a temporary, retryable failure (API overload, rate
+                           limit, 5xx, network/timeout).  Auto-retry is armed.
+            "permanent"  — retrying will not help (max-turns reached, invalid
+                           request, auth).  Surface the error + manual Retry.
+
+        The SDK's ResultMessage exposes ``subtype`` (success / error_during_
+        execution / error_max_turns) and ``result`` (the error text).  We match
+        the text against well-known transient signatures; an unrecognised error
+        defaults to "transient" because in practice the overwhelming majority of
+        mid-turn error results are temporary upstream hiccups, and a bounded
+        handful of retries is cheap insurance against a session dead-ending.
+        Pure function — no clock, no I/O — so it is trivially unit-testable.
+        """
+        st = (subtype or "").lower()
+        # error_max_turns: the turn budget is exhausted; resending the same
+        # message just hits the same wall.  Treat as permanent.
+        if "max_turns" in st or "max turns" in st:
+            return "permanent"
+        txt = (result_text or "").lower()
+        # Quota exhaustion is checked FIRST and deliberately outranks the
+        # transient signatures below: a usage-limit message frequently also
+        # contains "429" or "rate limit", and matching those first would arm an
+        # exponential backoff against a wall that stands for hours.
+        if SessionManager._parse_usage_limit(result_text)[0]:
+            return "usage_limit"
+        # Well-known permanent failures — retrying cannot succeed.
+        _permanent = (
+            "invalid request", "invalid_request", "400 bad request",
+            "authentication", "unauthorized", "401", "403 forbidden",
+            "permission denied", "not found", "404",
+        )
+        if any(sig in txt for sig in _permanent):
+            return "permanent"
+        # Well-known transient failures — safe to retry on backoff.  Includes
+        # connectivity loss (internet down / DNS / TLS) so an overnight task
+        # rides out a network outage the same way it rides out an API overload.
+        _transient = (
+            # API-side overload / rate limit / 5xx
+            "overload", "overloaded", "rate limit", "rate_limit", "ratelimit",
+            "429", "529", "500", "502", "503", "504",
+            "internal server error", "service unavailable", "gateway",
+            "temporarily", "unavailable", "try again",
+            # Connectivity loss (internet down, DNS, TLS, sockets)
+            "timeout", "timed out", "connection", "network",
+            "could not resolve", "name resolution", "getaddrinfo", "dns",
+            "connection refused", "connection reset", "connection aborted",
+            "connection error", "broken pipe", "unreachable", "no route to host",
+            "ssl", "tls", "handshake", "eof occurred", "remote end closed",
+            "temporary failure", "failed to establish", "max retries exceeded",
+        )
+        if any(sig in txt for sig in _transient):
+            return "transient"
+        # Unknown error → default to retryable (bounded by _API_RETRY_MAX).
+        return "transient"
+
+    @staticmethod
+    def _retry_reason_text(result_text: str) -> str:
+        """Short, human-friendly reason string shown in the retry countdown
+        banner (e.g. "API overloaded", "Rate limited").  Pure function."""
+        txt = (result_text or "").lower()
+        if "overload" in txt or "529" in txt:
+            return "API overloaded"
+        if "rate limit" in txt or "rate_limit" in txt or "ratelimit" in txt or "429" in txt:
+            return "Rate limited"
+        if any(c in txt for c in ("500", "502", "503", "504", "internal server error",
+                                  "service unavailable", "gateway")):
+            return "Server error"
+        if any(c in txt for c in ("timeout", "timed out", "connection", "network")):
+            return "Network error"
+        return "Temporary error"
+
+    # ── API-error auto-retry: timer + lifecycle helpers ──────────────────
+    # Flow:  a transient API error is detected on EITHER channel —
+    #   (a) a ResultMessage(is_error=True)  [_process_message], or
+    #   (b) a non-transport exception raised mid-stream  [_drive_session /
+    #       _send_query except handlers, e.g. a 500/503/529 API error]
+    # — and sets info._api_retry_needed.  The drive-loop finally then calls
+    # _arm_api_retry → a backoff timer task (_api_retry_timer) sleeps, then
+    # _fire_api_retry resumes with the CONTINUE prompt via
+    # send_message(_auto_retry=True).  The countdown fields
+    # (retry_at/attempt/max/reason) are serialized so the UI shows a live
+    # "Auto-retrying in 12m…" banner with Cancel / Retry-now controls.
+    # (Transport errors — "Stream closed"/process death — are handled by the
+    # separate _stream_heal mechanism, not this.)
+
+    def _has_user_message(self, info: SessionInfo) -> bool:
+        """True if the transcript has at least one user message — i.e. there's
+        actually a turn to resume.  Guards against arming a retry on a bare
+        connect failure with nothing to continue.
+
+        Trim-aware: idle sessions keep only the last 200
+        in-memory entries, so a long autonomous turn (dozens of background
+        task wake-ups) trims the user's message out of memory.  The answer was
+        then "nothing to resume", and every retry was refused, so a
+        usage-limited session dead-ended as "Session ended with error".  A
+        trimmed log had a conversation by definition.
+        """
+        if getattr(info, "_entries_trimmed", False):
+            return True
+        with info._lock:
+            for e in reversed(info.entries):
+                if e.kind == "user":
+                    return True
+        return False
+
+    def _resume_turn_prompt(self, info: SessionInfo) -> str:
+        """The prompt that re-runs the turn an error interrupted, or "" if the
+        transcript has nothing to resume.
+
+        Mirrors the prompt choice documented on ``_fire_api_retry`` — this is
+        the same decision, factored out so the usage-limit model switch resumes
+        a turn exactly the way an auto-retry does instead of inventing a second
+        (inevitably divergent) rule:
+
+          * the failed turn ran a TOOL → side-effectful work already happened,
+            so re-sending the instruction would duplicate it.  Send the CONTINUE
+            prompt and let the transcript carry the context.
+          * the failed turn produced no tool calls → nothing was done yet, so
+            re-send the original request for a clean redo ("continue" with
+            nothing to continue makes the model ramble).
+        """
+        with info._lock:
+            last_user_idx = -1
+            last_user_text = ""
+            for i in range(len(info.entries) - 1, -1, -1):
+                if info.entries[i].kind == "user":
+                    last_user_idx = i
+                    last_user_text = info.entries[i].text
+                    break
+            if last_user_idx < 0 or not last_user_text:
+                # Trimmed out of memory by a long turn: that turn did work,
+                # so continue it (same rule as _fire_api_retry).
+                if getattr(info, "_entries_trimmed", False):
+                    return self._API_RETRY_CONTINUE_PROMPT
+                return ""
+            for j in range(last_user_idx + 1, len(info.entries)):
+                if info.entries[j].kind in ("tool_use", "tool_result"):
+                    return self._API_RETRY_CONTINUE_PROMPT
+        return last_user_text
+
+    def _flag_api_retry_if_transient(self, info: SessionInfo, err_str: str) -> bool:
+        """Detection for channel (b): a non-transport stream exception.
+
+        If ``err_str`` classifies as a transient API error (5xx / overload /
+        rate-limit / network — and, by the classifier's default, any other
+        non-permanent error), flag an auto-retry so the drive-loop finally arms
+        the exponential backoff.  Permanent errors (400 invalid request, auth,
+        max-turns) are NOT flagged — they keep the plain reconnect-and-idle
+        behavior.  Returns True if a retry was flagged.
+        """
+        _cls = self._classify_result_error("", err_str)
+        if _cls == "usage_limit":
+            # Channel (b) saw the quota message as a raised exception rather
+            # than an is_error RESULT.  Record it the same way so the CTA shows
+            # up regardless of which channel surfaced it.  No backoff is armed
+            # against it, only the timed continue-at-reset (same as channel a).
+            self._apply_usage_limit(info, err_str)
+            return self._schedule_limit_resume(info)
+        if _cls != "transient":
+            return False
+        if info._api_retry_count >= self._API_RETRY_MAX:
+            return False
+        if not self._has_user_message(info):
+            return False
+        info._api_retry_needed = True
+        info.retry_reason = self._retry_reason_text(err_str)
+        return True
+
+    def _escalate_heal_to_backoff(self, info: SessionInfo, reason: str) -> bool:
+        """Detection for channel (c): a dead transport (CLI crash / connectivity
+        loss) that the short stream-heal couldn't recover within its quick 3-try
+        budget.  Rather than dead-ending with "please resend", escalate to the
+        long exponential backoff so an overnight task rides out a multi-hour
+        internet outage — reconnecting the CLI each attempt until it comes back.
+
+        Returns True if the escalation was flagged (the drive-loop finally then
+        arms the backoff); False if not eligible (no turn to resume, or the
+        backoff budget is already exhausted) so the caller keeps the existing
+        "please resend" fallback.
+        """
+        if not self._has_user_message(info):
+            return False
+        if info._api_retry_count >= self._API_RETRY_MAX:
+            return False
+        # A transport crash BEFORE the session ever produced a RESULT can't be
+        # resumed — the SDK id was never remapped to a real UUID, so every
+        # _reconnect_client --resume fails identically.  Escalating would just
+        # spin a doomed reconnect for the whole backoff budget.  Don't: let the
+        # caller fall back to "please resend" (nothing was accomplished anyway).
+        if not getattr(info, '_ever_got_result', False):
+            return False
+        info._api_retry_needed = True
+        info._retry_needs_reconnect = True   # transport is dead — reconnect before resending
+        info.retry_reason = reason
+        return True
+
+    def _cancel_api_retry_task(self, info: SessionInfo) -> None:
+        """Cancel a pending backoff timer task if present (idempotent, thread-safe).
+
+        Task.cancel() must run on the loop thread, but this helper is also called
+        from Flask-thread paths (send_message, interrupt, close, cancel/retry
+        actions), so route the cancel through the loop when we're off-thread.
+        """
+        task = info._api_retry_task
+        info._api_retry_task = None
+        if task is None or task.done():
+            return
+        try:
+            loop = self._loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(task.cancel)
+            else:
+                task.cancel()
+        except Exception:
+            pass
+
+    def _clear_api_retry(self, info: SessionInfo, reset_count: bool = True) -> None:
+        """Cancel any pending timer and clear the countdown fields.
+
+        reset_count=True also zeroes the accumulated attempt counter — used when
+        the user starts fresh (genuine new message, Cancel, interrupt, close).
+        reset_count=False preserves the counter so attempts keep accumulating
+        toward _API_RETRY_MAX across an auto-retry chain.
+        """
+        _was_armed = bool(getattr(info, "retry_at", 0.0) or getattr(info, "limit_switch_to", ""))
+        self._cancel_api_retry_task(info)
+        info._api_retry_needed = False
+        info._retry_needs_reconnect = False
+        info.retry_at = 0.0
+        info.retry_attempt = 0
+        info.retry_max = 0
+        info.retry_reason = ""
+        # A usage-limit auto-switch rides this countdown; cancelling the
+        # countdown (Cancel, a new message, interrupt, close) cancels it too.
+        info.limit_switch_to = ""
+        if reset_count:
+            info._api_retry_count = 0
+        # Write-through: a disarmed countdown must not come back after a
+        # restart (SessionDurable).  Only when one was armed: this runs on
+        # every genuine send, which must not pay for a disk write.
+        if _was_armed:
+            self._durable_save(info)
+
+    def _arm_api_retry(self, session_id: str, info: SessionInfo) -> None:
+        """Schedule an automatic retry after an exponential-backoff delay.
+
+        Non-blocking: sets the countdown fields, emits state so the UI shows the
+        live countdown, and starts a timer task.  Called from the drive-loop
+        finally block when info._api_retry_needed was set this turn.  Must run on
+        the manager's event loop (the finally blocks do).
+        """
+        info._api_retry_needed = False
+        # Eligibility: never arm over a stopped session or one that already has a
+        # new turn in flight (e.g. a queued message dispatched on the post-turn
+        # IDLE) — that turn supersedes the retry.
+        # HARDENING: this used to return with no trace whatsoever, which is
+        # indistinguishable from "the retry silently never happened" — the single
+        # most confusing way this feature fails.  A WORKING/WAITING/STARTING drop
+        # is legitimate (a newer turn owns the session and supersedes the retry);
+        # a STOPPED drop means the failed turn was abandoned outright.  Both are
+        # now visible in the log, with the attempt budget, so a "why didn't it
+        # retry?" report can be answered from logs/_server.log.
+        if info.state in (SessionState.STOPPED, SessionState.WORKING,
+                          SessionState.WAITING, SessionState.STARTING):
+            logger.info(
+                "Auto-retry NOT armed for %s — session is %s (%s); "
+                "reason=%r attempts_used=%d/%d",
+                session_id[:12], info.state,
+                "session stopped, failed turn abandoned"
+                if info.state == SessionState.STOPPED
+                else "a newer turn supersedes the retry",
+                info.retry_reason, info._api_retry_count, self._API_RETRY_MAX,
+            )
+            # Drop this retry's limit plan with it.  Left set, a later
+            # unrelated error would be scheduled as this limit's wait, or
+            # would even switch models.
+            info._limit_resume_at = 0.0
+            info.limit_switch_to = ""
+            return
+        attempt = info._api_retry_count  # 0-based index of the attempt to schedule
+        # A usage limit waits for its reset (see _schedule_limit_resume)
+        # instead of backing off.  Consumed here whether or not we arm.
+        limit_at = float(getattr(info, "_limit_resume_at", 0.0) or 0.0)
+        info._limit_resume_at = 0.0
+        if attempt >= self._API_RETRY_MAX:
+            # Budget already exhausted — _process_message normally handles this,
+            # but guard here too so we never schedule a no-op timer.
+            return
+        if limit_at > 0 and getattr(info, "limit_switch_to", ""):
+            # Usage-limit auto-switch: no spread (this session moves to another
+            # model rather than racing a window that reopens).  The switch
+            # itself happens when the timer fires (_switch_then_fire).
+            delay = max(self._LIMIT_SWITCH_MIN_DELAY_S, limit_at - time.time())
+            note = "%s hit its usage limit. Switching to %s" % (
+                self._model_label(info.limited_model),
+                self._model_label(info.limit_switch_to))
+            if delay > 60:
+                # Back to a model whose own limit resets first.
+                note += " when its limit resets, at %s (in %s), and continuing." % (
+                    time.strftime("%I:%M %p", time.localtime(time.time() + delay)).lstrip("0"),
+                    self._fmt_duration(delay))
+            else:
+                note += " and continuing…"
+        elif limit_at > 0:
+            # Small random spread so every limited session does not hit the
+            # API in the same second the window reopens.
+            delay = max(5.0, limit_at - time.time()) + random.uniform(0.0, 30.0)
+            note = "Usage limit: continuing automatically at %s (in %s)." % (
+                time.strftime("%I:%M %p", time.localtime(time.time() + delay)).lstrip("0"),
+                self._fmt_duration(delay))
+        else:
+            # Deterministic base delay, then jitter so sessions don't retry in
+            # lockstep.  The jittered value drives BOTH the timer and retry_at,
+            # so the UI countdown matches when the retry actually fires.
+            delay = self._apply_jitter(self._api_retry_delay(attempt))
+            note = None
+        self._cancel_api_retry_task(info)  # drop any stale timer first
+        info.retry_at = time.time() + delay
+        info.retry_attempt = attempt + 1
+        info.retry_max = self._API_RETRY_MAX
+        # info.retry_reason was set in _process_message
+        info.error = ""
+        info.state = SessionState.IDLE
+        entry = LogEntry(
+            kind="system",
+            text=note or "Auto-retrying in %s (attempt %d/%d)…" % (
+                self._fmt_duration(delay), info.retry_attempt, info.retry_max),
+        )
+        with info._lock:
+            info.entries.append(entry)
+            entry_index = len(info.entries) - 1
+        self._emit_entry(session_id, entry, entry_index)
+        self._emit_state(info)
+        # HARDENING: _arm_api_retry is reachable BOTH from the manager loop (the
+        # drive-loop finally blocks, the timer's reconnect-failed re-arm) and from
+        # off-loop callers (a failed auto-retry send re-arming from a Flask
+        # thread).  The old unconditional asyncio.create_task() only works on the
+        # loop thread; off-loop it raised RuntimeError and fell through to firing
+        # the retry INLINE — which, if that send also failed, could ping-pong
+        # between fire and re-arm.  Pick the scheduling primitive by thread.
+        coro = self._api_retry_timer(session_id, delay)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        try:
+            if running is not None:
+                info._api_retry_task = running.create_task(coro)
+            elif self._loop is not None and self._loop.is_running():
+                # Off-loop caller: hand the coroutine to the manager loop.  The
+                # returned concurrent Future exposes the .cancel()/.done() that
+                # _cancel_api_retry_task relies on.
+                info._api_retry_task = asyncio.run_coroutine_threadsafe(
+                    coro, self._loop)
+            else:
+                raise RuntimeError("no running manager event loop")
+            # Write-through: the armed instant survives a restart
+            # (SessionDurable; re-armed by _durable_restore_timers).
+            self._durable_save(info)
+        except Exception as sched_err:
+            # Nothing can run the timer (daemon shutting down / loop gone).  Do
+            # NOT fire inline here: a failing send re-arms, so an inline fire is
+            # a recursion hazard.  Surface a manual Retry rather than leaving a
+            # countdown ticking toward a timer that does not exist.
+            coro.close()
+            logger.warning("_arm_api_retry: cannot schedule the backoff timer for "
+                           "%s (%s) — surfacing manual Retry instead",
+                           session_id[:12], sched_err)
+            self._fail_retry_open(
+                session_id,
+                "Auto-retry could not be scheduled — use Retry to resume.")
+
+    # Slice length for the backoff sleep.  See _await_retry_deadline: the timer
+    # wakes at least this often to re-check the WALL clock, so a machine suspend
+    # can push a retry late by at most one slice instead of by the whole
+    # suspended duration.
+    _API_RETRY_TICK = float(os.environ.get("VIBENODE_API_RETRY_TICK", "30"))
+    _RECONNECT_STAGGER_S = 0.5
+    _EMPTY_CYCLE_WAIT_S = 0.5
+    _KILL_GRACE_S = 0.3
+    _LIMIT_SWITCH_MIN_DELAY_S = 1.0
+
+    async def _await_retry_deadline(self, deadline: float) -> None:
+        """Sleep until the wall-clock ``deadline`` (an epoch time.time() value).
+
+        HARDENING (suspend/resume).  ``asyncio.sleep`` is driven by the event
+        loop's MONOTONIC clock, which does not advance while the machine is
+        suspended, but ``retry_at`` is WALL clock.  A laptop closed for two hours
+        in the middle of a 30-minute backoff used to resume with the UI countdown
+        long expired (stuck rendering "Auto-retrying in now…") while the timer
+        still had its full remaining monotonic sleep left to run — and because
+        ``retry_at`` was still > 0 the centralized queue gate in
+        ``_try_dispatch_queue`` stayed shut for that entire extra window.  That is
+        one of the ways the auto-retry "just doesn't fire".
+
+        Sleeping in bounded slices and re-deriving the remaining time from
+        ``time.time()`` on every wake makes the timer fire when the countdown
+        actually said it would.
+        """
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, max(1.0, self._API_RETRY_TICK)))
+
+    def _fail_retry_open(self, session_id: str, message: str) -> None:
+        """Unwedge a session whose auto-retry could not be completed.
+
+        Clears the countdown fields (which RE-OPENS the queue gate), surfaces a
+        manual Retry, and drains anything that was held behind the countdown.
+
+        This is the safety net for every "the retry died on its way to firing"
+        path.  Leaving ``retry_at > 0`` with no live timer is the worst possible
+        end state: the UI shows a countdown that will never complete and
+        ``_try_dispatch_queue`` suppresses every queued message forever.  Called
+        from except handlers, so it must never raise.
+        """
+        try:
+            with self._lock:
+                info = self._sessions.get(self._resolve_id(session_id))
+            if info is None:
+                return
+            self._clear_api_retry(info, reset_count=True)
+            info.error = message
+            if info.state not in (SessionState.WORKING, SessionState.WAITING,
+                                  SessionState.STARTING, SessionState.STOPPED):
+                info.state = SessionState.IDLE
+            entry = LogEntry(kind="system", text=message, is_error=True)
+            with info._lock:
+                info.entries.append(entry)
+                entry_index = len(info.entries) - 1
+            self._emit_entry(info.session_id, entry, entry_index)
+            self._emit_state(info)
+            # The countdown is gone — let anything queued behind it through.
+            self._try_dispatch_queue(info.session_id)
+        except Exception:
+            logger.exception("_fail_retry_open failed for %s", session_id)
+
+    async def _api_retry_timer(self, session_id: str, delay: float) -> None:
+        """Sleep for the backoff delay, then fire the retry — unless cancelled
+        (Cancel button / new user message / interrupt / close) or the session is
+        no longer eligible (a newer turn started, or it was stopped).
+
+        If the retry follows a dead transport (CLI crash / connectivity loss),
+        reconnect the client first.  If the reconnect itself fails (the outage is
+        still ongoing), count the attempt and re-arm the next backoff rather than
+        giving up — that is what lets a session ride out a multi-hour outage.
+
+        HARDENING: the entire body is exception-contained.  Previously only the
+        sleep was guarded (for CancelledError) and ``_fire_api_retry`` was called
+        bare, so anything raising below became an un-retrieved asyncio task
+        exception — silent in the logs and leaving the session pinned at
+        ``retry_at > 0`` with no timer alive to ever clear it.  Any escape now
+        routes to _fail_retry_open so the session ends up with a usable manual
+        Retry instead of a dead countdown.
+        """
+        try:
+            await self._await_retry_deadline(time.time() + delay)
+        except asyncio.CancelledError:
+            return
+        try:
+            await self._api_retry_timer_fire(session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Auto-retry timer crashed for %s — clearing the countdown so the "
+                "session is not stranded behind a dead timer", session_id)
+            self._fail_retry_open(
+                session_id,
+                "Auto-retry failed unexpectedly — use Retry to resume.")
+
+    async def _api_retry_timer_fire(self, session_id: str) -> None:
+        """Deadline reached: re-check eligibility, reconnect if needed, fire.
+
+        Split out of _api_retry_timer so the timer can wrap it in a single
+        exception boundary (see the HARDENING note there).
+        """
+        with self._lock:
+            info = self._sessions.get(self._resolve_id(session_id))
+        if not info:
+            return
+        # Re-check eligibility: cancelled out from under us, or a new turn began.
+        if info.retry_at <= 0:
+            return
+        if info.state in (SessionState.STOPPED, SessionState.WORKING,
+                          SessionState.WAITING, SessionState.STARTING):
+            return
+
+        if getattr(info, '_retry_needs_reconnect', False):
+            reconnected = False
+            try:
+                reconnected = await self._reconnect_client(session_id, info)
+            except Exception as rc_err:
+                logger.warning("Auto-retry reconnect for %s raised: %s",
+                               session_id, rc_err)
+            if not reconnected:
+                # Still down — consume this attempt and schedule the next
+                # backoff (keep trying through the outage) until the budget runs
+                # out, then surface a manual Retry.
+                info._api_retry_count += 1
+                info.retry_at = 0.0
+                info._api_retry_task = None
+                # Keep state IDLE so the next _arm_api_retry passes its
+                # eligibility guard (a failed reconnect may have left it STOPPED).
+                if info.state != SessionState.IDLE:
+                    info.state = SessionState.IDLE
+                if (info._api_retry_count < self._API_RETRY_MAX
+                        and self._has_user_message(info)):
+                    self._arm_api_retry(info.session_id, info)
+                else:
+                    self._clear_api_retry(info, reset_count=True)
+                    info.error = ("Auto-retry gave up — connection still down. "
+                                  "Use Retry to try again.")
+                    info.state = SessionState.IDLE
+                    self._emit_state(info)
+                return
+            # Reconnected — transport is healthy again; resume normally.
+            info._retry_needs_reconnect = False
+
+        await self._switch_then_fire(session_id, info)
+
+    async def _switch_then_fire(self, session_id: str, info: SessionInfo) -> None:
+        """Fire a due retry, switching models first when it is a usage-limit
+        auto-switch (``limit_switch_to``).  If the switch fails, the retry is
+        re-planned to wait for the reset instead and nothing fires now."""
+        if getattr(info, "limit_switch_to", ""):
+            if not await self._apply_limit_switch(session_id, info):
+                return
+            # The switch waited on a control request.  Fire only if the retry
+            # still stands: Cancel, a new message, Stop and close all clear
+            # retry_at, a Sleep stops the session, and another turn may have
+            # taken it meanwhile.
+            if (info.retry_at <= 0 or info.state != SessionState.IDLE
+                    or self._user_stopped(info)):
+                logger.info("Usage-limit retry for %s not fired after the switch: "
+                            "it was cancelled or the session moved on (state=%s)",
+                            session_id[:12], info.state)
+                return
+        self._fire_api_retry(session_id, info)
+
+    async def _apply_limit_switch(self, session_id: str, info: SessionInfo) -> bool:
+        """Switch a usage-limited session to ``limit_switch_to``.  Returns True
+        when the caller should resume the turn now: the CLI confirmed, or there
+        was nothing left to switch (a manual model pick cleared it first, see
+        ``set_session_model``).
+
+        Same honesty contract and init guard as ``set_session_model``'s live
+        path: ``info.model`` changes only after the CLI accepted the control
+        request, and ``_model_switch_in_progress`` keeps the post-turn listener
+        from reading the side-effect ``init`` as an auto-resume (the resumed
+        turn's ``send_message`` clears the flag).  The countdown fields stay
+        set until ``_fire_api_retry`` sends, so the queue gate stays closed and
+        no queued message can jump ahead of the resumed turn.
+
+        On failure (an old CLI, a model the process rejects, no connection) the
+        session falls back to what a limit does without the switch: continue
+        when the limit resets, with the model-switch CTA still offered.
+        """
+        target = info.limit_switch_to
+        info.limit_switch_to = ""
+        if not target:
+            return True
+        limited = info.limited_model
+        info._model_switch_in_progress = True
+        info._model_switch_at = time.time()
+        try:
+            if not info.client:
+                raise RuntimeError("the session is not connected")
+            await asyncio.wait_for(self._sdk.set_model(info.client, target), timeout=20)
+        except Exception as e:
+            info._model_switch_in_progress = False
+            err = str(e) or e.__class__.__name__
+            logger.warning("Usage-limit auto-switch %s -> %s failed for %s: %s",
+                           limited, target, session_id[:12], err)
+            entry = LogEntry(kind="system", is_error=True, text=(
+                "Could not switch to %s (%s). Continuing on %s when its limit resets."
+                % (self._model_label(target), err, self._model_label(limited))))
+            with info._lock:
+                info.entries.append(entry)
+                entry_index = len(info.entries) - 1
+            self._emit_entry(session_id, entry, entry_index)
+            # Re-plan from inside the firing timer: drop this task's handle
+            # first so re-arming does not cancel the task that is running.
+            info.retry_at = 0.0
+            info._api_retry_task = None
+            if self._schedule_limit_resume(info, allow_switch=False):
+                self._arm_api_retry(session_id, info)
+            else:
+                self._clear_api_retry(info, reset_count=False)
+                info.error = "Usage limit reached. Switch models to keep working."
+                self._emit_state(info)
+            return False
+        # What the CLI now runs.  A concrete id is recorded as asked (it
+        # carries the session's [1m] choice).  A family alias ("opus") resolves
+        # inside the CLI, so read back what it picked; if that read fails, the
+        # resumed turn's init reports it through the same sink.
+        model = target
+        if not target.startswith("claude-"):
+            try:
+                model = await asyncio.wait_for(
+                    self._sdk.applied_model(info.client), timeout=10) or ""
+            except Exception:
+                model = ""
+        if model:
+            self._set_confirmed_model(info, model, save_registry=True)
+        # A later limit on the new model may go back to the one this left
+        # (_limit_switch_plan); back on it, there is nowhere further to return.
+        info._limit_origin = "" if target == info._limit_origin else limited
+        self._clear_usage_limit(info)
+        info.error = ""
+        # Every tab and device: the badge, and the CTA retracts (the payload
+        # now reports no limit).
+        self._broadcast_model_changed(session_id, info, info.model)
+        entry = LogEntry(kind="system",
+                         text="Switched to %s." % self._model_label(model or target))
+        with info._lock:
+            info.entries.append(entry)
+            entry_index = len(info.entries) - 1
+        self._emit_entry(session_id, entry, entry_index)
+        logger.info("Session %s hit a usage limit on %s; switched to %s (CLI "
+                    "confirmed), resuming the turn", session_id, limited, model or target)
+        return True
+
+    def _fire_api_retry(self, session_id: str, info: SessionInfo) -> None:
+        """Resume the failed turn.  Consumes one attempt from the budget
+        (increments _api_retry_count) and clears the countdown fields, but does
+        NOT reset the counter — the chain must accumulate so the _API_RETRY_MAX
+        cap is honored.
+
+        Prompt choice (set in _process_message via _retry_resend_original):
+        - If the failed turn produced NO output before erroring (error on the
+          first API call), RE-SEND the original request — "continue" would be
+          meaningless and makes the model ramble (confirmed via live-CLI test).
+        - If it had started working, send the CONTINUE prompt so we resume the
+          partial work instead of duplicating it.
+        """
+        # Find the last user message, and whether the failed turn produced any
+        # REAL assistant text after it.  We scan the transcript rather than rely
+        # on _turn_content_started, because the CLI emits empty assistant
+        # message_start events on each internal retry — that flag goes True even
+        # when nothing was actually produced.  An assistant entry with non-empty
+        # text after the last user message is the honest "had output" signal.
+        last_user_text = None
+        had_real_output = False
+        with info._lock:
+            last_user_idx = -1
+            for i in range(len(info.entries) - 1, -1, -1):
+                if info.entries[i].kind == "user":
+                    last_user_idx = i
+                    last_user_text = info.entries[i].text
+                    break
+            if last_user_idx >= 0:
+                for j in range(last_user_idx + 1, len(info.entries)):
+                    e = info.entries[j]
+                    # A TOOL CALL is side-effectful work (edits, commits, writes)
+                    # that must NOT be duplicated — so if the turn ran any tool,
+                    # we CONTINUE rather than re-send.  Pure-text turns (no tools)
+                    # are safe to re-send, so they don't count here.  (Note: the
+                    # CLI surfaces the API error itself as an "asst" text entry,
+                    # which is exactly why we must NOT key off assistant text —
+                    # only an actual tool_use/tool_result means real work was done.)
+                    if e.kind in ("tool_use", "tool_result"):
+                        had_real_output = True
+                        break
+        info._api_retry_task = None
+        if not last_user_text and getattr(info, "_entries_trimmed", False):
+            # The user's message was trimmed out of memory by a long turn.  A
+            # turn that long has certainly done work, so continue it.  Do not
+            # give up with "nothing to resume".
+            last_user_text = self._API_RETRY_CONTINUE_PROMPT
+            had_real_output = True
+        if not last_user_text:
+            # Nothing to continue — clear out and surface a manual-retry error.
+            self._clear_api_retry(info, reset_count=True)
+            info.error = "Session ended with error"
+            info.state = SessionState.IDLE
+            self._emit_state(info)
+            return
+        if had_real_output:
+            retry_text = self._API_RETRY_CONTINUE_PROMPT
+            note = "Auto-retrying — continuing from where it left off…"
+        else:
+            # No real output before the error — "continue" is meaningless; the
+            # model would ramble.  Re-send the original request for a clean redo.
+            retry_text = last_user_text
+            note = "Auto-retrying — re-sending your request…"
+        info._api_retry_count += 1
+        info.error = ""
+        info.state = SessionState.IDLE
+        entry = LogEntry(kind="system", text=note)
+        with info._lock:
+            info.entries.append(entry)
+            entry_index = len(info.entries) - 1
+        self._emit_entry(session_id, entry, entry_index)
+        # CRITICAL ORDERING (found via live-daemon queue testing):
+        # Keep retry_at > 0 (queue gate CLOSED) until send_message has flipped
+        # the session to WORKING.  send_message dispatches because state is IDLE
+        # (it doesn't look at retry_at); it sets WORKING synchronously under the
+        # lock.  Only THEN do we clear the countdown fields.  If we cleared
+        # retry_at first, the brief IDLE+retry_at==0 window would open the gate
+        # and a queued follow-up could auto-dispatch AHEAD of this continuation
+        # (real race observed: the queued message ran and the resend got queued
+        # behind it).  send_message uses _auto_retry so it does NOT reset the
+        # accumulated counter (only a genuine new user message does).
+        # HARDENING: this send used to be unguarded.  If it raised, the four
+        # lines below never ran and the session was left pinned at
+        # retry_at > 0 with its timer already cleared — a countdown that can
+        # never complete, a queue gate (_try_dispatch_queue) closed forever, and
+        # a UI banner stuck on "Auto-retrying in now…".  A returned
+        # {"ok": False} (e.g. "Session is stopped") was likewise discarded, so
+        # the chain just stopped mid-way with no error and no further attempts.
+        # Now: the countdown is always cleared (try/finally preserves the
+        # CRITICAL ORDERING above), and a failed send re-arms the next backoff
+        # instead of ending the chain silently.
+        send_result = None
+        send_error = None
+        try:
+            send_result = self.send_message(info.session_id, retry_text,
+                                            _auto_retry=True)
+        except Exception as send_err:
+            send_error = "%s: %s" % (type(send_err).__name__, send_err)
+            logger.exception("Auto-retry send_message raised for %s", session_id)
+        finally:
+            info.retry_at = 0.0
+            info.retry_attempt = 0
+            info.retry_max = 0
+            info.retry_reason = ""
+        if send_error is None and isinstance(send_result, dict) \
+                and not send_result.get("ok", True):
+            send_error = str(send_result.get("error") or "send rejected")
+        if send_error is not None:
+            self._handle_retry_send_failure(info, send_error)
+
+    def _handle_retry_send_failure(self, info: SessionInfo, send_error: str) -> None:
+        """An auto-retry's resend did not take.  Keep the chain alive.
+
+        The attempt has already been consumed (_fire_api_retry incremented the
+        counter before sending), so if budget remains we re-arm the next backoff
+        rather than abandoning the session.  A send failure usually means the
+        transport is dead, so the next attempt reconnects first — this is the
+        same shape as the timer's reconnect-failed re-arm and is what lets a
+        session ride out an outage that kills the CLI mid-chain.
+        """
+        logger.warning("Auto-retry resend failed for %s (%s) — attempts_used=%d/%d",
+                       info.session_id[:12], send_error,
+                       info._api_retry_count, self._API_RETRY_MAX)
+        if info.state in (SessionState.WORKING, SessionState.WAITING,
+                          SessionState.STARTING):
+            # Something else already owns the session — nothing to recover.
+            logger.info("Auto-retry resend failure for %s ignored — session is %s",
+                        info.session_id[:12], info.state)
+            return
+        if (info._api_retry_count < self._API_RETRY_MAX
+                and self._has_user_message(info)):
+            info._retry_needs_reconnect = True
+            info.state = SessionState.IDLE
+            self._arm_api_retry(info.session_id, info)
+            return
+        self._fail_retry_open(
+            info.session_id,
+            "Auto-retry gave up — could not resume the session. Use Retry to try again.")
+
+    @classmethod
+    def _is_scheduled_wakeup(cls, tool_name: str) -> bool:
+        """True only for a REAL scheduled-wake tool (ScheduleWakeup) — a
+        timer with a known fire instant the CLI reliably delivers.
+
+        Background Bash is deliberately excluded: it is not a scheduled
+        wake-up, so it must never drive the "Awaiting wake-up…" label.
+        """
+        norm = (tool_name or "").replace("_", "").replace("-", "").lower()
+        return tool_name in cls._WAKEUP_TOOL_NAMES or "schedulewake" in norm
+
+    @classmethod
+    def _wakeup_expected_delay(cls, tool_name: str, tool_input) -> float:
+        """Best-effort seconds until a wake-up tool's deferred resume fires.
+
+        Used to set a realistic phantom-wake-up deadline so a genuine long
+        sleep (e.g. ScheduleWakeup(3600)) is never falsely declared phantom,
+        while an unknowable background-Bash completion still gets a bounded
+        ceiling.  Only called when ``_tool_creates_wakeup`` is True.
+        """
+        norm = (tool_name or "").replace("_", "").replace("-", "").lower()
+        is_schedule = (
+            tool_name in cls._WAKEUP_TOOL_NAMES or "schedulewake" in norm
+        )
+        if is_schedule:
+            d = tool_input.get("delaySeconds") if isinstance(tool_input, dict) else None
+            if isinstance(d, (int, float)) and d > 0:
+                # Mirror the SDK's [60, 3600] clamp.
+                return float(min(max(d, 60.0), cls._WAKEUP_SCHEDULE_MAX))
+            # ScheduleWakeup with no parseable delay — assume the max.
+            return cls._WAKEUP_SCHEDULE_MAX
+        # Background Bash / other: completion time is unknowable → ceiling.
+        return cls._WAKEUP_UNKNOWN_DELAY_WAIT
+
+    @classmethod
+    def _tool_creates_wakeup(cls, tool_name: str, tool_input: dict) -> bool:
+        """Return True if the tool call schedules a deferred wake-up.
+
+        A "wake-up" here means the SDK will deliver an auto-resume cycle
+        (init + content + RESULT) for this session AFTER the current
+        turn's RESULT.  Detecting this lets the post-turn listener
+        suppress queue auto-dispatch — otherwise a queued message
+        races the wake-up content into the SDK buffer and the session
+        ends up reading wake-up output as the response to the queued
+        message.
+
+        Cases handled:
+        * Explicit wake-up tools: ``ScheduleWakeup`` (exact match), plus
+          substring matches like ``schedule_wakeup`` / ``WakeUp`` /
+          ``BackgroundTask`` so renames don't silently regress the fix.
+        * ``Bash`` with ``run_in_background=True``: the SDK emits a
+          ``task_notification`` when the background process exits.
+
+        Args:
+            tool_name: Tool name from the tool_use block.
+            tool_input: Tool input dict (already normalized to a dict).
+
+        Returns:
+            True if this tool call schedules a wake-up; False otherwise.
+        """
+        if not tool_name:
+            return False
+        if tool_name in cls._WAKEUP_TOOL_NAMES:
+            return True
+        # Normalize separators so ``schedule_wakeup``, ``ScheduleWakeUp``,
+        # ``schedule-wake-up``, and ``background_task_runner`` all match
+        # their substring keys (``schedulewake`` / ``wakeup`` /
+        # ``backgroundtask``).
+        normalized = ''.join(ch for ch in tool_name.lower() if ch.isalnum())
+        for sub in cls._WAKEUP_TOOL_SUBSTRINGS:
+            if sub in normalized:
+                return True
+        # Bash run_in_background — the SDK keeps the process alive past
+        # RESULT and emits a task_notification when it exits.
+        if tool_name == "Bash" and isinstance(tool_input, dict):
+            if tool_input.get("run_in_background") is True:
+                return True
+        return False
+
+    @staticmethod
+    def _tool_launches_background(tool_name: str, tool_input) -> bool:
+        """True if this tool call starts work that outlives the turn.
+
+        Input to the silent-wait backstop (HealthMonitor job 5), which must
+        tell "idle and waiting on the user" (no background work in the task)
+        apart from "idle and waiting on background work".  Distinct from
+        :meth:`_tool_creates_wakeup`: that one gates queue dispatch on
+        deferred SDK auto-resumes, and deliberately excludes Agent.
+
+        * ``Agent`` / ``Task``: background by default in current CLIs.  Only
+          an explicit ``run_in_background: false`` is a blocking call.
+        * ``Monitor``: watches in the background by design.
+        * Any tool with ``run_in_background: true`` (Bash, PowerShell, ...).
+        """
+        if not tool_name:
+            return False
+        inp = tool_input if isinstance(tool_input, dict) else {}
+        if tool_name in ("Agent", "Task"):
+            return inp.get("run_in_background") is not False
+        if tool_name == "Monitor":
+            return True
+        return inp.get("run_in_background") is True
+
+    @staticmethod
+    def _extract_tool_desc(inp: dict) -> str:
+        """Extract a human-readable description from tool input."""
+        if "description" in inp and "prompt" in inp:
+            # Agent tool — use the short description field
+            return str(inp["description"])[:200]
+        elif "command" in inp:
+            return str(inp["command"])[:300]
+        elif "file_path" in inp:
+            desc = str(inp["file_path"])
+            if "content" in inp:
+                desc += f" (write {len(str(inp.get('content', '')))} chars)"
+            return desc
+        elif "path" in inp:
+            desc = str(inp["path"])
+            if "content" in inp:
+                desc += f" (write {len(str(inp.get('content', '')))} chars)"
+            return desc
+        elif "pattern" in inp:
+            return str(inp["pattern"])[:200]
+        elif inp:
+            first_key = next(iter(inp))
+            return f"{first_key}: {str(inp[first_key])[:200]}"
+        return ""
+
+    # ------------------------------------------------------------------
+    # File-history snapshot support (rewind feature)
+    # ------------------------------------------------------------------
+
+    # File extensions worth tracking for change detection
+    _SOURCE_EXTS = {
+        '.py', '.js', '.ts', '.tsx', '.jsx', '.css', '.html', '.json',
+        '.yaml', '.yml', '.toml', '.cfg', '.ini', '.sh', '.bat', '.md',
+        '.txt', '.xml', '.sql', '.rb', '.go', '.rs', '.java', '.c',
+        '.cpp', '.h', '.hpp', '.cs', '.vue', '.svelte', '.astro',
+    }
+    # Hardcoded directory names to prune during os.walk fallback.  In
+    # addition to this list, ``_should_skip_dir`` also skips any directory
+    # containing ``pyvenv.cfg`` — the canonical marker of a Python
+    # virtualenv — so non-standard venv names (``cn_venv``, ``myenv``,
+    # etc.) are pruned automatically without needing to be added here.
+    _SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv',
+                  '.tox', '.mypy_cache', '.pytest_cache', 'dist', 'build',
+                  '.next', '.nuxt', '.claude'}
+
+    @classmethod
+    def _should_skip_dir(cls, parent: Path, name: str) -> bool:
+        """Return True if directory ``parent/name`` should be pruned from
+        os.walk traversal.  Skips known build/cache dirs by name AND any
+        directory containing a ``pyvenv.cfg`` (the canonical Python venv
+        marker — catches ``cn_venv``, ``myenv``, etc. without needing an
+        explicit name match).
+        """
+        if name in cls._SKIP_DIRS:
+            return True
+        try:
+            return (parent / name / 'pyvenv.cfg').exists()
+        except OSError:
+            return False
+
+    # Set True to log per-step timing in _drive_session / _send_query
+    _PROFILE_PIPELINE = True
+
+    # PERF-CRITICAL: git ls-files cache TTL — do NOT reduce below 120s. See CLAUDE.md #9.
+    # TTL for cached git ls-files results (seconds).  File additions during
+    # a turn are tracked via Edit/Write tool events, so this cache only needs
+    # refreshing to catch external changes.  180s keeps the subprocess from
+    # re-running on every follow-up message in a typical conversation.
+    _GIT_LS_FILES_CACHE_TTL = 180
+
+    # How many turns before forcing a full mtime rescan (0 = never force)
+    _MTIME_FULL_RESCAN_INTERVAL = 10
+
+    # Hard time budget (seconds) for any single filesystem-traversal call
+    # in ``_record_pre_turn_mtimes`` or ``_detect_changed_files``.  These
+    # functions enumerate source files to capture mtimes; on degenerate
+    # project layouts (missing/wrong ``.git``, large vendored trees, etc.)
+    # they have historically blown out to multi-minute runs and made the
+    # whole session look hung.  This budget guarantees no single call can
+    # block a turn for more than this many seconds — when it triggers, the
+    # function bails with the partial result it has, logs a warning, and
+    # the next turn proceeds normally.  Worst-case degradation: a few
+    # externally-edited files (Bash, Agent sub-tools) don't get tracked
+    # for one turn.  Acceptable; multi-second blocking is not.
+    _FS_TRAVERSAL_BUDGET_SECONDS = 2.0
+
+    # A turn whose filesystem scan finds more changed files than this is a
+    # bulk operation (git worktree add, checkout, npm install, codegen), not
+    # edits.  Its files are NOT copied into the snapshot store; files the
+    # session edited directly (tracked_files) still are.  Without this, a
+    # session whose folder holds git worktrees copied 11,154 files per turn
+    # (median) and up to 72,216, which grew ~/.claude/file-history by
+    # ~220 MB a day (measured).  Rewind cannot undo such a bulk
+    # change; git can.
+    _FS_BULK_CHANGE_LIMIT = 500
+
+    @staticmethod
+    def _is_file_tracking_enabled() -> bool:
+        """Check kanban_config.json for the file_tracking_enabled preference.
+
+        Defaults to True if the key is missing or the config file can't be read.
+        """
+        try:
+            cfg_path = Path(__file__).resolve().parents[2] / "kanban_config.json"
+            if cfg_path.exists():
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                return cfg.get("file_tracking_enabled", True)
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def _nested_repo_roots(cwd_path: Path) -> list:
+        """The repos directly under a wrapper folder, each counted ONCE.
+
+        A child whose ``.git`` is a directory is a repo.  A child whose
+        ``.git`` is a FILE is a linked worktree (``gitdir: <repo>/.git/
+        worktrees/<name>``): another checkout of a repo, so it is skipped
+        when that repo is one of the children, and kept when it belongs to
+        a repo outside the folder.
+
+        Counting every worktree as its own repo made a wrapper folder (one
+        repo plus 14 worktrees of it) list 143,442 files instead of ~10,800,
+        so every turn's mtime scan hit its 2s budget and bailed with a
+        partial, useless result: 2-12s added before each message was sent
+        (measured).
+        """
+        repos: list = []
+        worktrees: list = []
+        try:
+            children = sorted(cwd_path.iterdir())
+        except OSError:
+            return []
+        for child in children:
+            try:
+                if not child.is_dir():
+                    continue
+                dotgit = child / ".git"
+                if dotgit.is_dir():
+                    repos.append(child)
+                elif dotgit.is_file():
+                    worktrees.append(child)
+            except OSError:
+                continue
+
+        def _norm(p: Path) -> str:
+            try:
+                p = p.resolve()
+            except OSError:
+                pass
+            return os.path.normcase(str(p))
+
+        repo_gitdirs = [_norm(r / ".git") for r in repos]
+        roots = list(repos)
+        for wt in worktrees:
+            try:
+                text = (wt / ".git").read_text(encoding="utf-8",
+                                               errors="replace").strip()
+            except OSError:
+                continue
+            if not text.startswith("gitdir:"):
+                continue
+            target = Path(text[len("gitdir:"):].strip())
+            if not target.is_absolute():
+                target = wt / target
+            gd = _norm(target)
+            if any(gd == r or gd.startswith(r + os.sep) for r in repo_gitdirs):
+                continue  # another checkout of a repo already listed
+            roots.append(wt)
+        return roots
+
+    def _git_ls_files(self, cwd_path: Path, info: "SessionInfo | None" = None) -> list:
+        """Use `git ls-files` to get tracked files, respecting .gitignore.
+
+        Strategy (in order):
+          1. Run ``git ls-files`` at ``cwd_path`` directly.  Git auto-
+             discovers any ancestor ``.git`` directory, so this handles
+             both "cwd IS the repo root" and "cwd is a subdir deep in a
+             repo" (e.g. ``project_root/site/react/``).
+          2. If step 1 fails (cwd has no ancestor repo), look at
+             ``cwd_path``'s immediate children for nested repos and
+             union their ``git ls-files`` output.  This handles wrapper
+             layouts like ``Project/project_root/.git`` where
+             the session CWD sits one level above the real repo.  Linked
+             worktrees of a listed repo are skipped (``_nested_repo_roots``).
+
+        When *info* is provided, caches the result on the SessionInfo so
+        subsequent calls within the TTL window skip the subprocess entirely.
+
+        Returns a list of absolute Path objects, or None if neither step
+        located a repo.
+        """
+        # ── Check per-session cache ──
+        if info is not None:
+            now = time.time()
+            if (info._cached_git_files
+                    and now - info._cached_git_files_ts < self._GIT_LS_FILES_CACHE_TTL):
+                return info._cached_git_files
+
+        import subprocess as _sp
+
+        def _run_ls_files(root: Path) -> list | None:
+            try:
+                result = _sp.run(
+                    ["git", "ls-files", "-z"],
+                    cwd=str(root),
+                    capture_output=True,
+                    timeout=10,
+                )
+                if result.returncode != 0:
+                    return None
+                out: list = []
+                for rel in result.stdout.split(b'\x00'):
+                    if rel:
+                        out.append(root / rel.decode('utf-8', errors='replace'))
+                return out
+            except Exception:
+                return None
+
+        # Step 1: try cwd directly (git auto-discovers ancestor repos)
+        paths = _run_ls_files(cwd_path)
+
+        # Step 2: cwd isn't inside any repo — look one level down for
+        # nested repos (wrapper-folder layout).
+        if paths is None:
+            paths = []
+            for child in self._nested_repo_roots(cwd_path):
+                child_paths = _run_ls_files(child)
+                if child_paths is not None:
+                    paths.extend(child_paths)
+            if not paths:
+                return None
+
+        # ── Store in per-session cache ──
+        if info is not None:
+            info._cached_git_files = paths
+            info._cached_git_files_ts = time.time()
+
+        return paths
+
+    def _record_pre_turn_mtimes(self, info: SessionInfo) -> None:
+        """Snapshot mtimes of source files in the working directory.
+
+        Only used as a fallback when the streaming message handler doesn't
+        see direct Edit/Write tool uses (e.g. Agent sub-agent edits).
+        Uses `git ls-files` when available (fast, respects .gitignore),
+        falls back to os.walk with directory pruning.
+
+        **Optimisation:** On follow-up turns, if ``_post_turn_mtimes`` was
+        populated by the previous turn's ``_detect_changed_files``, we carry
+        it forward directly instead of re-walking + re-stat-ing every file.
+        A full rescan is forced every ``_MTIME_FULL_RESCAN_INTERVAL`` turns
+        so newly-added files are eventually picked up.
+        """
+        if not self._is_file_tracking_enabled():
+            info._pre_turn_mtimes = {}
+            return
+
+        cwd = info.cwd
+        if not cwd:
+            return
+        cwd_path = Path(cwd)
+        if not cwd_path.is_dir():
+            return
+
+        # PERF-CRITICAL: Mtime carry-forward avoids full git ls-files + stat every turn. See CLAUDE.md #4.
+        #
+        # LESSON LEARNED: Every follow-up turn used to do a full
+        # git ls-files + stat() on every source file in the project.  With a
+        # typical project of 200+ files, this took 60-80ms per turn.  The
+        # carry-forward pattern reuses the mtime snapshot from the previous
+        # turn's post-turn _detect_changed_files (which already scanned
+        # everything).  The chain: post-turn populates _post_turn_mtimes →
+        # next pre-turn carries it to _pre_turn_mtimes → next post-turn
+        # compares against it.  A full rescan is forced every
+        # _MTIME_FULL_RESCAN_INTERVAL turns to pick up newly added files.
+        #
+        # ── Fast path: carry forward from previous turn ──
+        info._mtime_turn_count += 1
+        force_rescan = (self._MTIME_FULL_RESCAN_INTERVAL > 0
+                        and info._mtime_turn_count % self._MTIME_FULL_RESCAN_INTERVAL == 0)
+
+        if info._post_turn_mtimes and not force_rescan:
+            info._pre_turn_mtimes = info._post_turn_mtimes
+            info._post_turn_mtimes = {}
+            logger.debug("_record_pre_turn_mtimes: carried forward %d files (turn %d)",
+                         len(info._pre_turn_mtimes), info._mtime_turn_count)
+            return
+
+        # ── Full rescan ──
+        mtimes = {}
+        budget = self._FS_TRAVERSAL_BUDGET_SECONDS
+        budget_exceeded = False
+        try:
+            # Fast path: use git ls-files (respects .gitignore)
+            git_files = self._git_ls_files(cwd_path, info)
+            # The budget bounds the WALK below, so it starts after git returns
+            # (git has its own timeout).  Started before it, a slow git launch
+            # on a busy machine spent the whole budget and the snapshot came
+            # back empty, hiding every edit from rewind.
+            deadline = time.monotonic() + budget
+            if git_files is not None:
+                for i, f in enumerate(git_files):
+                    # Check budget every 256 files to keep clock-read overhead trivial
+                    if (i & 0xFF) == 0 and time.monotonic() > deadline:
+                        budget_exceeded = True
+                        break
+                    if f.suffix.lower() not in self._SOURCE_EXTS:
+                        continue
+                    try:
+                        mtimes[str(f)] = f.stat().st_mtime
+                    except OSError:
+                        pass
+            else:
+                # Fallback: os.walk with directory pruning
+                processed = 0
+                for dirpath, dirnames, filenames in os.walk(cwd_path):
+                    if time.monotonic() > deadline:
+                        budget_exceeded = True
+                        break
+                    dp = Path(dirpath)
+                    dirnames[:] = [d for d in dirnames if not self._should_skip_dir(dp, d)]
+                    for fname in filenames:
+                        processed += 1
+                        if (processed & 0xFF) == 0 and time.monotonic() > deadline:
+                            budget_exceeded = True
+                            break
+                        f = dp / fname
+                        if f.suffix.lower() not in self._SOURCE_EXTS:
+                            continue
+                        try:
+                            mtimes[str(f)] = f.stat().st_mtime
+                        except OSError:
+                            pass
+                    if budget_exceeded:
+                        break
+        except Exception as e:
+            logger.warning("_record_pre_turn_mtimes failed: %s", e)
+        if budget_exceeded:
+            logger.warning(
+                "_record_pre_turn_mtimes: %.1fs budget exceeded for %s "
+                "(captured %d files) — bailing with partial result",
+                budget, cwd, len(mtimes),
+            )
+        info._pre_turn_mtimes = mtimes
+        info._post_turn_mtimes = {}
+        logger.debug("_record_pre_turn_mtimes: full rescan %d files in %s (turn %d)",
+                     len(mtimes), cwd, info._mtime_turn_count)
+
+    def _detect_changed_files(self, info: SessionInfo) -> set:
+        """Compare current file mtimes against the pre-turn snapshot.
+
+        Returns absolute paths of files that were created or modified
+        since _record_pre_turn_mtimes was called.
+        Uses `git ls-files` when available, falls back to os.walk with pruning.
+
+        Side-effect: populates ``info._post_turn_mtimes`` with the fresh
+        mtime dict so the next turn can carry it forward without re-scanning.
+        """
+        if not self._is_file_tracking_enabled():
+            return set()
+
+        cwd = info.cwd
+        if not cwd:
+            return set()
+        cwd_path = Path(cwd)
+        if not cwd_path.is_dir():
+            return set()
+
+        pre = info._pre_turn_mtimes
+        changed = set()
+        post_mtimes = {}
+        budget = self._FS_TRAVERSAL_BUDGET_SECONDS
+        budget_exceeded = False
+        try:
+            # Fast path: use git ls-files (cached per-session)
+            git_files = self._git_ls_files(cwd_path, info)
+            # Budget starts after git returns; see _record_pre_turn_mtimes.
+            deadline = time.monotonic() + budget
+            if git_files is not None:
+                for i, f in enumerate(git_files):
+                    if (i & 0xFF) == 0 and time.monotonic() > deadline:
+                        budget_exceeded = True
+                        break
+                    if f.suffix.lower() not in self._SOURCE_EXTS:
+                        continue
+                    fpath = str(f)
+                    try:
+                        current_mtime = f.stat().st_mtime
+                    except OSError:
+                        continue
+                    post_mtimes[fpath] = current_mtime
+                    if fpath not in pre or pre[fpath] != current_mtime:
+                        changed.add(fpath)
+            else:
+                # Fallback: os.walk with directory pruning
+                processed = 0
+                for dirpath, dirnames, filenames in os.walk(cwd_path):
+                    if time.monotonic() > deadline:
+                        budget_exceeded = True
+                        break
+                    dp = Path(dirpath)
+                    dirnames[:] = [d for d in dirnames if not self._should_skip_dir(dp, d)]
+                    for fname in filenames:
+                        processed += 1
+                        if (processed & 0xFF) == 0 and time.monotonic() > deadline:
+                            budget_exceeded = True
+                            break
+                        f = dp / fname
+                        if f.suffix.lower() not in self._SOURCE_EXTS:
+                            continue
+                        fpath = str(f)
+                        try:
+                            current_mtime = f.stat().st_mtime
+                        except OSError:
+                            continue
+                        post_mtimes[fpath] = current_mtime
+                        if fpath not in pre or pre[fpath] != current_mtime:
+                            changed.add(fpath)
+                    if budget_exceeded:
+                        break
+        except Exception as e:
+            logger.warning("_detect_changed_files failed: %s", e)
+        if budget_exceeded:
+            logger.warning(
+                "_detect_changed_files: %.1fs budget exceeded for %s "
+                "(captured %d files, %d changed) — bailing with partial result",
+                budget, cwd, len(post_mtimes), len(changed),
+            )
+
+        # Save for carry-forward on next turn
+        info._post_turn_mtimes = post_mtimes
+        return changed
+
+    def _touch_tracked_file(self, info: "SessionInfo", fp: str) -> None:
+        """Mark ``fp`` as directly edited this turn.
+
+        PERF-CRITICAL: bounded via ``_TRACKED_FILES_LRU_CAP``.  ``.add`` on
+        the LRU either moves ``fp`` to the most-recently-touched end (if
+        already present) or appends it and evicts the least-recently-touched
+        entry when the cap would be exceeded.
+
+        Do NOT bypass this helper for direct-edit tool_use blocks —
+        ``info.tracked_files.add`` works but centralising the touch call site
+        keeps the audit trail explicit and lets a future maintainer hook
+        counters/telemetry in one place.
+        """
+        info.tracked_files.add(fp)
+
+    def _prepopulate_tracked_files(self, info: SessionInfo) -> None:
+        """Scan the session storage for tracked files from two sources:
+
+        1. Past Edit/Write/MultiEdit/NotebookEdit tool_use blocks
+        2. Existing file-history-snapshot entries (catches files tracked
+           by previous daemon runs or the CLI itself)
+
+        This ensures snapshots work after daemon restart or for resumed
+        sessions.
+
+        Only runs ONCE per session — after the initial scan, real-time
+        tracking in _process_message keeps tracked_files up to date.
+        Re-parsing a 38MB JSONL on every follow-up message was blocking
+        the asyncio event loop and starving all other sessions.
+
+        Delegates the actual JSONL scanning to
+        ``self._store.read_tracked_files_cached()`` (fix #4), which
+        consults a next-to-JSONL sidecar keyed on the JSONL's
+        ``(st_mtime_ns, st_size)`` — an O(1) JSON read on the hot path
+        (daemon restart, session recovery, first open of a stale
+        session).  On sidecar miss/corruption it falls back to the full
+        JSONL walk and best-effort writes a fresh sidecar for next time.
+
+        The cached method returns ``found`` as an encounter-ordered
+        LIST so ``_TrackedFilesLRU.update`` (fix #3, cap=200) evicts the
+        OLDEST-encountered entries when the count exceeds the cap —
+        matching the semantics of a fresh cold walk fed into the same
+        LRU.
+        """
+        if info._tracked_files_populated:
+            return
+        try:
+            found, max_version, last_user_uuid, last_asst_uuid = \
+                self._store.read_tracked_files_cached(
+                    info.session_id, cwd=info.cwd or "",
+                )
+
+            # Cache user/assistant UUIDs so _write_file_snapshot
+            # doesn't have to re-parse the entire JSONL every turn.
+            if last_user_uuid:
+                info._last_user_uuid = last_user_uuid
+            if last_asst_uuid:
+                info._last_asst_uuid = last_asst_uuid
+
+            if found:
+                # ``found`` is encounter-ordered; ``update`` iterates and
+                # calls ``add`` on the LRU, so if len(found) > cap the
+                # oldest-encountered entries are evicted.
+                info.tracked_files.update(found)
+                # Restore version counters so new backups don't collide
+                for fp, v in max_version.items():
+                    if v > info.file_versions.get(fp, 0):
+                        info.file_versions[fp] = v
+                logger.info(
+                    "_prepopulate_tracked_files(%s): found %d files from store",
+                    info.session_id, len(found),
+                )
+            info._tracked_files_populated = True
+        except Exception as e:
+            logger.warning("_prepopulate_tracked_files failed for %s: %s", info.session_id, e)
+            # Mark as populated even on failure — don't retry on every message.
+            # Real-time tracking in _process_message will catch new edits.
+            info._tracked_files_populated = True
+
+    def _write_file_snapshot(self, session_id: str, is_post_turn: bool = False) -> None:
+        """Create file backups and append a file-history-snapshot to the JSONL.
+
+        Replicates the native Claude Code CLI behavior:
+        - Pre-turn  (is_post_turn=False): ``isSnapshotUpdate: false``,
+          linked to the **user** message UUID.  Captures state before edits.
+        - Post-turn (is_post_turn=True):  ``isSnapshotUpdate: true``,
+          outer ``messageId`` = latest **assistant** UUID, inner
+          ``messageId`` = the user UUID from the pre-turn snapshot.
+          Captures state after edits.
+
+        File change detection uses filesystem mtime comparison so it
+        catches edits from Agent sub-agents, Bash, or anything else.
+        """
+        if not self._is_file_tracking_enabled():
+            return
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            logger.info("_write_file_snapshot(%s): skipped (no session info)", session_id)
+            return
+
+        # ── Filesystem fallback for change detection ──
+        #
+        # PERF-CRITICAL: tracked_files snowball prevention — fs_changed are snapshot extras only. See CLAUDE.md #7.
+        # PERF-CRITICAL: is_post_turn guard — skips _detect_changed_files on pre-turn. See CLAUDE.md #1.
+        #
+        # LESSON LEARNED (performance overhaul):
+        #
+        # Problem 1 — tracked_files snowball:
+        #   We used to add fs_changed files to info.tracked_files permanently.
+        #   When test suites or Agent sub-agents touched many project files,
+        #   tracked_files grew to 1,400+ entries.  Every subsequent turn then
+        #   read, hashed, and backed up all 1,400 files — turns took 20-55s.
+        #   Fix: fs_changed is used for the CURRENT snapshot only (fs_snapshot_extras),
+        #   never added to tracked_files.  tracked_files only grows via direct
+        #   Edit/Write tool uses seen in the streaming message handler.
+        #
+        # Problem 2 — pre-turn filesystem scan was waste:
+        #   _detect_changed_files runs git ls-files + stat() + file read + MD5
+        #   on ~200 files to find what changed since last turn.  On pre-turn,
+        #   _turn_had_direct_edit is ALWAYS False (the turn hasn't started yet),
+        #   so the fallback triggered every time — scanning 199 files for 2-138ms.
+        #   But the pre-turn snapshot only needs files THIS session edited
+        #   (tracked_files), not changes from other sessions.  Other sessions'
+        #   edits are noise — this session didn't cause them, Rewind doesn't
+        #   need to undo them.  Fix: guard with is_post_turn.  The filesystem
+        #   fallback now only runs post-turn, where it catches Agent/Bash edits
+        #   that bypassed the Edit/Write tool tracking.
+        fs_snapshot_extras = set()
+        if is_post_turn and not info._turn_had_direct_edit:
+            fs_changed = self._detect_changed_files(info)
+            if fs_changed and len(fs_changed) > self._FS_BULK_CHANGE_LIMIT:
+                logger.info("_write_file_snapshot(%s): bulk filesystem change of %d files "
+                            "(limit %d) not snapshotted; direct edits still are",
+                            session_id, len(fs_changed), self._FS_BULK_CHANGE_LIMIT)
+            elif fs_changed:
+                fs_snapshot_extras = fs_changed
+                logger.info("_write_file_snapshot(%s): filesystem fallback detected %d changed files (snapshot-only)",
+                            session_id, len(fs_changed))
+
+        # Combine direct-edit tracked files with filesystem-detected extras
+        all_snapshot_files = info.tracked_files | fs_snapshot_extras
+        if not all_snapshot_files:
+            logger.info("_write_file_snapshot(%s): skipped (no tracked files)", session_id)
+            return
+
+        # ── PERF-CRITICAL: snapshot dedup — early-exit when nothing changed. ──
+        #
+        # The full pool path below classifies each file as skip / missing /
+        # unchanged / backup, populates ``tracked_backups`` only from the
+        # ``missing`` and ``backup`` branches, and gates the JSONL write on
+        # ``has_valid`` (any real backup produced).  On a turn where no
+        # tracked file has changed, every file returns "skip", ``tracked_backups``
+        # is empty, ``has_valid=False``, and the snapshot line is not written.
+        # That existing write-side dedup is what keeps the JSONL from growing
+        # by one full-inventory line per turn.
+        #
+        # This outer short-circuit reaches the same "no snapshot" verdict
+        # WITHOUT paying for the ThreadPoolExecutor setup, the parallel stat
+        # sweep, or the 64 KB tail read in ``_store.read_tail_uuids``.  It
+        # composes with (does not replace) the inner ``_process_one`` fast
+        # path: when the outer check bails, the pool runs unchanged.
+        #
+        # Preconditions to attempt the check:
+        #   - no external edits detected this turn (``fs_snapshot_extras``
+        #     is empty — the ``_detect_changed_files`` guard has already
+        #     been evaluated),
+        #   - ``_last_mtime_size`` is populated (some file has been backed
+        #     up in this SessionInfo's lifetime; empty on first turn AND
+        #     first turn after daemon restart per ``_prepopulate_tracked_files``
+        #     which does not persist ``_last_mtime_size``).
+        #
+        # Bail on the first mismatch: cache miss, stat failure, or
+        # (mtime, size) differ.  Worst-case adds one serial stat per file
+        # for change-heavy turns — but the pool below would have stat'd
+        # every file anyway.
+        #
+        # Do NOT extend this to also skip the ``_process_one`` scan when
+        # some files DID change: the scan is what keeps ``_last_mtime_size``
+        # and ``_last_hashes`` current (mtime bump + hash unchanged case).
+        if not fs_snapshot_extras and info._last_mtime_size:
+            _all_unchanged = True
+            for _fp in all_snapshot_files:
+                _cached = info._last_mtime_size.get(_fp)
+                if _cached is None:
+                    _all_unchanged = False
+                    break
+                try:
+                    _st = os.stat(_fp)
+                except (OSError, FileNotFoundError):
+                    _all_unchanged = False
+                    break
+                if _cached != (_st.st_mtime, _st.st_size):
+                    _all_unchanged = False
+                    break
+            if _all_unchanged:
+                if self._PROFILE_PIPELINE:
+                    logger.info(
+                        "PROFILE _write_file_snapshot(%s): dedup early-exit "
+                        "(all %d files unchanged, no fs extras)",
+                        session_id[:12], len(all_snapshot_files),
+                    )
+                return
+
+        # ── Profiling (gated by _PROFILE_PIPELINE) ──
+        # Tracks loop wall-clock + cache-hit rate so the same metric the
+        # snowball regression was caught with (write_snapshot+record_mtimes
+        # ballooning into hundreds of seconds) is visible per-call, not just
+        # at the _send_query stage.  Three numbers are useful for triage:
+        #   tracked / extras / total — confirms the snowball source
+        #   short_circuit_hits      — measures the (mtime, size) skip rate
+        #   loop_secs               — the actual disk-IO cost on this turn
+        _t_loop = time.perf_counter() if self._PROFILE_PIPELINE else 0.0
+        _short_circuit_hits = 0
+
+        try:
+            sid = info.session_id
+            history_dir = self._BACKEND.file_history_dir(Path.home()) / sid
+            history_dir.mkdir(parents=True, exist_ok=True)
+
+            tracked_backups = {}
+
+            # ── Per-file processor (runs in a thread pool below) ──
+            # PERF-CRITICAL: the read_bytes + md5 loop
+            # used to be sequential.  On Windows with Defender real-time
+            # scan + OneDrive in Documents/, hashing 2,800+ backed-up files
+            # took 130-380 s per pre-turn snapshot — blocking the query
+            # before it ever reached Claude.  Two fixes:
+            #
+            #   1. (mtime, size) short-circuit — if a file's stat metadata
+            #      matches what we recorded the last time we backed it up,
+            #      its content is unchanged and we can skip the read + md5
+            #      entirely.  This is the dominant speedup; on a typical
+            #      follow-up turn with 1000 tracked files and 1 changed,
+            #      999 hits the short-circuit and the loop runs in <100 ms.
+            #
+            #   2. Thread pool — the few files that DO need hashing run
+            #      in parallel, so the slow path is also bounded.  Pool
+            #      size is small (8) because the bottleneck is filesystem
+            #      IO + AV scan, not CPU.
+            #
+            # ``_last_hashes`` alone wasn't enough: it required a full
+            # read_bytes + md5 to even know whether content was unchanged.
+            # ``_last_mtime_size`` lets us skip the read in the common case.
+            def _process_one(fpath: str):
+                """Return (fpath, action_kind, payload) for the main thread to apply.
+
+                action_kind:
+                  'skip'        — file unchanged or unreadable (no entry written)
+                  'missing'     — file gone; record None backup if previously tracked
+                  'unchanged'   — hash matched _last_hashes; no new backup version
+                  'backup'      — produced a new backup; payload carries metadata
+                """
+                p = Path(fpath)
+                try:
+                    st = p.stat()
+                except (OSError, FileNotFoundError):
+                    # File gone — record missing entry only if we'd backed it up before
+                    if fpath in info._last_hashes:
+                        return (fpath, "missing", None)
+                    return (fpath, "skip", None)
+
+                # ── Fast path: stat-based short-circuit ──
+                # If (mtime, size) matches what we recorded last backup,
+                # the content is byte-identical to what's already backed
+                # up.  Skip the read_bytes + md5.  This is the hot path
+                # on Windows, where AV scans dominate read latency.
+                last_ms = info._last_mtime_size.get(fpath)
+                if last_ms is not None and last_ms == (st.st_mtime, st.st_size):
+                    return (fpath, "skip", None)
+
+                try:
+                    content = p.read_bytes()
+                except Exception:
+                    return (fpath, "skip", None)
+
+                content_hash = hashlib.md5(content).hexdigest()[:16]
+
+                # Even if mtime changed, hash may not have — touch(1)
+                # bumps mtime without changing content.  Refresh the
+                # cache so the short-circuit catches this file next turn.
+                if info._last_hashes.get(fpath) == content_hash:
+                    return (fpath, "unchanged",
+                            (st.st_mtime, st.st_size, content_hash))
+
+                # Real change: caller will assign next version + write backup.
+                return (fpath, "backup",
+                        (st.st_mtime, st.st_size, content_hash, content))
+
+            # ── Parallel scan ──
+            # Bounded pool (8) keeps simultaneous AV reads under control on
+            # Windows while still cutting wall time by ~3-4x in the worst
+            # case where many files actually changed.
+            from concurrent.futures import ThreadPoolExecutor as _Pool
+            _file_list = list(all_snapshot_files)
+            _max_workers = min(8, max(1, len(_file_list)))
+            with _Pool(max_workers=_max_workers, thread_name_prefix="snap") as _ex:
+                results = list(_ex.map(_process_one, _file_list))
+
+            # ── Apply results on the calling thread (no lock needed:
+            #    _write_file_snapshot is invoked serially per session) ──
+            for fpath, kind, payload in results:
+                if kind == "skip":
+                    _short_circuit_hits += 1
+                    continue
+                if kind == "missing":
+                    tracked_backups[fpath] = {
+                        "backupFileName": None,
+                        "version": 0,
+                        "backupTime": None,
+                    }
+                    continue
+                if kind == "unchanged":
+                    mtime, size, content_hash = payload
+                    info._last_mtime_size[fpath] = (mtime, size)
+                    info._last_hashes[fpath] = content_hash
+                    continue
+                # kind == "backup"
+                mtime, size, content_hash, content = payload
+                version = info.file_versions.get(fpath, 0) + 1
+                info.file_versions[fpath] = version
+                info._last_hashes[fpath] = content_hash
+                info._last_mtime_size[fpath] = (mtime, size)
+
+                backup_name = f"{content_hash}@v{version}"
+                backup_path = history_dir / backup_name
+                if not backup_path.exists():
+                    try:
+                        backup_path.write_bytes(content)
+                    except Exception as werr:
+                        logger.debug("backup write failed for %s: %s", fpath, werr)
+                        continue
+
+                tracked_backups[fpath] = {
+                    "backupFileName": backup_name,
+                    "version": version,
+                    "backupTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                }
+
+            if self._PROFILE_PIPELINE:
+                logger.info(
+                    "PROFILE _write_file_snapshot(%s): tracked=%d extras=%d total=%d "
+                    "short_circuit_hits=%d new_backups=%d loop=%.3fs",
+                    session_id[:12],
+                    len(info.tracked_files),
+                    len(fs_snapshot_extras),
+                    len(_file_list),
+                    _short_circuit_hits,
+                    sum(1 for v in tracked_backups.values()
+                        if isinstance(v, dict) and v.get("backupFileName")),
+                    time.perf_counter() - _t_loop,
+                )
+
+            has_valid = any(
+                isinstance(v, dict) and v.get("backupFileName")
+                for v in tracked_backups.values()
+            )
+            if not has_valid:
+                logger.info("_write_file_snapshot: no valid backups, skipping")
+                return
+
+            # Read UUIDs from the tail of the session storage.
+            # Delegated to ChatStore — reads only the last 64KB for performance.
+            last_user_uuid, last_asst_uuid = self._store.read_tail_uuids(
+                info.session_id, cwd=info.cwd or ""
+            )
+
+            # CLI pattern:
+            #   pre-turn:  outer=user_uuid, inner=user_uuid, isSnapshotUpdate=false
+            #   post-turn: outer=asst_uuid, inner=user_uuid, isSnapshotUpdate=true
+            fallback = str(uuid_mod.uuid4())
+            if is_post_turn:
+                outer_mid = last_asst_uuid or fallback
+                inner_mid = last_user_uuid or outer_mid
+                is_update = True
+            else:
+                outer_mid = last_user_uuid or fallback
+                inner_mid = outer_mid
+                is_update = False
+
+            now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            snapshot_entry = {
+                "type": "file-history-snapshot",
+                "messageId": outer_mid,
+                "snapshot": {
+                    "messageId": inner_mid,
+                    "trackedFileBackups": tracked_backups,
+                    "timestamp": now_iso,
+                },
+                "isSnapshotUpdate": is_update,
+            }
+
+            # Append snapshot to session storage via ChatStore
+            self._store.write_snapshot(
+                info.session_id, snapshot_entry, cwd=info.cwd or ""
+            )
+
+            logger.info(
+                "Wrote file-history-snapshot for %s (update=%s, %d files, outer=%s inner=%s)",
+                sid, is_update,
+                sum(1 for v in tracked_backups.values()
+                    if isinstance(v, dict) and v.get("backupFileName")),
+                outer_mid[:12], inner_mid[:12],
+            )
+        except Exception as e:
+            logger.warning("Failed to write file snapshot for %s: %s", session_id, e)
+
+    # ------------------------------------------------------------------
+    # Registry methods — thin wrappers delegating to SessionRegistry
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_hosted(info) -> bool:
+        """True when this session's CLI runs in a Session Host
+        (``src/engine/session_host.py``).  A plain flag set where the hosted client
+        is created, never inferred from the SDK object (a test double answers
+        every attribute)."""
+        return getattr(info, "_hosted", False) is True
+
+    def _host_wanted(self, session_type: str) -> bool:
+        """Should a NEW CLI for this session start inside a Session Host?
+        ``VIBENODE_SESSION_HOST`` on, a backend that can host, and a session
+        that is ever recovered (planner and title sessions are not)."""
+        if session_type in ("planner", "title"):
+            return False
+        if getattr(self._sdk, "supports_hosting", False) is not True:
+            return False
+        try:
+            from engine import session_host_protocol as _shp
+            return _shp.enabled()
+        except Exception:
+            return False
+
+    async def _attach_hosted(self, record: dict, timeout: float = 5.0) -> Optional[str]:
+        """Reattach a session whose CLI survived the previous engine inside
+        its Session Host.  Builds the SessionInfo from the registry (name,
+        cwd, model, effort) and SessionDurable (allow-lists, timers, aliases),
+        connects to the host (``initialize`` is answered from the host's
+        cache), then hands the client to ``_drive_session(attach=...)``.
+        Returns the session id, or None when the host could not be reached
+        (the caller falls back to ``--resume``)."""
+        sid = str(record.get("sid") or "")
+        if not sid:
+            return None
+        resolved = self._resolve_id(sid)
+        with self._lock:
+            existing = self._sessions.get(resolved)
+            if existing is not None and existing.state != SessionState.STOPPED:
+                return None
+        try:
+            sessions = self._reg.load_registry().get("sessions", {}) or {}
+        except Exception:
+            sessions = {}
+        reg = sessions.get(resolved) or sessions.get(sid) or {}
+        cwd = record.get("cwd") or reg.get("cwd") or ""
+        if cwd:
+            cwd = os.path.normpath(cwd)
+        info = SessionInfo(
+            session_id=resolved,
+            name=reg.get("name", "") or "",
+            cwd=cwd,
+            model=reg.get("model", "") or "",
+            effort=reg.get("effort", "") or "",
+            state=SessionState.STARTING,
+            session_type=reg.get("session_type", "") or "",
+            parent_session_id=reg.get("parent_session_id"),
+            subsession_origin_turn=int(reg.get("subsession_origin_turn") or 0),
+            parent_deleted_at=reg.get("parent_deleted_at"),
+            auto_report_on_idle=bool(reg.get("auto_report_on_idle", False)),
+        )
+        try:
+            from engine import session_durable as _sd
+            rec = _sd.load(resolved)
+            if rec:
+                restore = _sd.apply_static(info, rec, attached=True)
+                # A permission request still open is replayed by the host and
+                # asked again; it is not lost.
+                restore["lost_permission"] = ""
+                info._durable_restore = restore
+                for old in getattr(info, "_durable_aliases", ()) or ():
+                    with self._lock:
+                        self._id_aliases.setdefault(old, resolved)
+        except Exception:
+            logger.exception("SessionDurable restore failed for hosted %s", resolved)
+        options = SessionOptions(
+            cwd=cwd or None,
+            permission_callback=self._make_permission_callback(resolved),
+            pre_compact_callback=self._make_pre_compact_callback(resolved),
+            turn_end_callback=self._make_turn_end_callback(resolved),
+            include_partial_messages=True,
+            hosted=True,
+            host_sid=sid,
+            attach=record,
+        )
+        try:
+            client = await self._sdk.create_session(options)
+        except Exception:
+            logger.exception("Session Host attach: client for %s failed", resolved)
+            return None
+        info.client = client
+        with self._lock:
+            self._sessions[resolved] = info
+        try:
+            await asyncio.wait_for(self._sdk.connect(client), timeout)
+        except BaseException as exc:
+            logger.warning("Session Host attach for %s failed: %s", resolved, exc)
+            with self._lock:
+                if self._sessions.get(resolved) is info:
+                    del self._sessions[resolved]
+            info.client = None
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return None
+        self._mark_hosted(info, client)
+        hello = self._sdk.host_hello(client) or {}
+        info._cli_pid = self._sdk.extract_process_pid(client)
+        logger.info("Session Host: reattached %s (cli pid %s, turn in flight %s, "
+                    "%s replayed line(s))", resolved, info._cli_pid,
+                    hello.get("turn_in_flight"), hello.get("replay_count"))
+        self._loop.create_task(self._tracked_coro(info, self._drive_session(
+            resolved, "", cwd, False, attach=hello)))
+        return resolved
+
+    def attach_hosted_sessions(self, records: list, each_timeout: float = 5.0,
+                               total_timeout: float = 15.0) -> dict:
+        """Reattach ``records`` in parallel (``session_host_registry.reconcile``
+        calls this from ``start()`` before the engine binds its IPC port).
+        Returns ``{record sid: attached session id or None}``."""
+        out = {}
+        if not records or not self._loop or not self._loop.is_running():
+            return out
+        futs = {}
+        for rec in records:
+            futs[rec.get("sid")] = asyncio.run_coroutine_threadsafe(
+                self._attach_hosted(rec, each_timeout), self._loop)
+        deadline = time.monotonic() + total_timeout
+        for sid, fut in futs.items():
+            try:
+                out[sid] = fut.result(timeout=max(0.1, deadline - time.monotonic()))
+            except Exception as exc:
+                logger.warning("Session Host attach for %s did not finish: %s", sid, exc)
+                fut.cancel()
+                out[sid] = None
+        return out
+
+    def _mark_hosted(self, info, client) -> None:
+        """Record on ``info`` whether ``client`` runs in a Session Host."""
+        try:
+            rec = self._sdk.host_record(client) if client is not None else None
+        except Exception:
+            rec = None
+        if isinstance(rec, dict):
+            info._hosted = True
+            info._host_record = rec
+            closed = getattr(self, "_host_closed", None)
+            if isinstance(closed, set):       # woken again: a live host, not a closed one
+                closed.discard(info.session_id)
+                closed.discard(rec.get("sid"))
+        else:
+            info._hosted = False
+            info._host_record = None
+
+    def _reg_entry(self, info) -> dict:
+        """One session's registry snapshot entry (see ``_save_registry_now``)."""
+        entry = {
+            "name": info.name,
+            "cwd": info.cwd,
+            "model": info.model,
+            "effort": info.effort,
+            "session_type": info.session_type,
+            "state": info.state.value,
+            "started_at": (
+                info.entries[0].timestamp if info.entries else time.time()
+            ),
+            "last_activity": time.time(),
+            # Subsessions (spec §4.1) — backward-compatible additions.
+            # Older registry readers ignore unknown keys; newer
+            # readers use .get() with defaults so an older snapshot
+            # without these keys still loads cleanly.
+            "parent_session_id": info.parent_session_id,
+            "subsession_origin_turn": info.subsession_origin_turn,
+            "parent_deleted_at": info.parent_deleted_at,
+            # Phase 6.5 P1-4: persist the auto-report toggle so a
+            # daemon restart preserves the user's preference.
+            "auto_report_on_idle": info.auto_report_on_idle,
+        }
+        if self._is_hosted(info):
+            # Its CLI lives in a Session Host and outlives this engine.
+            entry["hosted"] = True
+        return entry
+
+    def _save_registry_now(self, extra: Optional[dict] = None) -> None:
+        """Prepare a snapshot of active sessions and save via SessionRegistry.
+
+        ``extra``: entries to write as-is (``stop()`` passes the hosted
+        sessions it detached, with their pre-detach state)."""
+        sessions_data = dict(extra or {})
+        with self._lock:
+            live = set(self._sessions.keys()) | set(sessions_data)
+            for sid, info in self._sessions.items():
+                if info.state == SessionState.STOPPED:
+                    continue
+                sessions_data[sid] = self._reg_entry(info)
+
+        # Carry forward dormant restart-memory so idle-session display state
+        # survives MORE THAN ONE restart.  recover_sessions() deliberately does
+        # NOT relaunch pure-idle sessions, so they never enter self._sessions
+        # and the loop above omits them.  Without this merge, the first save
+        # after a reboot rewrites the registry with ONLY the relaunched (live)
+        # sessions, erasing every dormant idle session from disk — so the NEXT
+        # reboot has no record and the UI collapses them from "idle" to
+        # "sleeping".  That gave restart-memory a one-restart lifespan and made
+        # the idle/sleeping distinction look intermittent.  _last_known_states
+        # is pruned by forget_dormant() on every explicit user stop/delete, so
+        # re-persisting it here never resurrects a session the user slept.
+        try:
+            dormant = self._last_known_states or {}
+            for sid, meta in list(dormant.items()):
+                if not isinstance(meta, dict):
+                    continue
+                try:
+                    rid = self._resolve_id(sid)
+                except Exception:
+                    rid = sid
+                # Live state is authoritative — never let stale memory shadow a
+                # session that has since gone live under either id form.
+                if sid in live or rid in live or sid in sessions_data or rid in sessions_data:
+                    continue
+                sessions_data[rid] = {
+                    "name": meta.get("name", ""),
+                    "cwd": meta.get("cwd", ""),
+                    "model": meta.get("model", ""),
+                    "effort": meta.get("effort", ""),
+                    "session_type": meta.get("session_type", ""),
+                    # last_state is collapsed to "idle" | "working"; "working"
+                    # here means "was mid-task, failed to auto-recover".  Writing
+                    # it back keeps recover_sessions' max_age guard honest via
+                    # the ORIGINAL last_activity (below) instead of stamping now.
+                    "state": meta.get("last_state", "idle"),
+                    "started_at": meta.get("last_activity", 0) or time.time(),
+                    "last_activity": meta.get("last_activity", 0),
+                }
+        except Exception:
+            logger.exception("Failed to carry forward dormant restart-memory")
+
+        self._reg.save_registry_now(sessions_data)
+
+    def _schedule_registry_save(self) -> None:
+        """Debounced save — delegates to SessionRegistry."""
+        self._reg.schedule_registry_save(self._save_registry_now)
+
+    # ------------------------------------------------------------------
+    # WebSocket emission helpers
+    # ------------------------------------------------------------------
+
+    async def _post_turn_compact_drain(self, session_id: str, info: SessionInfo) -> None:
+        """Drain the SDK buffer after RESULT.
+
+        Two things can be buffered after the assistant turn's RESULT:
+
+        1. Auto-compaction: ``compact_boundary`` system message followed by
+           ``init`` once the new context summary is ready.  The session
+           should show "Compacting…" until ``init`` arrives.
+
+        2. Auto-resume from a background hook (e.g. ``Bash`` started with
+           ``run_in_background=True``).  When the background task finishes,
+           the SDK injects a synthetic user message (``task_notification``)
+           and restarts the assistant turn (``init`` → content → fresh
+           ``RESULT``).  If we don't keep listening, the auto-resume's
+           events sit unread in the SDK buffer until the next user
+           ``send_message()`` reads them as if they were the response to
+           the new query — every subsequent turn returns instantly with
+           the wrong tokens, and the session becomes unusable.
+
+        Loops to handle chained auto-resumes (multiple background tasks
+        finishing in sequence) and ``compact_boundary`` followed by
+        auto-resume.
+        """
+        # CRITICAL invariant: this function MUST hand control to the
+        # extended listener at the end (or be cancelled / superseded).
+        # Returning without a consumer for the SDK buffer means future
+        # task_notification / auto-resume content lands unread, gets
+        # drained as the next user query's response, and breaks the
+        # session — exactly the bug we're fixing.  Every error path
+        # ``break``s out to the listener instead of returning early.
+        peek_phase_done = False
+        while not peek_phase_done:
+            compact_seen = False
+            auto_resume_seen = False
+            peek_got_result = False
+
+            async def _peek():
+                nonlocal compact_seen, auto_resume_seen, peek_got_result
+                async for msg in self._sdk.receive_response(info.client):
+                    if info.task is not asyncio.current_task():
+                        return
+
+                    # ── Pre-detect auto-resume BEFORE _process_message ──
+                    # Mirrors the post-turn listener fix: when state is IDLE
+                    # and an init / task_notification / non-system content
+                    # arrives, flip to WORKING so _process_message's
+                    # subsequent _emit_state can't dispatch a queued message
+                    # mid-wake-up.  compact_boundary stays its own path.
+                    if info.state == SessionState.IDLE:
+                        # Only messages that genuinely open a turn count as a
+                        # resume signal: SYSTEM init / task_notification, or
+                        # real conversation content (ASSISTANT / USER).
+                        # Metadata (status, turn_duration, STREAM_EVENT) also
+                        # arrives as post-sleep transport chatter on sessions
+                        # with no turn at all; flipping on it
+                        # left sessions in a phantom WORKING state that the
+                        # health watchdog then "recovered" with a spurious
+                        # nudge. A real turn always delivers init or content
+                        # within a message or two, so the flip is at most
+                        # delayed by one metadata message — which cannot
+                        # trigger the init-handler IDLE-emit race this
+                        # pre-detect exists to prevent.
+                        is_resume = False
+                        if msg.kind == MessageKind.SYSTEM:
+                            sub_pre = msg.subtype or ''
+                            if sub_pre in ('init', 'task_notification'):
+                                is_resume = True
+                        elif msg.kind in (MessageKind.ASSISTANT,
+                                          MessageKind.USER):
+                            is_resume = True
+                        if is_resume:
+                            if not self._model_switch_pending(info):
+                                auto_resume_seen = True
+                                self._enter_auto_resume(info)
+                            else:
+                                # CLI emitted init as a side-effect of set_model —
+                                # not a real auto-resume.  Clear flag and stay IDLE.
+                                info._model_switch_in_progress = False
+
+                    await self._process_message(session_id, msg)
+
+                    if msg.kind == MessageKind.RESULT:
+                        # Auto-resume turn finished inside the peek window —
+                        # _process_message just set state=IDLE +
+                        # _awaiting_compact_drain=True.  Loop will decide
+                        # whether to peek again for chained activity.
+                        peek_got_result = True
+                        return
+                    if msg.kind == MessageKind.SYSTEM:
+                        sub = msg.subtype or ''
+                        if sub == self._BACKEND.compaction_marker:
+                            compact_seen = True
+                            return
+                        if sub == 'init':
+                            # Init in peek context: either auto-compact end
+                            # (compact_seen would be True and we'd have
+                            # returned earlier) or auto-resume turn start.
+                            # The pre-detect block above already entered
+                            # auto-resume if state was IDLE.  Return so the
+                            # outer loop can stream the rest of the cycle.
+                            return
+                        # task_notification / status / turn_duration —
+                        # already handled by pre-detect (task_notification)
+                        # or are pure metadata.  Keep draining.
+                        continue
+                    # Non-system non-RESULT: pre-detect already entered
+                    # auto-resume.  Keep draining for the rest of the turn.
+                    continue
+
+            try:
+                await asyncio.wait_for(_peek(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("_post_turn_compact_drain peek error for %s: %s", session_id, e)
+                break  # fall through to extended listener
+
+            if info.task is not asyncio.current_task():
+                return  # Superseded — new task owns state
+
+            if compact_seen:
+                logger.info("Auto-compaction detected for %s — waiting for init", session_id)
+                wait_init_failed = False
+                try:
+                    async def _wait_init():
+                        async for msg in self._sdk.receive_response(info.client):
+                            if info.task is not asyncio.current_task():
+                                return
+                            await self._process_message(session_id, msg)
+                            if msg.kind == MessageKind.SYSTEM and (msg.subtype or '') == 'init':
+                                return  # Compaction complete
+                            if msg.kind == MessageKind.RESULT:
+                                return  # Unexpected second RESULT — stop
+                            if msg.kind != MessageKind.SYSTEM:
+                                logger.warning("Unexpected post-compact msg kind=%s for %s",
+                                               msg.kind.value, session_id)
+                                return
+                    await asyncio.wait_for(_wait_init(), timeout=300.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Auto-compact timed out waiting for init on %s (5 min)", session_id)
+                    if info.task is asyncio.current_task() and info.substatus:
+                        info.substatus = ""
+                        self._emit_state(info)
+                    wait_init_failed = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("_post_turn_compact_drain wait-init error for %s: %s",
+                                   session_id, e)
+                    wait_init_failed = True
+                if wait_init_failed:
+                    break  # fall through to extended listener
+                # Compaction may be followed by auto-resume — loop again.
+                continue
+
+            if auto_resume_seen and not peek_got_result:
+                # SDK is mid-way through the auto-resume turn; stream the
+                # rest until its RESULT arrives.
+                logger.info("Auto-resume in progress for %s — streaming until RESULT", session_id)
+                got_result = False
+                stream_failed = False
+                try:
+                    async for msg in self._sdk.receive_response(info.client):
+                        if info.task is not asyncio.current_task():
+                            return  # Superseded — new task owns state
+                        await self._process_message(session_id, msg)
+                        if msg.kind == MessageKind.RESULT:
+                            got_result = True
+                            # _process_message set state=IDLE + _awaiting_compact_drain=True.
+                            break
+                        # Defensive: a stray non-system msg with state still IDLE
+                        # would mean we missed the WORKING flip — re-enter.
+                        if info.state == SessionState.IDLE \
+                                and msg.kind != MessageKind.SYSTEM:
+                            self._enter_auto_resume(info)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("_post_turn_compact_drain auto-resume stream error for %s: %s",
+                                   session_id, e)
+                    stream_failed = True
+                if stream_failed or not got_result:
+                    break  # fall through to extended listener
+                # Loop to detect chained auto-resume / compaction.
+                continue
+
+            if peek_got_result:
+                # We consumed an auto-resume's full turn entirely inside the
+                # 100 ms peek (very fast turn).  Loop to check for further
+                # buffered activity.
+                continue
+
+            # Nothing more buffered — exit peek phase and drop into listener.
+            peek_phase_done = True
+
+        # Drop into the extended listener so a delayed ``task_notification``
+        # doesn't land on an empty buffer with no consumer.  Returns only
+        # on supersede / CancelledError; the listener owns IDLE-emit from
+        # this point on.
+        if info.task is asyncio.current_task():
+            await self._extended_post_turn_listener(session_id, info)
+
+    async def _extended_post_turn_listener(self, session_id: str,
+                                           info: SessionInfo) -> None:
+        """Keep listening on the SDK buffer while the session is post-turn IDLE.
+
+        When the agent ends a turn while a ``Bash(run_in_background=True)``
+        is still running, the SDK delivers the eventual ``task_notification``
+        + auto-resume turn long after RESULT — sometimes many minutes later.
+        Without a consumer those messages stack up in the SDK's
+        MemoryObjectStream and get drained as the response to the next user
+        message, breaking the session.
+
+        This coroutine emits the initial IDLE (so the user sees the session
+        as ready) and then sits on ``receive_response()`` until either:
+
+        * ``task_notification`` (or unexpected non-system content) arrives —
+          flip to WORKING with substatus="auto-resuming", stream until the
+          auto-resume's RESULT, emit IDLE, loop;
+        * ``compact_boundary`` arrives — drive the existing compaction flow;
+        * the task is superseded (a new ``send_message`` cancelled us);
+        * the task is cancelled (interrupt or session close) — ``CancelledError``
+          is propagated.
+
+        ``send_message`` cancels the listener and sets ``_drain_stale`` so any
+        late-arriving stale messages are consumed before the new query is read.
+        """
+        # Helper: this task is no longer the rightful owner of the SDK
+        # buffer.  Either ``info.task`` was replaced by a new task, or
+        # ``send_message`` flagged us for supersede.  Either condition is
+        # enough to bail without touching state — the new task takes
+        # over.  Critically, we must check BOTH because there is a
+        # window where ``send_message`` has set the flag but the new
+        # task has not yet claimed ``info.task`` (it's still queued on
+        # the event loop).  Without the flag check we'd keep processing
+        # auto-resume messages whose RESULT would clobber the WORKING
+        # state ``send_message`` just set for the new query.
+        def _bailing() -> bool:
+            return (
+                info.task is not asyncio.current_task()
+                or bool(getattr(info, '_listener_superseded', False))
+            )
+
+        # Claim ownership of the SDK buffer for the post-turn window.
+        # _in_post_turn gates queue auto-dispatch in _emit_state (combined
+        # with _wakeup_pending so non-wake-up sessions are unaffected).  We
+        # set it BEFORE the initial IDLE emit so that emit can't dispatch
+        # a queued message that would then race the wake-up content.
+        info._in_post_turn = True
+        try:
+            # Emit the IDLE that would normally fire in _send_query /
+            # _drive_session after the drain returns.  We're taking
+            # ownership of the IDLE-emit here because we never return
+            # normally.
+            info._awaiting_compact_drain = False
+            # An auto-resume turn consumed by the drain's peek phase may have
+            # ended in a retryable error.  Arm it here (see _arm_flagged_retry).
+            if not _bailing():
+                self._arm_flagged_retry(session_id, info)
+            if not _bailing() and info.state == SessionState.IDLE:
+                self._emit_state(info)
+
+            while not _bailing():
+                try:
+                    cycle_yielded = False
+                    async for msg in self._sdk.receive_response(info.client):
+                        cycle_yielded = True
+                        if _bailing():
+                            return
+
+                        # ── Pre-detect auto-resume BEFORE _process_message ──
+                        # The CRITICAL fix for the "session sleeps with a
+                        # wake-up wrapper" bug: when state is IDLE and the
+                        # SDK delivers a fresh turn (init / task_notification
+                        # / non-system content), flip to WORKING NOW so the
+                        # _emit_state call inside _process_message's init
+                        # handler doesn't fire on stale IDLE state and
+                        # accidentally dispatch a queued user message.
+                        # Without this pre-detect, ScheduleWakeup wake-ups
+                        # delivered as bare ``init`` (no leading
+                        # task_notification) reach _process_message with
+                        # state=IDLE, the init handler emits IDLE, and the
+                        # dispatcher sends a queued message into the middle
+                        # of the wake-up cycle.  After this transition the
+                        # wake-up's remaining content lands as the response
+                        # to the queued message and the session is "broken".
+                        if info.state == SessionState.IDLE:
+                            is_resume_signal = False
+                            if msg.kind == MessageKind.SYSTEM:
+                                sub = msg.subtype or ''
+                                # Only init / task_notification open a real
+                                # auto-resume turn. Other system metadata
+                                # (status, turn_duration) ALSO arrives as
+                                # post-sleep transport chatter on sessions
+                                # with no turn at all: flipping
+                                # on it left sessions in a phantom WORKING
+                                # state the health watchdog then "recovered"
+                                # with a spurious nudge on every laptop wake.
+                                if sub in ('init', 'task_notification'):
+                                    is_resume_signal = True
+                            elif msg.kind in (MessageKind.ASSISTANT,
+                                              MessageKind.USER):
+                                # Real conversation content — an auto-resume
+                                # turn is already flowing in. STREAM_EVENT is
+                                # deliberately excluded: bare stream chatter
+                                # cannot trigger the init-handler IDLE-emit
+                                # race this pre-detect exists to prevent, and
+                                # a real turn always follows it with content
+                                # or init within a message.
+                                is_resume_signal = True
+                            if is_resume_signal:
+                                if not self._model_switch_pending(info):
+                                    self._enter_auto_resume(info)
+                                else:
+                                    # CLI emitted init as a side-effect of set_model —
+                                    # not a real auto-resume.  Clear flag and stay IDLE.
+                                    info._model_switch_in_progress = False
+
+                        # Per-message try/except: a bad message must not kill
+                        # the entire listener and orphan the SDK buffer.  This
+                        # mirrors the main response loop's pattern in
+                        # _send_query / _drive_session.
+                        try:
+                            await self._process_message(session_id, msg)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as pm_err:
+                            logger.exception(
+                                "_extended_post_turn_listener _process_message error "
+                                "for %s (msg kind %s): %s",
+                                session_id, msg.kind.value, pm_err
+                            )
+                            # Continue iterating — the next message might be
+                            # the RESULT we need to consume for clean state.
+                            continue
+                        # Re-check: _process_message may have yielded under
+                        # info._lock contention, giving send_message a chance
+                        # to set _listener_superseded.
+                        if _bailing():
+                            return
+
+                        if msg.kind == MessageKind.RESULT:
+                            # Auto-resume turn ended.  _process_message set
+                            # state=IDLE + _awaiting_compact_drain=True; emit
+                            # IDLE and re-enter the listening loop.  Keep
+                            # _in_post_turn set: more auto-resumes may chain
+                            # (the agent might have scheduled another wake-up
+                            # during this turn).  _wakeup_pending reflects
+                            # whether they did — _emit_state uses that to
+                            # decide whether to suppress dispatch on THIS
+                            # IDLE emit.
+                            info._awaiting_compact_drain = False
+                            # The auto-resume turn may have ended in a usage
+                            # limit or transient error.  Arm its retry, which
+                            # _send_query/_drive_session would have done for a
+                            # user-driven turn.
+                            if not _bailing():
+                                self._arm_flagged_retry(session_id, info)
+                            if not _bailing() and info.state == SessionState.IDLE:
+                                self._emit_state(info)
+                            # receive_response terminates at RESULT; outer
+                            # while-loop calls receive_response again to
+                            # listen for the next batch.
+                            break
+
+                        # SYSTEM / non-RESULT non-SYSTEM messages were
+                        # already handled by the pre-detect block above
+                        # (auto-resume entered if needed) and by
+                        # _process_message (content rendered).  Nothing
+                        # more to do in this iteration.
+                    # receive_response() exhausted normally (e.g. RESULT consumed
+                    # via break above) — outer while loop iterates.
+                    # Anti-tight-loop guard: if a cycle yielded zero messages
+                    # (anomalous — receive_response normally blocks forever
+                    # waiting for the next batch), sleep briefly before retrying
+                    # to avoid pegging the CPU on a wedged transport.
+                    if not cycle_yielded and not _bailing():
+                        await asyncio.sleep(self._EMPTY_CYCLE_WAIT_S)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Transport-level error from receive_response itself.  If
+                    # it looks like a stream/transport failure, hand off to
+                    # the existing self-heal logic by flagging
+                    # _stream_heal_needed and letting _send_query /
+                    # _drive_session's finally block reconnect on the next
+                    # user action.  Otherwise just log and exit — the
+                    # buffer is unrecoverable from here.
+                    #
+                    # CRITICAL: if we're bailing (task superseded or replaced),
+                    # the exception is almost certainly the SDK's
+                    # ClosedResourceError / cancellation fallout from
+                    # send_message cancelling us — NOT a real transport
+                    # failure.  Flagging stream_heal here would cause the
+                    # next finally block to re-send the user's last message
+                    # on top of the brand-new turn they just submitted,
+                    # producing the "session reconnected, retrying last
+                    # message" loop on healthy sessions.  Bail without
+                    # touching heal state; the new task owns the buffer now.
+                    #
+                    # NOTE: another developer reports this loop does not
+                    # reproduce on Linux — it may be a Windows-only timing
+                    # window where the cancelled receive_response surfaces
+                    # the ClosedResourceError before the supersede flag's
+                    # bail check at the top of the loop catches it.  The
+                    # guard below covers both platforms either way.
+                    # CRITICAL: do NOT flag _stream_heal_needed here, even on
+                    # transport-shaped errors.  Evidence from STREAM_HEAL_
+                    # logs showed this site firing on healthy
+                    # idle sessions with `err='Command failed with exit code
+                    # 1'` and `listener_superseded=False` — producing the
+                    # a repeating "Reconnected — retrying last message
+                    # automatically" loop.
+                    #
+                    # This listener only exists to drain late auto-resume
+                    # content AFTER the turn's ResultMessage already shipped.
+                    # The user already saw their response.  If the SDK throws
+                    # anything during this idle window (stale background-task
+                    # exit code, ClosedResource from a supersede, or even a
+                    # real transport death), resending the user's last
+                    # message is wrong — they didn't ask for it and the
+                    # original turn already produced its answer.
+                    #
+                    # Real stream death during a REAL user turn is still
+                    # caught and healed by the four other STREAM_HEAL_TRIGGER
+                    # sites that run during the active turn:
+                    #   • drive_session_except
+                    #   • send_query_except
+                    #   • tool_result_stream_closed
+                    #   • can_use_tool_transport_dead
+                    # If the transport is genuinely dead when the user sends
+                    # their NEXT message, those paths will catch it then.
+                    # Until the user sends again, the broken buffer is
+                    # harmless — nothing is listening on it.
+                    err_str = str(e)
+                    etype = type(e).__name__
+                    if _bailing():
+                        logger.info(
+                            "STREAM_HEAL_SUPPRESSED site=post_turn_listener_bailing "
+                            "sid=%s etype=%s err=%r task_replaced=%s "
+                            "listener_superseded=%s",
+                            session_id, etype, err_str[:200],
+                            info.task is not asyncio.current_task(),
+                            getattr(info, '_listener_superseded', False),
+                        )
+                    else:
+                        logger.info(
+                            "STREAM_HEAL_SUPPRESSED site=post_turn_listener_exit "
+                            "sid=%s etype=%s err=%r state=%s in_post_turn=%s "
+                            "— turn already completed, not flagging heal",
+                            session_id, etype, err_str[:200],
+                            getattr(info.state, 'value', info.state),
+                            getattr(info, '_in_post_turn', False),
+                        )
+                    return
+        finally:
+            # Clear _in_post_turn on every exit path (normal return,
+            # CancelledError on supersede / interrupt, unhandled exception)
+            # so queue dispatch resumes normal behavior for the next turn.
+            # Only clear if WE still own the flag — a newer task that
+            # claimed info.task may have already set up its own post-turn
+            # state and we must not stomp it.
+            if info.task is asyncio.current_task():
+                info._in_post_turn = False
+
+    def _arm_flagged_retry(self, session_id: str, info: SessionInfo) -> bool:
+        """Arm an auto-retry that was flagged during a post-turn auto-resume turn.
+
+        User-driven turns arm ``_api_retry_needed`` in the ``_send_query`` /
+        ``_drive_session`` ``finally`` blocks.  Turns started by a background
+        task's notification never pass through those blocks; the post-turn
+        drain and listener consume them.  So an error ending such a turn (a
+        usage limit hit mid-orchestration, a 529) was flagged and then never
+        armed.  The session sat IDLE, sometimes under a banner promising an
+        auto-retry that would never come (for example a 5-hour limit hit inside
+        a notification-triggered turn stayed stuck past the reset).
+
+        Safe while the listener owns the SDK buffer: when the timer fires,
+        ``send_message`` supersedes the listener exactly as a user send does,
+        and ``_try_dispatch_queue`` holds queued messages while ``retry_at > 0``.
+        Returns True if a retry was armed.
+        """
+        if not getattr(info, "_api_retry_needed", False):
+            return False
+        if getattr(info, "_stream_heal_needed", False):
+            return False  # the transport self-heal owns this turn
+        try:
+            self._arm_api_retry(session_id, info)
+            return True
+        except Exception:
+            logger.exception("Arming a post-turn auto-retry failed for %s", session_id)
+            info._api_retry_needed = False
+            return False
+
+    def _enter_auto_resume(self, info: SessionInfo) -> None:
+        """Flip a session back to WORKING when the SDK auto-resumes.
+
+        Called from the post-turn drain / listener when an auto-resume
+        signal (task_notification, init after RESULT, or unexpected
+        non-system content) arrives — the SDK has injected a synthetic
+        turn and restarted assistant streaming.  Idempotent: only emits
+        state on the IDLE→WORKING transition so chained calls during the
+        same auto-resume don't spam clients.
+
+        Substatus is CLEARED here, not preserved.  The ``auto-resuming``
+        substatus is the server's way of saying "this session is asleep
+        with a scheduled wake-up pending" (state=IDLE).  Once the wake-up
+        actually fires and the session transitions to WORKING, the
+        session is no longer "awaiting" anything — it's actively
+        processing the wake-up turn.  Leaving substatus='auto-resuming'
+        latched here caused the user-visible bug where the working bar
+        kept saying "Awaiting wake-up…" and kanban kept showing the blue
+        sleeping dot while the spinner was already running, until the
+        wake-up turn's own RESULT finally swept the substatus.
+
+        Resets ``_wakeup_pending`` to False because the wake-up that
+        triggered this resume has been "consumed".  If the auto-resume
+        turn schedules ANOTHER wake-up, _process_message's tool_use
+        handler will flip it back to True before the turn ends; the
+        RESULT branch will then re-apply substatus='auto-resuming' for
+        the next sleep window.
+        """
+        if info.state != SessionState.IDLE:
+            return
+        info.state = SessionState.WORKING
+        info._awaiting_compact_drain = False
+        # Wake-up has fired — clear the "awaiting" substatus so the UI
+        # stops showing "Awaiting wake-up…" the moment work resumes.
+        # The init handler's `elif info.substatus != 'auto-resuming'`
+        # guard becomes a no-op for this path (substatus is already "")
+        # but is left in place as a defensive backstop.
+        info.substatus = ""
+        info.working_since = time.time()
+        # The wake-up that caused this resume is consumed.  Subsequent
+        # tool uses in this turn will re-flag _wakeup_pending if needed.
+        info._wakeup_pending = False
+        # The wake-up fired in time — drop its phantom deadline and the
+        # scheduled-flag.  A new one is armed at this turn's RESULT if it
+        # schedules another wake-up.
+        info._wakeup_deadline = 0.0
+        info._wakeup_is_scheduled = False
+        self._emit_state(info)
+
+    # ------------------------------------------------------------------
+    # SessionDurable (src/engine/session_durable.py)
+    # ------------------------------------------------------------------
+
+    def _durable_save(self, info, immediate: bool = True) -> None:
+        """Record ``info``'s restart-proof state.  Skips STOPPED sessions: an
+        explicit Sleep/Delete forgets the record (``_close_session``), and a
+        late write must not bring it back ("Sleep must stick").  Planner and
+        title sessions are never recovered, so they keep no record.
+        Never raises."""
+        try:
+            if info is None or getattr(info, "state", None) == SessionState.STOPPED:
+                return
+            if getattr(info, "session_type", "") in ("planner", "title"):
+                return
+            from engine import session_durable as _sd
+            _sd.save(info, immediate=immediate)
+        except Exception:
+            logger.debug("durable save failed", exc_info=True)
+
+    def _durable_restore_timers(self, session_id: str, info) -> None:
+        """After a recovered or re-attached session reaches IDLE: re-arm the
+        auto-retry / usage-limit continue its SessionDurable record carried,
+        and report a permission request a ``--resume`` could not keep.
+
+        Consumes ``info._durable_restore`` (set by ``start_session`` or the
+        host attach).  The arm uses the record's ABSOLUTE instant: the
+        remaining delay, or now if it already passed."""
+        restore = getattr(info, "_durable_restore", None)
+        info._durable_restore = None
+        if not restore:
+            return
+        try:
+            lost = restore.get("lost_permission") or ""
+            if lost:
+                entry = LogEntry(
+                    kind="system", is_error=True,
+                    text=("A permission request for %s was lost in the Session "
+                          "Engine restart. Send a message to continue." % lost))
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+            at = float(restore.get("retry_at") or 0.0)
+            if at > 0 and info.state == SessionState.IDLE \
+                    and not self._user_stopped(info):
+                self._arm_api_retry_at(session_id, info, at)
+            else:
+                self._durable_save(info)
+        except Exception:
+            logger.exception("Restoring durable timers failed for %s", session_id)
+
+    def _arm_api_retry_at(self, session_id: str, info, at: float) -> None:
+        """Re-arm an auto-retry countdown for the absolute instant ``at``
+        (a SessionDurable record from before a restart).  The countdown
+        fields (attempt, max, reason, ``limit_switch_to``) were already put
+        back by ``session_durable.apply_static``; a passed instant fires on
+        the next loop tick."""
+        delay = max(0.0, float(at) - time.time())
+        self._cancel_api_retry_task(info)
+        info.retry_at = time.time() + delay
+        if not info.retry_max:
+            info.retry_max = self._API_RETRY_MAX
+        if not info.retry_attempt:
+            info.retry_attempt = info._api_retry_count + 1
+        info.error = ""
+        entry = LogEntry(
+            kind="system",
+            text="Continuing the countdown from before the Session Engine "
+                 "restart: retrying in %s." % self._fmt_duration(delay))
+        with info._lock:
+            info.entries.append(entry)
+            entry_index = len(info.entries) - 1
+        self._emit_entry(session_id, entry, entry_index)
+        self._emit_state(info)
+        coro = self._api_retry_timer(session_id, delay)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None:
+            info._api_retry_task = running.create_task(coro)
+        elif self._loop is not None and self._loop.is_running():
+            info._api_retry_task = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        else:
+            coro.close()
+            self._fail_retry_open(
+                session_id, "Auto-retry could not be scheduled — use Retry to resume.")
+            return
+        self._durable_save(info)
+
+    def _emit_state(self, info: SessionInfo) -> None:
+        """Push session state change to all connected WebSocket clients.
+
+        Uses push_callback to ensure cross-context compatibility.
+        Also schedules a registry save so crash recovery data stays fresh.
+        When a session transitions to IDLE, auto-dispatches queued messages.
+        """
+        # Track when session entered WORKING state for elapsed timer
+        if info.state == SessionState.WORKING and info.working_since == 0.0:
+            info.working_since = time.time()
+        elif info.state != SessionState.WORKING:
+            info.working_since = 0.0
+        # Auto-clear stale substatus when session is no longer actively working.
+        # This ensures safety-net IDLE transitions don't carry "compacting" forward
+        # into the next turn's WORKING state emission.
+        #
+        # EXCEPTION: when a wake-up is pending (state=IDLE but the SDK still
+        # has a scheduled auto-resume coming), preserve ``auto-resuming``
+        # so the UI keeps showing "Awaiting wake-up…" through the sleep
+        # window instead of reverting to a plain-idle indicator.  The
+        # final wake-up's RESULT clears _wakeup_pending in
+        # _enter_auto_resume (or at the next user-driven turn start), so
+        # this branch falls through to the normal clear on the
+        # post-wake-up IDLE emit.
+        _preserve_for_wakeup = (
+            info.state == SessionState.IDLE
+            and getattr(info, '_wakeup_pending', False)
+            and info.substatus == "auto-resuming"
+        )
+        if (
+            info.state in (SessionState.IDLE, SessionState.STOPPED)
+            and info.substatus
+            and not _preserve_for_wakeup
+        ):
+            info.substatus = ""
+        if self._push_callback:
+            data = info.to_state_dict()
+            # Include queue data from server-side store
+            q = self._mq.get_queue_data(info.session_id)
+            if q:
+                data["queue"] = q
+            try:
+                self._push_callback('session_state', data)
+            except Exception as cb_err:
+                logger.error("_emit_state push_callback failed for %s (state=%s): %s",
+                             info.session_id, info.state, cb_err)
+        # Keep the persistent registry up to date
+        self._schedule_registry_save()
+        # SessionDurable: debounced (1 s) write of the session's restart-proof
+        # state.  The write-through sites call _durable_save(info) directly.
+        self._durable_save(info, immediate=False)
+
+        # ── Phase 6.5 P1-4: auto-report on IDLE for opted-in subsessions ──
+        # When a subsession with auto_report_on_idle == True transitions
+        # to IDLE AND has produced new assistant content since the last
+        # auto-report, write the last assistant message to its parent's
+        # inbox.  Idempotent across multiple IDLE emits per turn via
+        # ``_last_auto_report_entry_count``: we only fire when the entry
+        # count has actually advanced AND the most recent entry is an
+        # assistant message.
+        if (
+            info.state == SessionState.IDLE
+            and getattr(info, "auto_report_on_idle", False)
+            and getattr(info, "parent_session_id", None)
+        ):
+            try:
+                self._maybe_auto_report_to_parent(info)
+            except Exception as e:
+                # Auto-report must never break a session state emit.
+                logger.warning(
+                    "auto-report soft-fail for %s: %s",
+                    info.session_id, e,
+                )
+
+        # ── Patent 13: marker-triggered report on IDLE ──
+        # Independent of the auto_report toggle: if the subsession's latest
+        # assistant turn carries the <!-- subsession:report --> marker, push
+        # that conclusion to the parent's inbox.  This is the child
+        # explicitly deciding to report, so it runs for ANY subsession with
+        # a parent.  Same soft-fail discipline — a marker scan must never
+        # break a state emit.
+        if (
+            info.state == SessionState.IDLE
+            and getattr(info, "parent_session_id", None)
+        ):
+            try:
+                self._maybe_marker_report_to_parent(info)
+            except Exception as e:
+                logger.warning(
+                    "marker-report soft-fail for %s: %s",
+                    info.session_id, e,
+                )
+
+        # ── Memory management: trim in-memory entries for idle sessions ──
+        # The JSONL file is the source of truth; the web frontend reads it
+        # directly (with caching).  The daemon's in-memory entries list is
+        # only needed during active streaming for real-time updates.  Once
+        # idle, keep only the last N entries so long-running sessions don't
+        # consume hundreds of MB of RAM.
+        _ENTRY_TRIM_THRESHOLD = 500   # start trimming above this
+        _ENTRY_KEEP_AFTER_TRIM = 200  # keep this many after trimming
+        if info.state in (SessionState.IDLE, SessionState.STOPPED):
+            with info._lock:
+                if len(info.entries) > _ENTRY_TRIM_THRESHOLD:
+                    trimmed = len(info.entries) - _ENTRY_KEEP_AFTER_TRIM
+                    info.entries = info.entries[-_ENTRY_KEEP_AFTER_TRIM:]
+                    # Permanent sticky flag consumed by the ws_events fast path.  Once
+                    # trimmed the JSONL always has strictly more entries than
+                    # ``info.entries``, so the fast path can no longer trust
+                    # ``get_entry_count`` as an authoritative total.  Reads use
+                    # ``getattr(info, "_entries_trimmed", False)`` for defensive
+                    # compatibility with older SessionInfo instances.
+                    info._entries_trimmed = True
+                    logger.info("Trimmed %d in-memory entries for %s (kept last %d)",
+                                trimmed, info.session_id[:12], _ENTRY_KEEP_AFTER_TRIM)
+            # NOTE: we deliberately do NOT wipe
+            # ``_pre_turn_mtimes``, ``_post_turn_mtimes``, or
+            # ``_cached_git_files`` here.  An earlier version of this
+            # block wiped them on every IDLE transition "to save memory,"
+            # but that ran BETWEEN the pre-turn record and the post-turn
+            # ``_detect_changed_files`` for the same turn — leaving
+            # ``pre`` empty so every file looked "changed."  For a
+            # project with 3789 source files, every turn
+            # then rewrote 3789 backups (~5-6s of disk IO) for no
+            # reason, so turns alternated between fast and very slow.  Holding the dicts costs only
+            # a few hundred KB per session — far cheaper than the
+            # multi-second penalty of repopulating them every turn.
+            # See ``PERF-CRITICAL #4`` (mtime carry-forward) in
+            # CLAUDE.md, which this wipe was silently violating.
+
+        # Auto-dispatch queued messages when session goes IDLE — but NOT if:
+        #   • the user just interrupted (flag is cleared on next send_message
+        #     so the session resumes normal dispatch after); OR
+        #   • a post-turn listener owns the SDK buffer AND a wake-up was
+        #     scheduled by the agent (ScheduleWakeup / Bash run_in_background).
+        #     In that case a deferred auto-resume cycle (init -> content ->
+        #     RESULT) is still coming and dispatching the queue now would
+        #     race the wake-up content into the SDK buffer — the dispatched
+        #     query's response loop would read the wake-up's content as its
+        #     own response, breaking the session.  Sessions WITHOUT a pending
+        #     wake-up dispatch normally even with the listener active; the
+        #     listener exists defensively but no auto-resume will arrive.
+        if (
+            info.state == SessionState.IDLE
+            and not getattr(info, '_interrupted', False)
+            # Hold the queue while an API-error auto-retry countdown is active.
+            # The retry is the CONTINUATION of the failed turn, so it must run
+            # before the user's queued follow-ups — otherwise a queued message
+            # would jump ahead of the recovery and the failed work would be
+            # abandoned.  When the retry fires (or is cancelled / gives up),
+            # retry_at returns to 0 and the queue dispatches normally.
+            and not (getattr(info, 'retry_at', 0) > 0)
+            and not (
+                getattr(info, '_in_post_turn', False)
+                and getattr(info, '_wakeup_pending', False)
+                # Starvation override: the wake-up queue watchdog sets
+                # _force_queue_dispatch once a queued user message has been
+                # blocked behind the gate longer than the starvation
+                # timeout, so a self-perpetuating wake-up loop can never
+                # strand the queue indefinitely.  See _wakeup_queue_watchdog.
+                and not getattr(info, '_force_queue_dispatch', False)
+            )
+        ):
+            self._try_dispatch_queue(info.session_id)
+            # Safety net: re-emit IDLE state after 3 seconds in case the first
+            # push was silently lost (SocketIO transport hiccup, tab sleeping,
+            # etc.).  If the session is no longer IDLE (queue dispatched a
+            # follow-up or user sent a new message), the re-emit is skipped.
+            sid = info.session_id
+            def _deferred_idle_reemit():
+                with self._lock:
+                    recheck = self._sessions.get(sid)
+                if recheck and recheck.state == SessionState.IDLE \
+                        and not (getattr(recheck, 'retry_at', 0) > 0) \
+                        and not (
+                            getattr(recheck, '_in_post_turn', False)
+                            and getattr(recheck, '_wakeup_pending', False)
+                            and not getattr(recheck, '_force_queue_dispatch', False)
+                        ):
+                    # Safety net for race condition: if a message was queued
+                    # right as the session went idle, dispatch it now.
+                    # (But NOT while an auto-retry countdown is pending — this
+                    # deferred timer fires ~3s after the arm, which is BEFORE a
+                    # longer backoff fires, and without this guard it would
+                    # dispatch the queued follow-up ahead of the retry.  Real
+                    # race caught by live-daemon queue testing.)
+                    self._try_dispatch_queue(sid)
+                    # Re-check state — dispatch may have moved it to WORKING
+                    if recheck.state != SessionState.IDLE:
+                        return
+                    logger.debug("Deferred IDLE re-emit for %s", sid)
+                    if self._push_callback:
+                        data = recheck.to_state_dict()
+                        q = self._mq.get_queue_data(sid)
+                        if q:
+                            data["queue"] = q
+                        try:
+                            self._push_callback('session_state', data)
+                        except Exception:
+                            pass
+            t = threading.Timer(3.0, _deferred_idle_reemit)
+            t.daemon = True
+            t.start()
+
+    def _log_auto_approved(self, session_id: str, info, tool_name: str,
+                           tool_input, policy: str) -> None:
+        """Log auto-approved permission — delegates to PermissionManager."""
+        self._pm.log_auto_approved(session_id, info, tool_name, tool_input, policy)
+
+    def _emit_entry(self, session_id: str, entry: LogEntry, index: int) -> None:
+        """Push a new log entry to all connected WebSocket clients."""
+        # TTFT #5: if this session is awaiting its first emit after T4, stamp
+        # T5 now and flush the per-turn record. This is the moment the client
+        # would see the first session_entry event. Fast no-op when disabled.
+        if _TTFT_TIMING_ENABLED:
+            with self._lock:
+                _info = self._sessions.get(session_id)
+            if _info is not None and getattr(_info, "_ttft_await_first_emit", False):
+                d = getattr(_info, "_ttft_turn", None)
+                if d is not None and d.get("t5_perf_ns") is None:
+                    d["t5_perf_ns"] = time.perf_counter_ns()
+                    _ttft_flush(_info, session_id, status="ok")
+        if self._push_callback:
+            data = {
+                'session_id': session_id,
+                'entry': entry.to_dict(),
+                'index': index,
+            }
+            try:
+                self._push_callback('session_entry', data)
+            except Exception as cb_err:
+                logger.error("_emit_entry push_callback failed for %s (entry %d): %s",
+                             session_id, index, cb_err)
+
+    def _emit_permission(self, session_id: str, tool_name: str, tool_input: dict) -> None:
+        """Push a permission request to all connected WebSocket clients.
+
+        This is called from inside an anyio task group (the SDK's control
+        handler), so we use push_callback to ensure it reaches the clients.
+        """
+        # Never broadcast permission requests for hidden utility sessions
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if info and info.session_type in ("planner", "title"):
+            return
+        if self._push_callback:
+            data = {
+                'session_id': session_id,
+                'tool_name': tool_name,
+                'tool_input': tool_input,
+            }
+            self._push_callback('session_permission', data)
+
+    # ------------------------------------------------------------------
+    # Hook-based permission helpers (for CLI 2.x which doesn't support
+    # the SDK's can_use_tool callback)
+    # ------------------------------------------------------------------
+
+    def _hook_permission_start(self, session_id: str, req_id: str,
+                                tool_name: str, tool_input: dict) -> None:
+        """Called when a PreToolUse hook fires. Sets state to WAITING and
+        pushes the permission prompt to the frontend."""
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            # Session might not be tracked (hook fires for any Claude session)
+            # Try to find by matching — for now, use the most recent WORKING session
+            with self._lock:
+                for sid, si in self._sessions.items():
+                    if si.state == SessionState.WORKING:
+                        info = si
+                        session_id = sid
+                        break
+        if not info:
+            return
+
+        info.pending_tool_name = tool_name
+        info.pending_tool_input = tool_input if isinstance(tool_input, dict) else {}
+        info.state = SessionState.WAITING
+        # Store the hook request ID so the WebSocket handler can resolve it
+        info._hook_req_id = req_id
+        self._emit_state(info)
+        self._emit_permission(session_id, tool_name, info.pending_tool_input)
+
+    def _hook_permission_end(self, session_id: str) -> None:
+        """Called when a hook permission is resolved. Restores WORKING state."""
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            with self._lock:
+                for sid, si in self._sessions.items():
+                    if si.state == SessionState.WAITING:
+                        info = si
+                        session_id = sid
+                        break
+        if not info:
+            return
+
+        info.pending_tool_name = ""
+        info.pending_tool_input = {}
+        info._hook_req_id = None
+        info.state = SessionState.WORKING
+        self._emit_state(info)
+
+    # ------------------------------------------------------------------
+    # Hook-based permission methods
+    # ------------------------------------------------------------------
+
+    def resolve_hook_permission(self, req_id: str, action: str) -> bool:
+        """Resolve a pending hook-based permission request."""
+        with self._hook_lock:
+            entry = self._hook_pending.get(req_id)
+        if not entry:
+            return False
+        entry["result"] = action
+        entry["event"].set()
+        return True
+
+    def hook_pre_tool(self, tool_name: str, tool_input: dict, session_id: str) -> dict:
+        """Handle a PreToolUse hook. Blocks until user responds."""
+        import uuid
+        req_id = str(uuid.uuid4())[:8]
+        event = threading.Event()
+        with self._hook_lock:
+            self._hook_pending[req_id] = {"event": event, "result": "allow"}
+
+        self._hook_permission_start(session_id, req_id, tool_name, tool_input)
+
+        # Block until user responds (up to 1 hour)
+        event.wait(timeout=3600)
+
+        with self._hook_lock:
+            entry = self._hook_pending.pop(req_id, {})
+        result = entry.get("result", "allow")
+
+        self._hook_permission_end(session_id)
+
+        return {"action": result}
+
+    # ------------------------------------------------------------------
+    # Unified permission resolution
+    # ------------------------------------------------------------------
+
+    def resolve_permission_unified(self, session_id: str, allow: bool, always: bool = False,
+                                   almost_always: bool = False) -> dict:
+        """Resolve permission — auto-detects hook vs SDK callback."""
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"ok": False, "error": "Session not found"}
+
+        hook_req_id = getattr(info, '_hook_req_id', None)
+        if hook_req_id:
+            action = "allow" if allow else "deny"
+            resolved = self.resolve_hook_permission(hook_req_id, action)
+            if resolved:
+                return {"ok": True}
+            return {"ok": False, "error": "Hook permission request not found"}
+        else:
+            return self.resolve_permission(session_id, allow=allow, always=always,
+                                           almost_always=almost_always)

@@ -1,0 +1,122 @@
+"""scripts/ab_test.py, now a wrapper for AI Compare, keeps the old runner's helpers:
+it follows a session's id switch and knows when it is done (shared code in
+``features.experiments.sessions``). AI Compare sends prompts exactly as written
+(tests/test_ai_compare.py)."""
+
+import importlib.util
+import json
+from pathlib import Path
+
+_SPEC = importlib.util.spec_from_file_location(
+    "ab_test", Path(__file__).resolve().parents[1] / "scripts" / "ab_test.py")
+ab = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(ab)
+
+
+def _write(path, records):
+    path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+
+def test_resolve_follows_chained_remaps(tmp_path):
+    (tmp_path / "_remapped_sessions.json").write_text(json.dumps({
+        "launch-x": {"new_id": "mid-x", "ts": 1},
+        "mid-x": {"new_id": "real-x", "ts": 2},
+    }))
+    assert ab.resolve_id(tmp_path, "launch-x") == "real-x"
+    assert ab.resolve_id(tmp_path, "unknown-x") == "unknown-x"
+
+
+def test_resolve_survives_a_cycle(tmp_path):
+    (tmp_path / "_remapped_sessions.json").write_text(json.dumps({
+        "p-x": {"new_id": "q-x"}, "q-x": {"new_id": "p-x"}}))
+    assert ab.resolve_id(tmp_path, "p-x") in ("p-x", "q-x")
+
+
+def test_done_only_on_a_main_thread_end_turn(tmp_path):
+    f = tmp_path / "s.jsonl"
+    user = {"type": "user", "message": {"content": "question"}}
+    tool = {"type": "assistant", "message": {"stop_reason": "tool_use", "content": [
+        {"type": "tool_use", "name": "WebSearch"}]}}
+    _write(f, [user, tool])
+    assert ab.read_outcome(f)["state"] == "running"
+
+    side = {"type": "assistant", "isSidechain": True,
+            "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "x"}]}}
+    _write(f, [user, tool, side])
+    assert ab.read_outcome(f)["state"] == "running"
+
+    final = {"type": "assistant", "message": {"stop_reason": "end_turn", "model": "m",
+             "content": [{"type": "text", "text": "the answer"}]}}
+    _write(f, [user, tool, side, final])
+    res = ab.read_outcome(f)
+    assert res["state"] == "completed" and res["text"] == "the answer"
+
+    sent_back = {"type": "user", "message": {"content": "Stop hook feedback: redo"}}
+    _write(f, [user, tool, final, sent_back])
+    assert ab.read_outcome(f)["state"] == "running"
+
+
+def test_any_number_of_variants_same_or_different_prompts():
+    same = ab.build_variants([], "q", [], 3, [])
+    assert same == [("Compare A", "q"), ("Compare B", "q"), ("Compare C", "q")]
+    each = ab.build_variants([], None, [], 0, ["p1", "p2", "p3", "p4"])
+    assert [n for n, _ in each] == ["Compare A", "Compare B", "Compare C", "Compare D"]
+    assert [p for _, p in each] == ["p1", "p2", "p3", "p4"]
+    named = ab.build_variants(["x=one", "y=two=still two"], None, [], 0, [])
+    assert named == [("x", "one"), ("y", "two=still two")]
+    assert ab.variant_name(25) == "Compare Z" and ab.variant_name(26) == "Compare AA"
+
+
+def test_one_variant_or_a_repeated_name_is_refused():
+    import pytest
+    with pytest.raises(ValueError):
+        ab.build_variants([], "q", [], 1, [])
+    with pytest.raises(ValueError):
+        ab.build_variants(["x=1", "x=2"], None, [], 0, [])
+
+
+def test_short_answer_reads_the_card():
+    text = 'intro\n```handoff\n{"headline": "h", "answer": "short one"}\n```'
+    assert ab.short_answer(text) == "short one"
+    assert ab.short_answer("plain reply") == "plain reply"
+
+
+CATALOG = [
+    {"id": "claude-opus-5-5[1m]", "name": "Opus 5.5[1m]"},
+    {"id": "claude-opus-5-5", "name": "Opus 5.5"},
+    {"id": "claude-opus-4-7", "name": "Opus 4.7"},
+    {"id": "claude-sonnet-5-5", "name": "Sonnet 5.5"},
+    {"id": "claude-sonnet-5", "name": "Sonnet 5"},
+    {"id": "claude-haiku-4-5", "name": "Haiku 4.5"},
+]
+
+
+def test_friendly_model_names_resolve_to_ids():
+    r = lambda t: ab.resolve_model(t, CATALOG)["id"]
+    assert r("opus") == "claude-opus-5-5"          # newest, without 1M
+    assert r("Sonnet") == "claude-sonnet-5-5"
+    assert r("sonnet 5") == "claude-sonnet-5"
+    assert r("Haiku 4.5") == "claude-haiku-4-5"
+    assert r("claude-opus-4-7") == "claude-opus-4-7"
+    assert r("opus 5.5 [1m]") == "claude-opus-5-5[1m]"
+    import pytest
+    with pytest.raises(ValueError):
+        r("gpt")
+
+
+def test_models_pair_with_variants_one_for_all_or_one_each():
+    v = [("A", "p"), ("B", "p"), ("C", "p")]
+    each = ab.assign_models(v, ["opus", "sonnet", "haiku"], CATALOG)
+    assert [m["id"] for _, _, m in each] == ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"]
+    one = ab.assign_models(v, ["sonnet"], CATALOG)
+    assert {m["id"] for _, _, m in one} == {"claude-sonnet-5-5"}
+    assert [m for _, _, m in ab.assign_models(v, [], CATALOG)] == [None, None, None]
+    import pytest
+    with pytest.raises(ValueError):
+        ab.assign_models(v, ["opus", "sonnet"], CATALOG)
+
+
+def test_a_model_that_did_not_take_is_caught():
+    assert ab.same_model("claude-opus-5-5", "claude-opus-5-5")
+    assert ab.same_model("claude-opus-5-5[1m]", "claude-opus-5-5")
+    assert not ab.same_model("claude-haiku-4-5", "claude-opus-5-5")

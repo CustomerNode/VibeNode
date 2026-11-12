@@ -1,0 +1,10 @@
+#!/bin/sh
+# Runs VibeNode's Publish scan for git itself: this repository is public (src/web/git_hook.py).
+here=$(cd "$(dirname "$0")" && pwd) || exit 0
+for py in python python3; do
+  if "$py" -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >/dev/null 2>&1; then
+    exec "$py" "$here/../../src/web/git_hook.py" commit-msg "$@"
+  fi
+done
+echo "VibeNode commit-msg: no Python found, scan skipped" >&2
+exit 0

@@ -1,0 +1,58 @@
+[project]
+name = "vibenode"
+description = "A local workspace for running and reviewing many Claude Code sessions at once."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dynamic = ["version", "dependencies"]
+
+# Everything the app and the test suite need is in requirements.txt: Update
+# installs from it, and the suite needs nothing more.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "slow: tests that take more than a few seconds",
+    "live_server: tests that require a running live server (not the test server)",
+    "allow_real_claude_cli: opt out of the conftest guard that fails tests launching the real Claude CLI",
+    "real_process_scan: opt out of the conftest stub so the test runs the real OS process enumeration",
+]
+addopts = "-q --timeout=60"
+# Keep only the last run's temp folders: they live in memory on Linux (conftest).
+tmp_path_retention_count = 1
+timeout = 60
+
+[tool.code-pipeline]
+# VibeNode's pinned verification for Code Pipeline. features.pipeline.start copies
+# it into every run, and the harness requires each entry to pass on the final
+# code. A run cannot drop or weaken it; changing it forces full depth and caps
+# that run below HIGH until a person reviews it. {python} is the interpreter
+# running the check; -q hides the "N passed" line, so the progress line's [100%]
+# and exit status 0 are the evidence.
+verify = """
+- id: suite
+  cmd: {python} -m pytest --tb=short -q --no-header --timeout=120 -n 8 --dist loadfile tests/
+  expect: \\[100%\\]
+  timeout: 1800
+"""
+# Files whose change forces Code Pipeline to full depth here (one glob per line;
+# the defaults in src/features/pipeline/depth.py already cover the Session Engine,
+# shared code, auth, billing, schemas, IPC and PERF-CRITICAL markers).
+protected = """
+src/web/mobile_auth.py
+src/web/routes/ws_events.py
+src/web/routes/preview_api.py
+src/web/daemon_client.py
+src/launcher/run.py
+src/launcher/launch.bat
+src/launcher/launch.sh
+src/web/static/js/socket.js
+src/web/static/js/live-panel.js
+src/web/static/js/session-store.js
+src/web/static/js/thread-scroll*.js
+src/web/static/js/notify.js
+src/web/static/js/utils.js
+src/web/templates/index.html
+src/features/workforce/AGENT_BEST_PRACTICES.md
+"""

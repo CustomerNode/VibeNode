@@ -1,0 +1,284 @@
+"""Source guards for the two most common regressions in VibeNode:
+
+1. DRAFT PERSISTENCE — unsent text must survive session switches and page reloads.
+   Without this, typing in the input box and switching sessions loses the text,
+   or worse, auto-submits it causing a cascade of unwanted "hi" sessions.
+
+2. SEND BEHAVIOR PREFERENCE — "Enter to send" vs "Ctrl+Enter to send" must persist
+   across page reloads and server restarts, including when keyboard handling
+   is simplified.
+
+Both are easy to break when the code is changed without knowing why it exists.
+These tests read the source to verify the patterns are intact.
+"""
+
+import re
+from pathlib import Path
+
+_JS = Path(__file__).resolve().parent.parent / "src" / "web" / "static" / "js"
+
+
+def _read(path):
+    return path.read_text(encoding="utf-8")
+
+
+# ===========================================================================
+# DRAFT PERSISTENCE — live-panel.js must save/restore drafts via localStorage
+# ===========================================================================
+
+class TestDraftPersistenceAPI:
+    """The draft API (_saveDraft, _getDraft, _clearDraft) must exist and
+    use localStorage. Without it, session switches lose typed text."""
+
+    def test_drafts_use_localstorage(self):
+        src = _read(_JS / "live-panel.js")
+        assert "vibenode_drafts" in src, \
+            "Draft persistence must use 'vibenode_drafts' localStorage key"
+        assert "localStorage" in src, \
+            "Drafts must be persisted to localStorage"
+
+    def test_save_draft_exists(self):
+        src = _read(_JS / "live-panel.js")
+        assert "function _saveDraft(" in src, \
+            "_saveDraft function must exist — saves typed text before session switch"
+
+    def test_get_draft_exists(self):
+        src = _read(_JS / "live-panel.js")
+        assert "function _getDraft(" in src, \
+            "_getDraft function must exist — restores text when switching back"
+
+    def test_clear_draft_exists(self):
+        src = _read(_JS / "live-panel.js")
+        assert "function _clearDraft(" in src, \
+            "_clearDraft function must exist — removes draft after successful submit"
+
+    def test_save_draft_stores_to_localstorage(self):
+        """_saveDraft must call _persistDraftsToStorage (which writes localStorage).
+        Without this, drafts only survive in memory — lost on page reload."""
+        src = _read(_JS / "live-panel.js")
+        match = re.search(
+            r"function _saveDraft\([^)]*\)\s*\{([\s\S]*?)\n\}",
+            src
+        )
+        assert match, "Could not extract _saveDraft function body"
+        body = match.group(1)
+        assert "_persistDraftsToStorage" in body or "localStorage" in body, \
+            "_saveDraft must persist to localStorage — in-memory only loses drafts on reload"
+
+
+class TestDraftRestorationOnSessionSwitch:
+    """When switching TO a session, its draft must be restored into the textarea."""
+
+    def test_update_live_input_bar_restores_draft(self):
+        """updateLiveInputBar (called during session open) must fall back to
+        _getDraft when there's no _preservedText from a state transition."""
+        src = _read(_JS / "live-panel.js")
+        match = re.search(
+            r"function updateLiveInputBar\([^)]*\)\s*\{([\s\S]*?)^function ",
+            src, re.MULTILINE
+        )
+        assert match, "Could not find updateLiveInputBar function"
+        body = match.group(1)
+        assert "_getDraft" in body, \
+            "updateLiveInputBar must call _getDraft to restore saved draft " \
+            "when opening a session (no _preservedText from state transition)"
+
+    def test_draft_saved_on_stop(self):
+        """stopLivePanel (called when leaving a session) must save the draft."""
+        src = _read(_JS / "live-panel.js")
+        match = re.search(
+            r"function stopLivePanel\([^)]*\)\s*\{([\s\S]*?)^function ",
+            src, re.MULTILINE
+        )
+        assert match, "Could not find stopLivePanel function"
+        body = match.group(1)
+        assert "_saveDraft" in body, \
+            "stopLivePanel must call _saveDraft to save typed text before switching away"
+
+    def test_draft_cleared_on_submit(self):
+        """When a message is successfully submitted, the draft must be cleared
+        so it doesn't get restored next time the user opens the session."""
+        src = _read(_JS / "live-panel.js")
+        assert src.count("_clearDraft") >= 2, \
+            "Must call _clearDraft in at least 2 places (submit paths) to " \
+            "prevent sent messages from being restored as drafts"
+
+    def test_draft_saved_on_page_unload(self):
+        """Drafts must be saved on beforeunload/visibilitychange so page
+        refresh doesn't lose typed text."""
+        src = _read(_JS / "live-panel.js")
+        assert "beforeunload" in src or "visibilitychange" in src or "_saveDraftFromDOM" in src, \
+            "Must save drafts on page unload events — typed text lost on refresh otherwise"
+
+
+class TestNoAccidentalSessionStarts:
+    """Session switches must NEVER start sessions or send messages.
+
+    THE BUG: User types text, switches to a different session, the typed text
+    gets auto-submitted as a message or used to start a new session. This
+    causes a cascade of unwanted "hi" sessions.
+
+    THE FIX: Session switches call _savePendingInputAsDraft() which only
+    saves to localStorage. The old _autoSendPendingInput() which emitted
+    socket events is no longer called from any switch path.
+    """
+
+    def test_save_pending_input_has_no_socket_emit(self):
+        """_savePendingInputAsDraft must NEVER emit socket events."""
+        src = _read(_JS / "live-panel.js")
+        match = re.search(
+            r"function _savePendingInputAsDraft\(\)\s*\{([\s\S]*?)\n\}",
+            src
+        )
+        assert match, "Could not find _savePendingInputAsDraft function"
+        body = match.group(1)
+        assert "socket.emit" not in body, \
+            "CRITICAL REGRESSION: _savePendingInputAsDraft must NEVER call " \
+            "socket.emit — it causes unwanted session starts when switching"
+        assert "start_session" not in body, \
+            "CRITICAL REGRESSION: _savePendingInputAsDraft must NEVER start sessions"
+        assert "send_message" not in body, \
+            "CRITICAL REGRESSION: _savePendingInputAsDraft must NEVER send messages"
+
+    def test_auto_send_not_called_from_any_switch_path(self):
+        """_autoSendPendingInput must have ZERO call sites in actual code.
+        It was replaced by _savePendingInputAsDraft at all switch points."""
+        toolbar_src = _read(_JS / "toolbar.js")
+        live_src = _read(_JS / "live-panel.js")
+        # Count actual code calls — exclude comments (lines starting with //)
+        # and the function definition itself
+        def _count_code_calls(src):
+            count = 0
+            for line in src.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("//") or stripped.startswith("*"):
+                    continue
+                if "function _autoSendPendingInput" in stripped:
+                    continue
+                if "_autoSendPendingInput()" in stripped:
+                    count += 1
+            return count
+        toolbar_calls = _count_code_calls(toolbar_src)
+        live_calls = _count_code_calls(live_src)
+        total = toolbar_calls + live_calls
+        assert total == 0, \
+            f"CRITICAL REGRESSION: _autoSendPendingInput() has {total} CODE call site(s). " \
+            "It must have ZERO — all switch paths must use _savePendingInputAsDraft(). " \
+            "Calling _autoSendPendingInput on session switch SENDS text instead of " \
+            "saving it, causing the cascade-of-unwanted-sessions bug."
+
+    def test_select_session_uses_draft_save(self):
+        """selectSession in toolbar.js must use _savePendingInputAsDraft."""
+        src = _read(_JS / "toolbar.js")
+        fn = re.search(
+            r"function selectSession\([^)]*\)\s*\{([\s\S]*?)^function ",
+            src, re.MULTILINE
+        )
+        assert fn, "Could not find selectSession"
+        body = fn.group(1)
+        assert "_savePendingInputAsDraft()" in body, \
+            "selectSession must call _savePendingInputAsDraft"
+
+    def test_deselect_session_uses_draft_save(self):
+        """deselectSession in toolbar.js must use _savePendingInputAsDraft."""
+        src = _read(_JS / "toolbar.js")
+        fn = re.search(
+            r"function deselectSession\(\)\s*\{([\s\S]*?)^function ",
+            src, re.MULTILINE
+        )
+        assert fn, "Could not find deselectSession"
+        body = fn.group(1)
+        assert "_savePendingInputAsDraft()" in body, \
+            "deselectSession must call _savePendingInputAsDraft"
+
+
+# ===========================================================================
+# SEND BEHAVIOR PREFERENCE — Enter vs Ctrl+Enter must persist
+# ===========================================================================
+
+class TestSendBehaviorPreference:
+    """The 'Enter to send' vs 'Ctrl+Enter to send' preference must be stored
+    in localStorage AND synced to the server."""
+
+    def test_send_behavior_variable_exists(self):
+        src = _read(_JS / "utils.js")
+        assert re.search(r"let sendBehavior\s*=", src), \
+            "sendBehavior variable must exist in utils.js"
+
+    def test_reads_from_localstorage_on_load(self):
+        """Must read preference from localStorage on page load — not hardcoded."""
+        src = _read(_JS / "utils.js")
+        assert re.search(r"localStorage\.getItem\(['\"]sendBehavior['\"]\)", src), \
+            "Must read sendBehavior from localStorage on page load"
+
+    def test_saves_to_localstorage_on_change(self):
+        """Must save to localStorage when the user changes the preference."""
+        src = _read(_JS / "utils.js")
+        assert re.search(r"localStorage\.setItem\(['\"]sendBehavior['\"]", src), \
+            "Must save sendBehavior to localStorage when changed"
+
+    def test_syncs_to_server(self):
+        """Must sync to server via set_ui_prefs so preference survives
+        localStorage clears and works across devices."""
+        src = _read(_JS / "utils.js")
+        assert "set_ui_prefs" in src, \
+            "Must sync sendBehavior to server via set_ui_prefs socket event"
+
+    def test_should_send_function_exists(self):
+        """_shouldSend(e) must exist and check the sendBehavior variable."""
+        src = _read(_JS / "utils.js")
+        assert "function _shouldSend(" in src, \
+            "_shouldSend function must exist — keyboard handler for Enter/Ctrl+Enter"
+        match = re.search(
+            r"function _shouldSend\([^)]*\)\s*\{([\s\S]*?)\n\}",
+            src
+        )
+        assert match, "Could not extract _shouldSend body"
+        body = match.group(1)
+        assert "sendBehavior" in body, \
+            "_shouldSend must check the sendBehavior variable — not hardcoded to one mode"
+
+    def test_enter_mode_sends_on_plain_enter(self):
+        """When sendBehavior === 'enter', plain Enter (no modifiers) must send."""
+        src = _read(_JS / "utils.js")
+        match = re.search(
+            r"function _shouldSend\([^)]*\)\s*\{([\s\S]*?)\n\}",
+            src
+        )
+        body = match.group(1)
+        # Must check for 'enter' mode and return true for unmodified Enter
+        assert re.search(r"sendBehavior\s*===\s*['\"]enter['\"]", body), \
+            "_shouldSend must have a branch for sendBehavior === 'enter'"
+
+    def test_preference_restored_from_server_on_connect(self):
+        """On socket connect, server prefs must be loaded and applied.
+        This ensures preference survives localStorage clears."""
+        src = _read(_JS / "socket.js")
+        assert "ui_prefs_loaded" in src, \
+            "Must listen for ui_prefs_loaded event to restore server-side preferences"
+        assert "sendBehavior" in src, \
+            "Must restore sendBehavior from server preferences on connect"
+
+    def test_toggle_function_exists(self):
+        """Must have a toggle function accessible from the UI."""
+        src = _read(_JS / "utils.js")
+        assert re.search(r"function _toggleSendBehavior", src), \
+            "_toggleSendBehavior must exist for the preference toggle UI"
+
+    def test_refresh_hints_after_toggle(self):
+        """After toggling, all visible send hints must be updated."""
+        src = _read(_JS / "utils.js")
+        match = re.search(
+            r"function _toggleSendBehavior\([^)]*\)\s*\{([\s\S]*?)\n\}",
+            src
+        )
+        assert match, "Could not find _toggleSendBehavior"
+        body = match.group(1)
+        # The toggle (and the Preferences switch) change the setting through
+        # _setSendBehavior, which is where the refresh lives.
+        assert "_setSendBehavior(" in body, \
+            "_toggleSendBehavior must change the setting through _setSendBehavior"
+        setter = re.search(r"function _setSendBehavior\([^)]*\)\s*\{([\s\S]*?)\n\}", src)
+        assert setter, "Could not find _setSendBehavior"
+        assert "_refreshSendHints" in setter.group(1), \
+            "Must call _refreshSendHints after toggle — UI hints go stale otherwise"

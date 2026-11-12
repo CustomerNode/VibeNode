@@ -1,0 +1,408 @@
+"""A write the Publish scan would fail is refused when it is written (src/engine/publish_guard.py).
+
+The triggering text is assembled at run time, so this file itself never holds what the scan looks for."""
+import subprocess
+
+from engine import publish_guard as pg
+from engine import tool_guards as tg
+
+ROOT = pg.ROOT
+KEY = "AKIA" + "Q7" * 8          # AWS key shape, built here so the source stays clean
+SOFT = 'api_key = "' + "k" * 28 + '"'  # an assignment-style secret, still skipped in markdown
+
+
+def _src(rel):
+    return str(ROOT / rel)
+
+
+def test_a_key_written_into_the_repo_is_refused_with_what_was_found():
+    why = pg.decide("Write", {"file_path": _src("src/web/zz_probe.py"), "content": f"x = 1\nk = '{KEY}'\n"})
+    assert why and "Publish scan" in why and "line 2" in why and "AWS Access Key" in why
+
+
+def test_a_finding_in_a_test_fixture_is_refused_with_a_made_up_name_hint():
+    why = pg.decide("Edit", {"file_path": _src("tests/test_zz_probe.py"), "old_string": "a",
+                             "new_string": f"<span>{KEY}</span>"})
+    assert why and "AWS Access Key" in why and "made-up" in why
+
+
+def test_multiedit_and_notebook_text_are_judged():
+    assert pg.decide("MultiEdit", {"file_path": _src("src/web/zz.py"),
+                                   "edits": [{"old_string": "a", "new_string": "fine"},
+                                             {"old_string": "b", "new_string": KEY}]})
+    assert pg.decide("NotebookEdit", {"notebook_path": _src("src/web/zz.ipynb"), "new_source": KEY})
+
+
+def test_clean_text_ignored_folders_other_projects_and_other_tools_pass(tmp_path):
+    assert pg.decide("Write", {"file_path": _src("src/web/zz_probe.py"), "content": "x = 1\n"}) is None
+    assert pg.decide("Write", {"file_path": _src("docs/plans/zz_probe.py"), "content": KEY}) is None
+    assert pg.decide("Write", {"file_path": str(tmp_path / "x.py"), "content": KEY}) is None
+    assert pg.decide("Bash", {"command": f"echo {KEY}"}) is None
+
+
+def test_the_scanner_s_own_skip_list_applies():
+    # Markdown is not content-scanned for assignment-style secrets, so the guard lets one through.
+    assert pg.decide("Write", {"file_path": _src("README.md"), "content": SOFT}) is None
+    # But a strong, unmistakable secret is caught everywhere, markdown included.
+    assert pg.decide("Write", {"file_path": _src("README.md"), "content": KEY})
+
+
+def test_a_relative_path_resolves_against_the_session_folder():
+    assert pg.decide("Write", {"file_path": "src/web/zz_probe.py", "content": KEY}, str(ROOT))
+
+
+def test_it_fails_open_and_has_a_kill_switch(monkeypatch):
+    monkeypatch.setattr(pg, "findings", lambda *a: (_ for _ in ()).throw(OSError("boom")))
+    assert pg.decide("Write", {"file_path": _src("src/web/zz.py"), "content": KEY}) is None
+    monkeypatch.undo()
+    monkeypatch.setenv("VIBENODE_PUBLISH_GUARD", "0")
+    assert pg.decide("Write", {"file_path": _src("src/web/zz.py"), "content": KEY}) is None
+
+
+def test_it_runs_first_inside_the_tool_guards(tmp_path):
+    why = tg.decide("Write", {"file_path": _src("src/web/zz.py"), "content": KEY}, "",
+                    config=tmp_path / "none.json")
+    assert why and why.startswith("[publish scan]")
+
+
+def test_the_guard_and_publish_use_one_rule_set():
+    from web import git_scanner as g
+    text = f"k = '{KEY}'\n"
+    assert pg.findings("src/web/zz.py", text) == g.scan_text("src/web/zz.py", text)
+    assert pg.findings("src/web/zz.py", text)
+
+
+def test_the_full_scan_still_reports_what_scan_text_finds(tmp_path):
+    from web import git_scanner as g
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "a.py").write_text(f"k = '{KEY}'\n")
+    (tmp_path / "README.md").write_text(SOFT)
+    res = g.scan_staged_files(tmp_path)
+    assert [(f["file"], f["line"], f["type"]) for f in res["findings"]] == [("a.py", 1, "AWS Access Key")]
+    import json
+    done = json.loads(list(g.scan_staged_files_stream(tmp_path))[-1])
+    assert done["findings"] == res["findings"]
+
+
+# ── Who the owner is never reaches a published file, notes included ──
+# The real rules hold only fingerprints, and no file may carry a name, so these
+# tests swap in rules built from made-up words with the same shape.
+import pytest
+
+
+@pytest.fixture
+def made_up_people(monkeypatch):
+    from web import git_scanner as g
+    R = g._IdentityRule.of
+    rules = [R("Owner ID", "id", ["40404"]), R("Owner Name", "n", ["zorbo"]),
+             R("Owner Family Name", "f", ["rivers"], initial=True),
+             R("Owner First Name", "first", ["Jordan"], case=True, as_name=True),
+             R("Collaborator Name", "c", ["Quill"], case=True, as_name=True),
+             R("Owner Machine Name", "m", ["zorbvm"])]
+    monkeypatch.setattr(g, "_IDENTITY_RULES", rules)
+    return g
+
+
+PLANTED = ["user 40404 here", "by zorbo", "jrivers@example.org", "Asked by Jordan, 2026-11-03.",
+           "Quill wrote this.", "rebuild launched on zorbvm"]
+
+
+def test_every_identity_rule_fires_in_code_tests_and_notes(made_up_people):
+    g = made_up_people
+    for where in ("src/web/x.py", "tests/test_x.py", "CLAUDE.md", "src/features/workforce/agent.md", "docs/guide.md"):
+        found = {f["type"] for text in PLANTED for f in g.scan_text(where, text)}
+        assert found == {r.label for r in g._IDENTITY_RULES}, (where, found)
+    assert g.scan_text("src/web/git_scanner.py", PLANTED[3]) == []
+
+
+def test_ordinary_words_are_not_the_owner(made_up_people):
+    g = made_up_people
+    for text in ["Jordan't", "Jordan\\'t", "Jordan&#x27;t", "JORDAN", "Jordanian", "riverside", "precanter"]:
+        assert not g.scan_text("src/web/x.py", text), text
+    # A possessive is the name itself.
+    assert [f["type"] for f in g.scan_text("src/web/x.py", "Waiting on Jordan's approval")] == ["Owner First Name"]
+
+
+def test_the_full_scan_reads_skipped_files_for_identity_only(tmp_path, made_up_people):
+    g = made_up_people
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "NOTES.md").write_text(f"{SOFT}\nQuestion from Jordan\n")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "shot.png").write_bytes(b"\x89PNG\x00\x00 Jordan ")
+    res = g.scan_staged_files(tmp_path)
+    assert [(f["file"], f["line"], f["type"]) for f in res["findings"]] == [("NOTES.md", 2, "Owner First Name")]
+    import json
+    assert json.loads(list(g.scan_staged_files_stream(tmp_path))[-1])["findings"] == res["findings"]
+
+
+def test_a_session_writing_the_owner_into_notes_is_refused(made_up_people):
+    # The guard runs the scanner in a fresh interpreter, so it uses the real rules;
+    # here the finding comes from the test rules through the same code path.
+    g = made_up_people
+    assert [f["type"] for f in g.scan_text("CLAUDE.md", "The owner (Jordan) chose this.")] == ["Owner First Name"]
+
+
+def test_the_real_rules_keep_only_fingerprints():
+    from web import git_scanner as g
+    src = (ROOT / "src" / "web" / "git_scanner.py").read_text()
+    assert len(g._IDENTITY_RULES) == 9  # eight identity rules and swearing
+    for r in g._IDENTITY_RULES:
+        assert r.fingerprints and all(len(f) == 20 for f in r.fingerprints)
+        for f in r.fingerprints:
+            assert f in src
+
+
+def _git(cwd, *a):
+    return subprocess.run(["git", "-C", str(cwd), *a], check=True, capture_output=True, text=True).stdout
+
+
+def test_versions_waiting_to_publish_are_checked_for_names(tmp_path, made_up_people):
+    g = made_up_people
+    remote, work = tmp_path / "remote.git", tmp_path / "work"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "clone", "-q", str(remote), str(work)], check=True)
+    for k, v in {"user.email": "t@example.org", "user.name": "t"}.items():
+        _git(work, "config", k, v)
+    (work / "a.txt").write_text("hello\n"); _git(work, "add", "-A"); _git(work, "commit", "-qm", "one")
+    _git(work, "push", "-q", "origin", "HEAD")
+    assert g.scan_outgoing_commits(work) == []
+    # An old version that still names the owner, removed again later: the tree is clean, history is not.
+    (work / "a.txt").write_text("hello\nAsked by Jordan.\n"); _git(work, "commit", "-qam", "two")
+    (work / "a.txt").write_text("hello\n"); _git(work, "commit", "-qam", "three")
+    assert g.scan_staged_files(work)["findings"] == []
+    found = g.scan_outgoing_commits(work)
+    assert [f["type"] for f in found] == ["Owner First Name"]
+    _git(work, "commit", "-q", "--allow-empty", "-m", "fix for Quill")
+    assert {f["type"] for f in g.scan_outgoing_commits(work)} == {"Owner First Name", "Collaborator Name"}
+
+
+def test_update_refuses_to_publish_versions_with_names():
+    src = (ROOT / "src" / "web" / "git_ops.py").read_text()
+    a, b = src.index("scan_outgoing_commits(proj)"), src.index('["git", "-C", str(proj), "push"]')
+    assert a < b, "the outgoing-versions check must run before the push"
+
+
+# ── Private notes and stray files never publish ──
+
+def test_the_public_layout_hides_notes_pictures_and_strays():
+    for path in ["zz.png", "notes.md", "_trash_x/a.png", "docs/zz.md", "docs/x.py", "src/web/x.png",
+                 "src/web/NOTES.md", "tests/screenshots/a.png", "docs/plans/x.md", "scratch.txt", "src/web/plan.html"]:
+        assert subprocess.run(["git", "-C", str(ROOT), "check-ignore", "-q", path]).returncode == 0, path
+    for path in ["src/web/x.py", "src/web/static/x.png", "src/web/static/images/y.png", "docs/screenshots/z.png",
+                 "src/features/workforce/new.md", "tests/test_x.py", "src/web/templates/x.html", "README.md", "CLAUDE.md"]:
+        assert subprocess.run(["git", "-C", str(ROOT), "check-ignore", "-q", path]).returncode == 1, path
+
+
+def test_no_tracked_file_is_outside_the_public_layout():
+    from web import git_scanner as g
+    assert g.layout_problems(ROOT) == []
+
+
+def test_a_force_added_note_is_refused_by_the_scan(tmp_path):
+    from web import git_scanner as g
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*.md\n")
+    (tmp_path / "PLAN.md").write_text("a private plan\n")
+    _git(tmp_path, "add", "-f", "PLAN.md")
+    res = g.scan_staged_files(tmp_path)
+    assert not res["ok"] and [b["file"] for b in res["blocked_files"]] == ["PLAN.md"]
+
+
+def test_the_public_project_file_stays_short(tmp_path):
+    from web import git_scanner as g
+    assert g.CLAUDE_MD_MAX_LINES == pg.CLAUDE_MD_MAX_LINES
+    assert (ROOT / "CLAUDE.md").read_text().count("\n") <= g.CLAUDE_MD_MAX_LINES
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "CLAUDE.md").write_text("rule\n" * (g.CLAUDE_MD_MAX_LINES + 1))
+    assert any(b["file"] == "CLAUDE.md" for b in g.scan_staged_files(tmp_path)["blocked_files"])
+    why = pg.decide("Edit", {"file_path": _src("CLAUDE.md"), "old_string": "# VibeNode",
+                             "new_string": "## A new note\n" * 80 + "# VibeNode"})
+    assert why and "docs/plans/PROJECT-NOTES.md" in why
+    assert pg.decide("Write", {"file_path": _src("CLAUDE.md"), "content": "short\n"}) is None
+
+
+def test_swearing_is_refused_everywhere():
+    from web import git_scanner as g
+    word = "f" + "ucking"
+    for where in ("src/web/x.py", "CLAUDE.md", "src/features/workforce/a.md"):
+        assert [f["type"] for f in g.scan_text(where, f"this is {word} slow")] == ["Swearing"], where
+    assert g.scan_text("src/web/x.py", "handle_crashitem shift shitake") == []
+
+
+def test_a_copy_gets_its_private_notes_back_after_the_update(tmp_path):
+    from web import post_update
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for k, v in {"user.email": "t@example.org", "user.name": "t"}.items():
+        _git(tmp_path, "config", k, v)
+    long_notes = "".join(f"note {i}\n" for i in range(200))
+    (tmp_path / "CLAUDE.md").write_text(long_notes); _git(tmp_path, "add", "-A"); _git(tmp_path, "commit", "-qm", "a")
+    (tmp_path / "CLAUDE.md").write_text("short public rules\n"); _git(tmp_path, "commit", "-qam", "b")
+    assert post_update.restore_private_notes(tmp_path) == "restored"
+    assert (tmp_path / "docs" / "plans" / "PROJECT-NOTES.md").read_text() == long_notes
+    assert post_update.restore_private_notes(tmp_path) == "present"
+
+
+# ── Notes about people and build history never publish ──
+# Built at run time so this file holds none of what the rules look for.
+_O = "own" + "er"
+
+
+def test_quotes_decisions_and_dated_notes_are_refused_everywhere():
+    from web import git_scanner as g
+    cases = {
+        "Owner Quote": f"# The {_O}, 20" + "26-10-28: \"follow the work\"",
+        "Owner Decision Note": f"# {_O.capitalize()}'s pick B of the mockup page",
+        "Personal Quote": "# he " + "said: \"make it bigger\"",
+        "Dated Build Note": "# Fix" + "ed 2026-10-05 after an incident",
+    }
+    for where in ("src/web/x.py", "tests/test_x.py", "docs/guide.md", "src/features/workforce/a.md"):
+        for label, text in cases.items():
+            assert label in {f["type"] for f in g.scan_text(where, text)}, (where, label)
+
+
+def test_ordinary_wording_is_not_a_note():
+    from web import git_scanner as g
+    for text in [f"the {_O}'s phone may do everything the computer can", "request_is_" + _O,
+                 "the user asked for a file", "date: 2026-10-05", "in the user's own words",
+                 "Answering a card follows the thread until the reader scrolls away."]:
+        assert not g.scan_text("src/web/x.py", text), text
+
+
+def test_a_name_after_an_escaped_line_break_is_caught(made_up_people):
+    g = made_up_people
+    assert [f["type"] for f in g.scan_text("tests/test_x.py", 'body = "Thanks,\\n\\nJordan"')] == ["Owner First Name"]
+
+
+def test_versions_waiting_to_publish_are_checked_for_notes_too(tmp_path):
+    from web import git_scanner as g
+    remote, work = tmp_path / "remote.git", tmp_path / "work"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "clone", "-q", str(remote), str(work)], check=True)
+    for k, v in {"user.email": "t@example.org", "user.name": "t"}.items():
+        _git(work, "config", k, v)
+    (work / "a.py").write_text("x = 1\n"); _git(work, "add", "-A"); _git(work, "commit", "-qm", "one")
+    _git(work, "push", "-q", "origin", "HEAD")
+    (work / "a.py").write_text("x = 1\n# " + _O + "'s pick B of the mockup\n"); _git(work, "commit", "-qam", "two")
+    (work / "a.py").write_text("x = 1\n"); _git(work, "commit", "-qam", "three")
+    assert [f["type"] for f in g.scan_outgoing_commits(work)] == ["Owner Decision Note"]
+
+
+# ── Generalized rules added after a line-by-line review found leaks a pattern
+#    scan had missed (a collaborator's name in an identifier, another project's
+#    data, a device codename, parenthetical/"pre-" dates). Triggering strings
+#    are assembled at run time so this test file itself stays clean.
+
+def test_a_name_hidden_in_camelcase_or_at_a_quote_end_is_caught(made_up_people):
+    g = made_up_people
+    # camelCase: a name needs no surrounding spaces to be found.
+    assert [f["type"] for f in g.scan_text("src/web/x.py", "if (approvedByJordan) ok();")] == ["Owner First Name"]
+    # a name at the very end of a quoted string (a closing quote is not a contraction).
+    assert g.scan_text("src/web/x.py", "label = 'Approved by Jordan'")
+    assert g.scan_text("src/web/x.py", "x = ('By Jordan')")
+    # a regex for a contraction is not the bare name.
+    assert not g.scan_text("src/web/x.py", 'pat = "Jordan' + "'?t\"")
+
+
+def test_another_projects_name_job_or_host_is_caught():
+    from web import git_scanner as g
+    for term in ["Alt" + "ium", "author" + "ship", "build" + "box"]:
+        assert any(f["type"] == "Foreign Project Or Host"
+                   for f in g.scan_text("src/web/x.py", 'project="' + term + '"')), term
+    # case-insensitive
+    assert any(f["type"] == "Foreign Project Or Host"
+               for f in g.scan_text("src/web/x.py", ("ALT" + "IUM")))
+
+
+def test_a_second_collaborator_name_is_caught_but_not_a_contraction():
+    from web import git_scanner as g
+    name = "d" + "on"
+    assert any(f["type"] == "Collaborator Name" for f in g.scan_text("src/web/x.py", "'not_approved_by_" + name + "'"))
+    assert any(f["type"] == "Collaborator Name" for f in g.scan_text("src/web/x.py", "'Not approved by " + name.capitalize() + "'"))
+    assert not g.scan_text("src/web/x.py", "we " + name + "'t do that")         # contraction
+    assert not g.scan_text("src/web/x.py", 'r"' + name + "'?t\"")               # regex for one
+
+
+def test_parenthetical_and_change_dates_and_device_labels_are_caught():
+    from web import git_scanner as g
+    assert any(f["type"] == "Parenthetical Date"
+               for f in g.scan_text("src/web/x.py", "# step 3 (" + "2026-09-25" + ") bug"))
+    assert any(f["type"] == "Change-Date Reference"
+               for f in g.scan_text("src/web/x.py", "// the " + "pre-" + "2026-10-14" + " design"))
+    assert any(f["type"] == "Change-Date Reference"
+               for f in g.scan_text("src/web/x.py", "restored from " + "before " + "2026-10-14"))
+    assert any(f["type"] == "Device Label"
+               for f in g.scan_text("src/web/x.py", "tag = '" + "Sent from " + "Q at ' + ts"))
+    # Legitimate forms stay clean: a generic label, an ISO timestamp, a bare
+    # date not in parentheses.
+    assert not g.scan_text("src/web/x.py", "ts = 'Sent from Mobile at ' + now")
+    assert not g.scan_text("src/web/x.py", "created = '" + "2026-03-01" + "T10:00:00Z'")
+    assert not g.scan_text("src/web/x.py", "# ubuntu runner from " + "2026-10-19" + ") exits 127")
+
+
+# ── Every-file personal-data checks (added to cover every conceivable piece of
+#    private or personal information). Triggers
+#    are assembled at run time so this file stays clean.
+
+def test_personal_data_is_caught_but_placeholders_are_not():
+    from web import git_scanner as g
+    s = g.scan_text
+    # Real email, phone, and a Tailscale machine FQDN are flagged.
+    assert [f["type"] for f in s("src/web/x.py", "write me at jdoe@gmail" + ".com")] == ["Email Address"]
+    assert [f["type"] for f in s("src/web/x.py", "call 415-555" + "-0137")] == ["Phone Number"]
+    assert [f["type"] for f in s("src/web/x.py", "ring +1 415 555" + " 0137")] == ["Phone Number"]
+    assert [f["type"] for f in s("src/web/x.py", "host = 'box.tail1ee172.ts" + ".net'")] == ["Tailnet Machine"]
+    # Reserved/example/noreply addresses, placeholder tailnets and decimals are not.
+    for clean in ["sam@example.com", "t@test.local", "customernode@users.noreply.github.com",
+                  "box.example.ts.net", "x.tail0000.ts.net", "d = '167.3125 and 191.8125'"]:
+        assert s("src/web/x.py", clean) == [], clean
+
+
+def test_personal_data_and_strong_secrets_are_checked_even_in_docs():
+    from web import git_scanner as g
+    # Markdown/docs are skipped for assignment-style secrets but NOT for personal
+    # data or a strong, unmistakable key.
+    assert [f["type"] for f in g.scan_text("docs/guide.md", "mail jdoe@gmail" + ".com")] == ["Email Address"]
+    assert any(f["type"] == "AWS Access Key" for f in g.scan_text("CLAUDE.md", "AKIA" + "Q7" * 8))
+    assert any(f["type"] == "Anthropic Key"
+               for f in g.scan_text("src/features/workforce/a.md", "sk-ant-" + "api03" + "A" * 24))
+
+
+def test_binary_bytes_are_not_mistaken_for_personal_data():
+    from web import git_scanner as g
+    # An image's random bytes can look like an address; images are left out of the
+    # text PII checks (a name planted in one is still caught by the identity rules).
+    assert g.scan_text("docs/screenshots/x.png", "o56U@a.UWwug Y@25W.nm") == []
+
+
+# ── The user's own words (cursing or not) never get copied into the repo ──
+# The write-guard compares a write against what the user typed this session and
+# refuses a run of their words. Off by default in the suite; on per test here.
+
+def test_a_write_copying_the_users_own_words_is_refused(monkeypatch):
+    monkeypatch.setenv("VIBENODE_USER_WORDS_GUARD", "1")
+    monkeypatch.setattr(pg, "_user_messages",
+                        lambda sid: ["ok so make it happen and do exactly what i said right now please"])
+    # A run of >=8 of the user's words, dropped into a comment, is refused.
+    why = pg._user_words_problem("# make it happen and do exactly what i said right now", "x")
+    assert why and "user's own words" in why
+    # Neutral code that shares no long run with the user is fine.
+    assert pg._user_words_problem("def add(a, b):\n    return a + b\n", "x") is None
+
+
+def test_the_user_words_guard_has_a_kill_switch(monkeypatch):
+    monkeypatch.setenv("VIBENODE_USER_WORDS_GUARD", "0")
+    monkeypatch.setattr(pg, "_user_messages",
+                        lambda sid: ["make it happen and do exactly what i said right now please"])
+    assert pg._user_words_problem("make it happen and do exactly what i said right now", "x") is None
+
+
+def test_the_guard_refuses_a_real_write_that_quotes_the_user(monkeypatch):
+    monkeypatch.setenv("VIBENODE_USER_WORDS_GUARD", "1")
+    monkeypatch.setattr(pg, "_user_messages",
+                        lambda sid: ["please add a note that the quick brown fox jumps over the lazy dog today"])
+    why = pg.decide("Write", {"file_path": _src("src/web/zz_userwords.py"),
+                              "content": "# the quick brown fox jumps over the lazy dog today\n"})
+    assert why and "own words" in why
+    # The same write without the user's words passes the guard.
+    assert pg.decide("Write", {"file_path": _src("src/web/zz_userwords.py"),
+                               "content": "def f():\n    return 42\n"}) is None

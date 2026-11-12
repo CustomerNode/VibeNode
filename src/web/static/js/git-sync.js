@@ -1,0 +1,1013 @@
+/* git-sync.js — git status polling and sync actions */
+
+let _gitStatus = {};
+
+// Drawn icons for the three states (were the text characters ↓ ↑ ↓↑ in a badge).
+const _GIT_ICO = (d) => '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + d + '</svg>';
+const _GIT_ICONS = {
+  pull: _GIT_ICO('<path d="M12 4v11"/><path d="m7 10.5 5 5 5-5"/><path d="M5 20h14"/>'),      // down to a line: there is something to bring in
+  push: _GIT_ICO('<path d="M12 20V9"/><path d="m7 13.5 5-5 5 5"/><path d="M5 4h14"/>'),         // up to a line: there is something to send out
+  sync: _GIT_ICO('<path d="M7 4v15"/><path d="m3.5 15.5 3.5 3.5 3.5-3.5"/><path d="M17 20V5"/><path d="m13.5 8.5 3.5-3.5 3.5 3.5"/>'),
+};
+
+/** One state button: icon, a count where there is one, and a tooltip that says exactly what is waiting. */
+function _setGitBtn(btn, badgeId, kind, count, tip) {
+  document.getElementById(badgeId).innerHTML = _GIT_ICONS[kind];
+  if (count > 0) btn.dataset.count = String(count); else delete btn.dataset.count;
+  btn.title = tip;
+  btn.style.display = 'inline-flex';
+}
+
+function _applyGitStatus(s) {
+  _gitStatus = s;
+  const hasPush = s.ahead > 0 || s.uncommitted;
+  const hasPull = s.behind > 0;
+  const btnUpdate  = document.getElementById('btn-git-update');
+  const btnPublish = document.getElementById('btn-git-publish');
+  const btnSync    = document.getElementById('btn-git-sync');
+  const n = (k, one, many) => k + ' ' + (k === 1 ? one : many);
+  const pullTip = n(s.behind || 0, 'update', 'updates') + ' available';
+  const pushTip = s.ahead > 0
+    ? n(s.ahead, 'change', 'changes') + ' to publish' + (s.uncommitted ? ', plus unsaved edits' : '')
+    : 'Unsaved edits to publish';
+  if (hasPull && hasPush) {
+    // Both directions — show single Sync button
+    btnUpdate.style.display = 'none';
+    btnPublish.style.display = 'none';
+    _setGitBtn(btnSync, 'git-badge-sync', 'sync', 0, pullTip + ' \u00b7 ' + pushTip);
+  } else {
+    btnSync.style.display = 'none';
+    if (hasPull) _setGitBtn(btnUpdate, 'git-badge-pull', 'pull', s.behind, pullTip);
+    else btnUpdate.style.display = 'none';
+    if (hasPush) _setGitBtn(btnPublish, 'git-badge-push', 'push', s.ahead, pushTip);
+    else btnPublish.style.display = 'none';
+  }
+}
+
+async function pollGitStatus() {
+  try {
+    const res = await fetch('/api/git-status');
+    const s = await res.json();
+    _applyGitStatus(s);
+  } catch(e) {}
+}
+
+// Arm the approval-notification capability on any git-button press. This is
+// the reliable "user gesture on their phone" moment for iOS Safari — pressing
+// the Update button unlocks the WebAudio context and opportunistically
+// requests Notification permission, so later approval pings can actually
+// make sound. Idempotent, safe to call every time. See notify.js.
+function _armNotifyOnGesture() {
+  try {
+    if (window.VNNotify && typeof window.VNNotify.arm === 'function') {
+      window.VNNotify.arm();
+    }
+  } catch (e) {}
+}
+
+// ── What goes into the commit ──
+// The commit message is the user's one-line "What changed" (auto-generated from
+// the staged areas when left empty) plus a "Publish gate" line recording which
+// test mode ran and how it went, or that it was skipped.  Both are read here
+// and sent with the /api/git-sync request (src/web/git_ops.py build_commit_message).
+let _publishSummary = '';
+let _publishGate = null;       // {mode, passed, skipped, failed, seconds, anyway}
+
+// What each test mode really runs, from /api/test-modes (src/web/routes/test_api.py
+// MODES).  The fallback matches it; both modes run the same files, and only
+// the per-test timeout differs.  The Code Pipeline tests never run here.
+const _TEST_MODE_FALLBACK = {
+  fast: {label: 'Fast: unit + browser tests, 60s timeout (Code Pipeline tests not included)'},
+  full: {label: 'Full: unit + browser tests, 120s timeout (Code Pipeline tests not included)'},
+};
+let _testModesCache = null;
+async function _testModes() {
+  if (_testModesCache) return _testModesCache;
+  try {
+    const r = await fetch('/api/test-modes');
+    const d = r.ok ? await r.json() : null;
+    if (d && d.modes && d.modes.fast && d.modes.full) _testModesCache = d.modes;
+  } catch (_) {}
+  return _testModesCache || _TEST_MODE_FALLBACK;
+}
+
+function _gateOptionsHtml(modes, verb) {
+  return '<p style="color:var(--text-muted);font-size:12px;margin-top:8px">'
+    + 'Run regression tests before ' + verb + '?</p>'
+    + '<ul style="margin:4px 0 0 16px;color:var(--text-muted);font-size:11px;line-height:1.5">'
+    + '<li>' + escHtml(modes.fast.label) + '</li>'
+    + '<li>' + escHtml(modes.full.label) + '</li>'
+    + '<li>Skip: no tests run; the commit message says so.</li></ul>';
+}
+
+function _summaryFieldHtml() {
+  return '<label for="git-publish-summary" style="display:block;margin-top:10px;font-size:12px;color:var(--text-muted)">'
+    + 'What changed? (one line, optional)</label>'
+    + '<input id="git-publish-summary" type="text" maxlength="120" autocomplete="off" '
+    + 'placeholder="Left empty: areas and file count are filled in for you" '
+    + 'style="width:100%;box-sizing:border-box;margin-top:4px;padding:6px 8px;font-size:13px;'
+    + 'background:var(--bg-input,rgba(255,255,255,0.06));color:var(--text-primary,#eee);'
+    + 'border:1px solid var(--border,rgba(255,255,255,0.15));border-radius:6px">';
+}
+
+/** Read the summary field before the dialog body is replaced. */
+function _readSummaryField() {
+  const el = document.getElementById('git-publish-summary');
+  _publishSummary = el ? String(el.value || '').trim().slice(0, 120) : '';
+}
+
+async function openGitPublish() {
+  _armNotifyOnGesture();
+  const s = _gitStatus;
+  const hasPush = s.ahead > 0 || s.uncommitted;
+  if (!hasPush) {
+    showGitSyncModal('Publish App Update', '<p style="color:var(--text-muted)">Nothing to publish \u2014 your app is already up to date on remote.</p>',
+      [{label:'OK', onclick: closeGitSyncModal}]);
+    return;
+  }
+  // Branch guard FIRST — before any publish/test options are shown.
+  if (s.on_default === false) {
+    _showBranchWarning('both', 'btn-git-publish', 'Publish App Update', s);
+    return;
+  }
+  let body = '<p>Your local changes are ready to publish.</p>'
+    + '<p style="color:var(--text-muted);font-size:12px">They will be saved and uploaded to remote automatically.</p>';
+  if (s.behind > 0) {
+    body += '<p style="color:var(--text-muted);font-size:12px;margin-top:8px">'
+      + s.behind + ' remote update(s) will be pulled in first, then your changes pushed.</p>';
+  }
+  const modes = await _testModes();
+  body += _summaryFieldHtml() + _gateOptionsHtml(modes, 'publishing');
+  _publishGate = null;
+  showGitSyncModal('Publish App Update', body, [
+    {label: 'Fast tests + Publish', primary: true, onclick: () => { _readSummaryField(); _testThenPublish('fast'); }},
+    {label: 'Full tests + Publish', onclick: () => { _readSummaryField(); _testThenPublish('full'); }},
+    {label: 'Skip & Publish', onclick: () => {
+      _readSummaryField();
+      _publishGate = {mode: 'skipped'};
+      executeGitAction('both', 'btn-git-publish', 'Publish App Update');
+    }},
+    {label: 'Cancel', onclick: closeGitSyncModal}
+  ]);
+}
+
+function _testThenPublish(mode) {
+  _testThenAction(mode, 'publish', 'Publish App Update', 'btn-git-publish');
+}
+
+async function openGitSyncBoth() {
+  _armNotifyOnGesture();
+  const s = _gitStatus;
+  // Branch guard FIRST — before any sync/test options are shown.
+  if (s.on_default === false) {
+    _showBranchWarning('both', 'btn-git-sync', 'Sync App', s);
+    return;
+  }
+  let body = '<p><b style="color:var(--text-heading)">' + s.behind + ' update(s)</b> to pull and '
+    + '<b style="color:var(--text-heading)">' + (s.ahead + (s.uncommitted ? 1 : 0)) + ' change(s)</b> to push.</p>'
+    + '<p style="color:var(--text-muted);font-size:12px">Remote updates will be pulled first, merge conflicts resolved automatically, then your changes pushed.</p>'
+    + _summaryFieldHtml() + _gateOptionsHtml(await _testModes(), 'syncing');
+  _publishGate = null;
+  showGitSyncModal('Sync App', body, [
+    {label: 'Fast tests + Sync', primary: true, onclick: () => { _readSummaryField(); _testThenSync('fast'); }},
+    {label: 'Full tests + Sync', onclick: () => { _readSummaryField(); _testThenSync('full'); }},
+    {label: 'Skip & Sync', onclick: () => {
+      _readSummaryField();
+      _publishGate = {mode: 'skipped'};
+      executeGitAction('both', 'btn-git-sync', 'Sync App');
+    }},
+    {label: 'Cancel', onclick: closeGitSyncModal}
+  ]);
+}
+
+function _testThenSync(mode) {
+  _testThenAction(mode, 'sync', 'Sync App', 'btn-git-sync');
+}
+
+/**
+ * Shared helper: run tests, then execute a git action if they pass.
+ * @param {string} mode - "fast" or "full"
+ * @param {string} actionType - "publish" or "sync" (for labels)
+ * @param {string} actionLabel - display label for the git action
+ * @param {string} btnId - button ID for executeGitAction
+ */
+// Cap on traceback text embedded in the fix prompt.  The full output is always
+// in the saved log file, which the fix session is told to read.
+const _TEST_FIX_DETAIL_CAP = 15000;
+
+/**
+ * Turn raw pytest -q output into what the failure dialog and the fix session
+ * need: the FAILED/ERROR lines, the traceback sections, the run's tail (for
+ * runs that died without a summary, e.g. a timeout abort), a copyable text
+ * blob, and a ready-to-send prompt.
+ */
+function _testFailureReport(lines, d, mode) {
+  const failLines = lines.filter(l => l.startsWith('FAILED') || l.startsWith('ERROR'));
+  // Traceback sections: from "== FAILURES ==" / "== ERRORS ==" up to the
+  // short test summary.
+  let detail = [];
+  let inDetail = false;
+  for (const l of lines) {
+    if (/^=+ (FAILURES|ERRORS) =+$/.test(l)) { inDetail = true; }
+    else if (/^=+ short test summary info =+$/.test(l)) { inDetail = false; }
+    if (inDetail) detail.push(l);
+  }
+  const tail = lines.slice(-40);
+  let detailText = detail.join('\n');
+  let truncated = false;
+  if (detailText.length > _TEST_FIX_DETAIL_CAP) {
+    detailText = detailText.slice(0, _TEST_FIX_DETAIL_CAP);
+    truncated = true;
+  }
+  const failText = failLines.join('\n');
+  const logPath = d.log_path || '';
+  // Same command the Publish gate runs (src/web/routes/test_api.py), including the
+  // parallel workers, so "passes for the fix session" means "passes Publish".
+  const cmd = 'python -m pytest --tb=short -q --no-header'
+    + (mode === 'fast' ? ' --ignore-glob=tests/test_code_pipeline*.py --timeout=60'
+                       : ' --ignore-glob=tests/test_code_pipeline*.py --timeout=120')
+    + ' -n 8 --dist loadfile tests/';
+
+  let prompt = 'TEST FAILURES ARE BLOCKING PUBLISH\n\n';
+  prompt += 'The VibeNode pre-publish test run (' + mode + ' mode) failed. Fix the failures so the developer can publish.\n\n';
+  prompt += '## Result\n';
+  prompt += 'passed ' + (d.passed || 0) + ', failed ' + (d.failed || 0) + ', errors ' + (d.errors || 0)
+    + ', skipped ' + (d.skipped || 0) + ', exit code ' + d.exit_code + '\n';
+  prompt += 'Command: `' + cmd + '`\n';
+  if (logPath) prompt += 'Full output (read this first, it has every traceback): `' + logPath + '`\n';
+  prompt += '\n## Failing tests\n';
+  prompt += (failText || '(no FAILED/ERROR summary lines; the run likely aborted. Last output lines:)\n' + tail.join('\n')) + '\n';
+  if (detailText) {
+    prompt += '\n## Tracebacks' + (truncated ? ' (truncated; see the full log)' : '') + '\n```\n' + detailText + '\n```\n';
+  }
+  prompt += '\n## Instructions\n';
+  prompt += '1. Read the full log, then reproduce each failure by running only that test.\n';
+  prompt += '2. Find the root cause. Decide whether the app code is wrong or the test is stale against intended behavior, and fix the right one.\n';
+  prompt += '3. Do NOT skip, delete, or weaken tests or assertions to get a pass. If a test is genuinely obsolete, say so and explain why before changing it.\n';
+  prompt += '4. Check for order-dependence: a test that passes alone but fails in the full run usually means shared state between test files (see the guard notes in tests/conftest.py).\n';
+  prompt += '5. Re-run the failing tests, then the full command above, and confirm 0 failures.\n';
+  prompt += '6. Report what failed, why, and what you changed. Do not commit or publish; the developer will press Publish again.\n';
+  prompt += '\nFollow CLAUDE.md. This is a public repository, and never restart the Session Engine (the daemon).\n';
+
+  const copyText = (failText || tail.join('\n'))
+    + (detailText ? '\n\n' + detailText : '')
+    + (logPath ? '\n\nFull output: ' + logPath : '');
+  return {failLines, tail, prompt, copyText};
+}
+
+/** Copy the failure text, with visible feedback on the button. */
+function _copyTestErrors(text, btn) {
+  const done = ok => {
+    if (btn) {
+      const old = btn.textContent;
+      btn.textContent = ok ? 'Copied ✓' : 'Copy failed';
+      setTimeout(() => { btn.textContent = old; }, 1600);
+    } else if (typeof showToast === 'function') {
+      showToast(ok ? 'Errors copied' : 'Copy failed');
+    }
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => done(true), () => done(_legacyCopy(text)));
+  } else {
+    done(_legacyCopy(text));
+  }
+}
+
+function _legacyCopy(text) {
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch (e) { return false; }
+}
+
+function _testThenAction(mode, actionType, actionLabel, btnId) {
+  closeGitSyncModal();
+  const testLabel = mode === 'fast' ? 'Fast Tests' : 'Full Tests';
+  const verb = actionType === 'publish' ? 'publish' : 'sync';
+  const desc = 'Running ' + (mode === 'fast' ? 'fast' : 'full') + ' tests before ' + verb + '...';
+  const Verb = verb.charAt(0).toUpperCase() + verb.slice(1);
+
+  if (typeof _testRunning !== 'undefined' && _testRunning) {
+    showGitSyncModal('Tests Running', '<p style="color:var(--text-muted)">Tests are already running in this tab. '
+      + 'The earlier run carries on and reports when it finishes.</p>',
+      [{label: 'Cancel Tests', onclick: () => { if (typeof cancelTests === 'function') cancelTests(); }},
+       {label: 'OK', primary: true, onclick: closeGitSyncModal}]);
+    return;
+  }
+
+  if (typeof _testRunning !== 'undefined') _testRunning = true;
+
+  showGitSyncModal(testLabel + ' Before ' + Verb, typeof _testRunnerHtml === 'function' ? _testRunnerHtml(desc) : '<p>' + desc + '</p>', []);
+
+  const startedAt = Date.now();
+  // The run lives on the server and survives a dropped connection; the
+  // stream reattaches by itself (_streamTestRun in test-runner.js), so a
+  // phone locking its screen mid-run does not leave this dialog on "running".
+
+  _streamTestRun(mode, {
+    onLine: lines => { if (typeof _updateTestOutput === 'function') _updateTestOutput(lines); },
+    onDone: (d, lines) => {
+      if (typeof _testRunning !== 'undefined') _testRunning = false;
+      // Recorded in the commit message's "Publish gate" line.
+      _publishGate = {
+        mode: d.mode || mode,   // the run joined may be a full one
+        passed: d.passed || 0,
+        skipped: d.skipped || 0,
+        failed: (d.failed || 0) + (d.errors || 0),
+        seconds: (typeof d.seconds === 'number') ? d.seconds : Math.round((Date.now() - startedAt) / 1000),
+        anyway: false,
+      };
+      // Reuse (src/web/gate_reuse.py): a passing run on identical files stood in
+      // for this one, or the A/B tests were left out because nothing they
+      // depend on changed.  Both go into the commit's gate line; a run
+      // without reuse keeps the gate's old shape.
+      if (d.reused_from) _publishGate.reused_from = d.reused_from;
+      if (d.ab_reused_from) _publishGate.ab_reused_from = d.ab_reused_from;
+      if (d.ok) {
+        const reuseNote = d.reused_from
+          ? '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;">Reused the full run that passed at ' + escHtml(d.reused_from) + ' on identical files.</div>'
+          : (d.ab_reused_from
+            ? '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;">A/B tests reused from ' + escHtml(d.ab_reused_from) + ': nothing they depend on changed.</div>'
+            : '');
+        showGitSyncModal('Tests Passed \u2713', '<div style="text-align:center;padding:12px 0;">'
+          + '<div style="font-weight:600;color:var(--accent-green,#4ecdc4);">'
+          + d.passed + ' tests passed \u2014 proceeding to ' + verb + '...</div>' + reuseNote + '</div>', []);
+        setTimeout(() => {
+          executeGitAction('both', btnId, actionLabel);
+        }, 1200);
+      } else {
+        const report = _testFailureReport(lines, d, mode);
+        const nFail = report.failLines.length;
+        const headline = nFail
+          ? nFail + ' test(s) failed. Fix the failures before ' + verb + 'ing.'
+          : 'The test run did not finish cleanly (exit ' + d.exit_code + '). See the output below.';
+        let body = '<div style="text-align:center;padding:8px 0;">'
+          + '<div style="font-weight:600;color:var(--result-err,#ff4444);font-size:16px;">' + Verb + ' Blocked</div>'
+          + '<div style="font-size:13px;color:var(--text-muted);margin-top:4px;">' + headline + '</div></div>';
+        const shown = nFail ? report.failLines : report.tail;
+        if (shown.length > 0) {
+          body += '<pre id="test-fail-pre" style="text-align:left;font-size:10px;font-family:monospace;'
+            + 'max-height:200px;overflow-y:auto;background:rgba(255,60,60,0.06);'
+            + 'border:1px solid rgba(255,60,60,0.15);border-radius:6px;'
+            + 'padding:8px 10px;margin-top:10px;color:var(--text-secondary);'
+            + 'white-space:pre-wrap;word-break:break-all;user-select:text;">'
+            + shown.map(l => (typeof _escTestHtml === 'function' ? _escTestHtml(l) : l)).join('\n')
+            + '</pre>';
+        }
+        if (d.log_path) {
+          body += '<div style="font-size:11px;color:var(--text-faint);margin-top:6px;text-align:left;">'
+            + 'Full output saved to ' + (typeof _escTestHtml === 'function' ? _escTestHtml(d.log_path) : d.log_path)
+            + '</div>';
+        }
+        showGitSyncModal(Verb + ' Blocked \u2014 Tests Failed', body, [
+          {label: 'Fix errors', primary: true, onclick: () => {
+            closeGitSyncModal();
+            _startFixSession('Fix Test Failures', 'Fixing failing tests...', report.prompt);
+          }},
+          {label: 'Copy errors', onclick: (e) => _copyTestErrors(report.copyText, e && e.currentTarget)},
+          {label: Verb + ' Anyway', onclick: () => {
+            // Still allowed (a non-technical user must be able to ship), but
+            // the commit message will say "published anyway" with the counts.
+            if (_publishGate) _publishGate.anyway = true;
+            executeGitAction('both', btnId, actionLabel);
+          }},
+          {label: 'Close', onclick: closeGitSyncModal}
+        ], {sticky: true});
+      }
+    },
+    onError: (msg, info) => {
+      if (typeof _testRunning !== 'undefined') _testRunning = false;
+      _publishGate = {mode: 'skipped'};   // nothing ran to completion
+      if (info && info.busy) {
+        // Another run (started elsewhere) is in progress.  Never offer to
+        // sync anyway here: say so, and give a way to cancel it.
+        showGitSyncModal('Tests Running',
+          '<p style="color:var(--text-muted)">' + (typeof _escTestHtml === 'function' ? _escTestHtml(msg) : msg) + '</p>', [
+          {label: 'Cancel that run', onclick: () => { if (typeof cancelTests === 'function') cancelTests(); }},
+          {label: 'OK', primary: true, onclick: closeGitSyncModal}
+        ]);
+        return;
+      }
+      if (info && info.started) {
+        // The run started but its result never arrived.  Never offer to
+        // publish anyway here: nothing says the tests passed.
+        showGitSyncModal('Test Run Interrupted',
+          '<p style="color:var(--text-muted)">' + (typeof _escTestHtml === 'function' ? _escTestHtml(msg) : msg)
+          + ' Nothing was ' + verb + 'ed.</p>', [
+          {label: 'Run again', primary: true, onclick: () => _testThenAction(mode, actionType, actionLabel, btnId)},
+          {label: 'Close', onclick: closeGitSyncModal}
+        ]);
+        return;
+      }
+      const why = msg ? ' (' + (typeof _escTestHtml === 'function' ? _escTestHtml(msg) : msg) + ')' : '';
+      showGitSyncModal('Test Error', '<p style="color:var(--result-err)">Could not run tests' + why + '. ' + Verb + ' anyway?</p>', [
+        {label: Verb + ' Anyway', onclick: () => executeGitAction('both', btnId, actionLabel)},
+        {label: 'Cancel', onclick: closeGitSyncModal}
+      ]);
+    },
+  });
+}
+
+function openGitUpdate() {
+  _armNotifyOnGesture();
+  const s = _gitStatus;
+  if (s.behind === 0) {
+    showGitSyncModal('Update App', '<p style="color:var(--text-muted)">Your app is already up to date.</p>',
+      [{label:'OK', onclick: closeGitSyncModal}]);
+    return;
+  }
+  // Branch guard FIRST — pulling while off-branch updates the wrong branch.
+  if (s.on_default === false) {
+    _showBranchWarning('pull', 'btn-git-update', 'Update App', s);
+    return;
+  }
+  showGitSyncModal('Update App', '<p><b style="color:var(--text-heading)">' + s.behind + ' update(s)</b> are available from remote.</p>'
+    + '<p style="color:var(--text-muted);font-size:12px">Your app will be updated to the latest version. Your local changes are safe.</p>', [
+    {label: 'Update Now', primary: true, onclick: () => executeGitAction('pull', 'btn-git-update', 'Update App')},
+    {label: 'Cancel', onclick: closeGitSyncModal}
+  ]);
+}
+
+// ── Minimize / restore state ──
+let _gitSyncMinimized = false;
+let _gitSyncFinished = false;  // true when operation completed while minimized
+let _gitSyncMiniLabel = '';    // current step label for the mini indicator
+
+function showGitSyncModal(title, body, btns, opts) {
+  // sticky: ignore backdrop clicks; only the dialog's own buttons close it.
+  // Used for results the user needs to read or copy (test failures): a text
+  // selection that ends on the backdrop counts as a backdrop click and used to
+  // close the dialog mid-copy.
+  document.getElementById('git-sync-overlay').dataset.sticky = (opts && opts.sticky) ? '1' : '';
+  document.getElementById('git-sync-title').textContent = title;
+  document.getElementById('git-sync-body').innerHTML = body;
+  const acts = document.getElementById('git-sync-actions');
+  acts.innerHTML = '';
+  btns.forEach(b => {
+    const el = document.createElement('button');
+    el.className = 'btn' + (b.primary ? ' primary' : '');
+    el.textContent = b.label;
+    el.onclick = b.onclick;
+    acts.appendChild(el);
+  });
+  // Show minimize button only when there are no action buttons (in-progress state)
+  const minBtn = document.getElementById('git-sync-minimize-btn');
+  if (minBtn) minBtn.style.display = btns.length === 0 ? 'inline-flex' : 'none';
+  // Track label for mini indicator
+  _gitSyncMiniLabel = title;
+  // If minimized, update the mini indicator label instead of showing the overlay
+  if (_gitSyncMinimized) {
+    const label = document.getElementById('git-sync-mini-label');
+    if (label) label.textContent = title;
+    // If this is a completion call (has buttons), notify mini
+    if (btns.length > 0) {
+      const isOk = title.includes('\u2713') || title.includes('All Clear');
+      _notifyMiniComplete(title, isOk);
+    }
+    return;  // don't show overlay — user minimized it
+  }
+  document.getElementById('git-sync-overlay').classList.add('show');
+}
+
+function closeGitSyncModal() {
+  document.getElementById('git-sync-overlay').classList.remove('show');
+  _dismissMiniIndicator();
+}
+
+function minimizeGitSyncModal() {
+  _gitSyncMinimized = true;
+  document.getElementById('git-sync-overlay').classList.remove('show');
+  // Show floating mini indicator
+  const mini = document.getElementById('git-sync-mini');
+  const label = document.getElementById('git-sync-mini-label');
+  const spinner = document.getElementById('git-sync-mini-spinner');
+  const closeBtn = document.getElementById('git-sync-mini-close');
+  label.textContent = _gitSyncMiniLabel || document.getElementById('git-sync-title').textContent || 'Working...';
+  spinner.className = 'git-sync-mini-spinner working';
+  closeBtn.style.display = 'none';
+  mini.classList.add('show');
+  if (typeof _updateFloatOffset === 'function') _updateFloatOffset();   // shared float stack (utils.js)
+}
+
+function restoreGitSyncModal() {
+  _gitSyncMinimized = false;
+  document.getElementById('git-sync-mini').classList.remove('show');
+  if (typeof _layoutFloats === 'function') _layoutFloats();
+  document.getElementById('git-sync-overlay').classList.add('show');
+}
+
+function _dismissMiniIndicator() {
+  _gitSyncMinimized = false;
+  _gitSyncFinished = false;
+  document.getElementById('git-sync-mini').classList.remove('show');
+  if (typeof _layoutFloats === 'function') _layoutFloats();
+}
+
+function dismissGitSyncMini() {
+  // If finished, just dismiss. If still working, restore modal instead.
+  if (_gitSyncFinished) {
+    _dismissMiniIndicator();
+  } else {
+    restoreGitSyncModal();
+  }
+}
+
+// Called when operation finishes — if minimized, update the mini indicator
+function _notifyMiniComplete(title, isOk) {
+  if (!_gitSyncMinimized) return;
+  _gitSyncFinished = true;
+  const label = document.getElementById('git-sync-mini-label');
+  const spinner = document.getElementById('git-sync-mini-spinner');
+  const closeBtn = document.getElementById('git-sync-mini-close');
+  label.textContent = title;
+  spinner.className = 'git-sync-mini-spinner ' + (isOk ? 'done' : 'error');
+  closeBtn.style.display = 'inline-flex';
+  if (typeof _layoutFloats === 'function') _layoutFloats();   // its size just changed
+  // Flash the indicator to draw attention
+  const mini = document.getElementById('git-sync-mini');
+  mini.classList.add('flash');
+  setTimeout(() => mini.classList.remove('flash'), 1500);
+}
+
+function _syncStatusHtml(stepLabel) {
+  return '<div class="scan-anim">'
+    + '<div class="scan-shield">'
+    +   '<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">'
+    +     '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>'
+    +   '</svg>'
+    +   '<div class="scan-beam"></div>'
+    + '</div>'
+    + '<div class="scan-label" id="sync-step-label">' + (stepLabel || 'Working...') + '</div>'
+    + '<div class="scan-progress">'
+    +   '<div class="scan-progress-bar"><div class="scan-progress-fill" id="scan-progress-fill" style="width:0%"></div></div>'
+    +   '<div class="scan-progress-text" id="scan-progress-text"></div>'
+    +   '<div class="scan-file-name" id="scan-file-name" style="font-size:10px;color:var(--text-faint,#666);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:380px;"></div>'
+    + '</div>'
+    + '</div>';
+}
+
+function _setSyncStep(label, pct) {
+  const el = document.getElementById('sync-step-label');
+  const fill = document.getElementById('scan-progress-fill');
+  const text = document.getElementById('scan-progress-text');
+  const fname = document.getElementById('scan-file-name');
+  if (el) el.textContent = label;
+  if (fill) fill.style.width = (pct || 0) + '%';
+  if (text) text.textContent = '';
+  if (fname) fname.textContent = '';
+  // Update mini indicator label if minimized
+  _gitSyncMiniLabel = label;
+  if (_gitSyncMinimized) {
+    const miniLabel = document.getElementById('git-sync-mini-label');
+    if (miniLabel) miniLabel.textContent = label;
+  }
+}
+
+// ── Branch guard warning ──
+// Shown when a sync/publish is attempted while NOT on the repo's default
+// branch. Preserves the Fork feature (you can proceed) but stops a
+// non-technical user from silently pushing to the wrong branch.
+function _showBranchWarning(action, btnId, btnLabel, info) {
+  info = info || {};
+  const branch = info.branch || '';
+  const def = info.default_branch || 'main';
+  const branchLabel = branch ? branch : 'a detached HEAD (no branch)';
+  const body =
+      '<div style="padding:4px 0;">'
+    + '<p style="color:var(--result-err,#ff4444);font-weight:600;margin-bottom:6px;">'
+    +   '⚠ You are on branch "<code>' + escHtml(branchLabel) + '</code>", not "<code>' + escHtml(def) + '</code>".'
+    + '</p>'
+    + '<p style="color:var(--text-secondary);font-size:13px;">'
+    +   'Syncing now publishes your work to <b>' + escHtml(branchLabel) + '</b> — <b>not</b> your main app. '
+    +   'Most of the time you want to be on <b>' + escHtml(def) + '</b>.'
+    + '</p>'
+    + '<p style="color:var(--text-muted);font-size:12px;margin-top:8px;">'
+    +   'If you didn’t mean to be here, cancel and switch back to <b>' + escHtml(def) + '</b> first.'
+    + '</p>'
+    + '</div>';
+  showGitSyncModal('Wrong Branch?', body, [
+    {label: 'Cancel', primary: true, onclick: closeGitSyncModal},
+    {label: 'Sync to “' + branchLabel + '” anyway',
+     onclick: () => executeGitAction(action, btnId, btnLabel, true)}
+  ]);
+}
+
+async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
+  closeGitSyncModal();
+  // Reset minimize state for new operation
+  _gitSyncMinimized = false;
+  _gitSyncFinished = false;
+  _dismissMiniIndicator();
+  const btn = document.getElementById(btnId);
+  btn.disabled = true;
+
+  // ── Branch guard: warn before syncing while on a non-default branch. ──
+  // Uses the last-polled status for an instant pre-flight; the server enforces
+  // the same check again in case this status is stale.
+  if (!confirmBranch && _gitStatus && _gitStatus.on_default === false) {
+    btn.disabled = false;
+    _showBranchWarning(action, btnId, btnLabel, _gitStatus);
+    return;
+  }
+
+  const isPush = action === 'push' || action === 'both';
+  const isPull = action === 'pull' || action === 'both';
+
+  // Show animated modal for all actions
+  const firstStep = isPull ? 'Pulling latest updates...' : 'Scanning repository...';
+  showGitSyncModal(btnLabel, isPush ? _scanAnimationHtml() : _syncStatusHtml(firstStep), []);
+
+  // For push/sync: run streaming scan first
+  if (isPush) {
+    try {
+      const preScan = await _runStreamingScan();
+      await new Promise(r => setTimeout(r, 300));
+      if (!preScan.ok) {
+        let body = '<ul style="margin:10px 0 0 16px;color:var(--text-secondary);">'
+          + '<li>Push blocked by security scan: ' + escHtml(preScan.summary) + '</li></ul>'
+          + _renderScanFindings(preScan);
+        const scanBtns = [
+          {label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchRemediationSession(preScan); }},
+          {label: 'Close', onclick: closeGitSyncModal}
+        ];
+        showGitSyncModal('Push Blocked \u2014 Security Issue', body, scanBtns);
+        btn.disabled = false;
+        return;
+      }
+      // Scan passed — transition to sync step
+      _setSyncStep(isPull ? 'Pulling & pushing...' : 'Pushing changes...', 0);
+    } catch(_) {
+      // Stream failed — fall through to normal sync (server has its own scan)
+    }
+  }
+
+  // Show indeterminate progress during the git operation
+  const _pulseTimer = setInterval(() => {
+    const fill = document.getElementById('scan-progress-fill');
+    if (!fill) { clearInterval(_pulseTimer); return; }
+    // Gentle pulse between 20-80% to show activity
+    const t = (Date.now() % 2000) / 2000;
+    const pct = 20 + 60 * (0.5 + 0.5 * Math.sin(t * Math.PI * 2));
+    fill.style.width = pct + '%';
+  }, 50);
+
+  try {
+    const payload = {action, confirm_branch: !!confirmBranch};
+    if (isPush) {
+      payload.summary = _publishSummary || '';
+      payload.gate = _publishGate || {mode: 'skipped'};
+    }
+    const res = await fetch('/api/git-sync', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    clearInterval(_pulseTimer);
+    const r = await res.json();
+    if (isPush && !r.needs_branch_confirm) { _publishSummary = ''; _publishGate = null; }
+
+    // Server-side branch guard (in case the polled status was stale).
+    if (r.needs_branch_confirm) {
+      if (r.git_status) _applyGitStatus(r.git_status);
+      _showBranchWarning(action, btnId, btnLabel, r);
+      return;  // finally{} re-enables the button
+    }
+
+    // Snap to 100%
+    const fill = document.getElementById('scan-progress-fill');
+    if (fill) fill.style.width = '100%';
+    await new Promise(r => setTimeout(r, 300));
+
+    let body = '<ul style="margin:10px 0 0 16px;color:var(--text-secondary);">'
+      + r.messages.map(m => '<li>' + escHtml(m) + '</li>').join('') + '</ul>';
+
+    if (r.scan && !r.scan.ok) {
+      body += _renderScanFindings(r.scan);
+    }
+
+    // The pull changed requirements.txt and pip ran (src/web/git_ops.py).
+    if (r.pip_ran) {
+      if (r.pip_ok) {
+        const n = r.pip_installed || 0;
+        if (typeof showToast === 'function') {
+          showToast(n ? 'Installed ' + n + ' new dependenc' + (n === 1 ? 'y' : 'ies') : 'Dependencies already satisfied');
+        }
+      } else {
+        if (typeof showToast === 'function') showToast('Dependency install failed — see the Update dialog');
+        body += '<pre style="text-align:left;font-size:10px;font-family:monospace;max-height:160px;overflow-y:auto;'
+          + 'background:rgba(255,60,60,0.06);border:1px solid rgba(255,60,60,0.15);border-radius:6px;'
+          + 'padding:8px 10px;margin-top:10px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all;user-select:text;">'
+          + escHtml(r.pip_output_tail || '(no pip output)') + '</pre>';
+      }
+    }
+
+    const btns = [{label:'OK', primary: r.ok, onclick: closeGitSyncModal}];
+    if (r.scan && !r.scan.ok) {
+      btns.unshift({label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchRemediationSession(r.scan); }});
+    } else if (r.conflicts && r.conflicts.length) {
+      // A clash stopped it: offer the same way out as a scan finding.
+      btns.unshift({label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchClashSession(r.conflicts, !!r.pull_clash); }});
+    }
+    // Only a scan finding is a security issue; a clash or a failed pull gets
+    // its own title.
+    const failTitle = (r.scan && !r.scan.ok) ? 'Push Blocked \u2014 Security Issue'
+      : (r.conflicts && r.conflicts.length) ? btnLabel + ' \u2014 Stopped: Changes Clash'
+      : btnLabel + ' \u2014 Not Finished';
+    showGitSyncModal(r.ok ? btnLabel + ' \u2713' : failTitle, body, btns);
+    if (r.git_status) {
+      _applyGitStatus(r.git_status);
+    } else {
+      await pollGitStatus();
+    }
+  } catch(e) {
+    clearInterval(_pulseTimer);
+    showGitSyncModal('Error', '<p style="color:var(--result-err)">Could not complete. Try again.</p>',
+      [{label:'OK', onclick: closeGitSyncModal}]);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── Security scan rendering ──
+function _renderScanFindings(scan) {
+  let html = '<div style="margin-top:12px;padding:10px;background:rgba(255,60,60,0.08);border:1px solid rgba(255,60,60,0.2);border-radius:8px;">';
+  html += '<div style="font-weight:600;color:var(--result-err,#ff4444);font-size:12px;margin-bottom:6px;">Security Scan Results</div>';
+  html += '<div style="font-size:11px;color:var(--text-secondary);margin-bottom:8px;">' + escHtml(scan.summary) + ' (' + scan.files_scanned + ' files scanned)</div>';
+
+  if (scan.blocked_files && scan.blocked_files.length) {
+    html += '<div style="font-size:11px;font-weight:600;color:var(--text-heading);margin:6px 0 3px;">Blocked Files:</div>';
+    html += '<ul style="margin:0 0 0 14px;font-size:11px;color:var(--text-secondary);">';
+    scan.blocked_files.forEach(f => {
+      html += '<li><code style="color:var(--result-err)">' + escHtml(f.file) + '</code> — ' + escHtml(f.reason) + '</li>';
+    });
+    html += '</ul>';
+  }
+
+  if (scan.findings && scan.findings.length) {
+    html += '<div style="font-size:11px;font-weight:600;color:var(--text-heading);margin:6px 0 3px;">Potential Secrets:</div>';
+    html += '<ul style="margin:0 0 0 14px;font-size:11px;color:var(--text-secondary);">';
+    scan.findings.slice(0, 15).forEach(f => {
+      html += '<li><code style="color:var(--result-err)">' + escHtml(f.file) + ':' + f.line + '</code> — '
+        + escHtml(f.type) + ': <code>' + escHtml(f.match) + '</code></li>';
+    });
+    if (scan.findings.length > 15) {
+      html += '<li style="color:var(--text-muted)">...and ' + (scan.findings.length - 15) + ' more</li>';
+    }
+    html += '</ul>';
+  }
+
+  html += '</div>';
+  return html;
+}
+
+function _scanAnimationHtml() {
+  return '<div class="scan-anim">'
+    + '<div class="scan-shield">'
+    +   '<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">'
+    +     '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>'
+    +   '</svg>'
+    +   '<div class="scan-beam"></div>'
+    + '</div>'
+    + '<div class="scan-label">Scanning repository...</div>'
+    + '<div class="scan-progress">'
+    +   '<div class="scan-progress-bar"><div class="scan-progress-fill" id="scan-progress-fill"></div></div>'
+    +   '<div class="scan-progress-text" id="scan-progress-text">Connecting...</div>'
+    +   '<div class="scan-file-name" id="scan-file-name" style="font-size:10px;color:var(--text-faint,#666);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:380px;"></div>'
+    + '</div>'
+    + '</div>';
+}
+
+function _runStreamingScan() {
+  return new Promise((resolve, reject) => {
+    const es = new EventSource('/api/git-scan-stream');
+    const fill = () => document.getElementById('scan-progress-fill');
+    const text = () => document.getElementById('scan-progress-text');
+    const fname = () => document.getElementById('scan-file-name');
+
+    es.onmessage = (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        if (d.type === 'progress') {
+          const pct = Math.round((d.current / d.total) * 100);
+          if (fill()) fill().style.width = pct + '%';
+          if (text()) text().textContent = d.current + ' / ' + d.total + ' files';
+          if (fname()) fname().textContent = d.file;
+        } else if (d.type === 'done') {
+          es.close();
+          if (fill()) fill().style.width = '100%';
+          if (text()) text().textContent = d.files_scanned + ' / ' + d.files_scanned + ' files';
+          if (fname()) fname().textContent = '';
+          resolve(d);
+        }
+      } catch(_) {}
+    };
+    es.onerror = () => {
+      es.close();
+      reject(new Error('Scan stream failed'));
+    };
+  });
+}
+
+async function runCodeScan() {
+  showGitSyncModal('Server Scan', _scanAnimationHtml(), []);
+  try {
+    const scan = await _runStreamingScan();
+    // Brief pause so user sees 100%
+    await new Promise(r => setTimeout(r, 400));
+    let body;
+    const btns = [];
+    if (scan.ok) {
+      body = '<div style="text-align:center;padding:16px 0;">'
+        + '<div style="font-weight:600;color:var(--accent-green,#4ecdc4);">All Clear</div>'
+        + '<div style="font-size:12px;color:var(--text-muted);margin-top:4px;">' + scan.files_scanned + ' files scanned — no secrets or sensitive data detected.</div>'
+        + '</div>';
+      btns.push({label: 'OK', primary: true, onclick: closeGitSyncModal});
+    } else {
+      body = _renderScanFindings(scan);
+      btns.push({label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchRemediationSession(scan); }});
+      btns.push({label: 'Close', onclick: closeGitSyncModal});
+    }
+    showGitSyncModal('Server Scan Results', body, btns);
+  } catch(e) {
+    showGitSyncModal('Error', '<p style="color:var(--result-err)">Could not run scan. Try again.</p>',
+      [{label:'OK', onclick: closeGitSyncModal}]);
+  }
+}
+
+// ── Launch AI remediation session ──
+// Spins up a new Claude session with the scan results and a remediation prompt.
+// Switches to sessions view and opens the new session automatically.
+let _lastScanResults = null;
+
+function _launchRemediationSession(scan) {
+  _lastScanResults = scan;
+
+  // Build a detailed prompt for the AI
+  let prompt = 'SECURITY SCAN VIOLATION — REMEDIATION REQUIRED\n\n';
+  prompt += 'The VibeNode pre-push security scanner has detected issues that are blocking publish.\n';
+  prompt += 'You must remediate these issues so the developer can safely publish the app.\n\n';
+  prompt += '## Scan Summary\n';
+  prompt += scan.summary + ' (' + scan.files_scanned + ' files scanned)\n\n';
+
+  if (scan.blocked_files && scan.blocked_files.length) {
+    prompt += '## Blocked Files\n';
+    scan.blocked_files.forEach(f => {
+      prompt += '- `' + f.file + '` — ' + f.reason + '\n';
+    });
+    prompt += '\n';
+  }
+
+  if (scan.findings && scan.findings.length) {
+    prompt += '## Potential Secrets Found\n';
+    scan.findings.forEach(f => {
+      prompt += '- `' + f.file + ':' + f.line + '` — ' + f.type + ': `' + f.match + '`\n';
+    });
+    prompt += '\n';
+  }
+
+  prompt += '## Instructions\n';
+  prompt += '1. Read each flagged file and understand the issue\n';
+  prompt += '2. For real secrets: move them to environment variables or kanban_config.json (gitignored)\n';
+  prompt += '3. For false positives in source code patterns (like regex patterns that look like keys): add the file to the scanner\'s skip list in app/git_scanner.py\n';
+  prompt += '4. For forbidden files (.env, credentials, etc): ensure they are in .gitignore and remove from tracking with `git rm --cached`\n';
+  prompt += '5. After making fixes, run the scan again by calling: curl http://localhost:5050/api/git-scan\n';
+  prompt += '6. Verify the scan returns {"ok": true} before considering the task complete\n';
+  prompt += '\nIMPORTANT: This is a public repository. Everything committed will be visible on the internet.\n';
+
+  _startFixSession('Security Remediation', 'Fixing security scan violations...', prompt);
+}
+
+// ── Launch AI clash-resolution session ──
+// An Update pulled code that clashed with local changes (src/web/git_ops.py
+// returns `conflicts`).  The session resolves the clash; it never publishes.
+// `pulled` (the result's `pull_clash`): the pull itself clashed and was undone,
+// so there are no markers on disk yet; the session redoes the pull by hand.
+function _launchClashSession(files, pulled) {
+  let prompt = 'UPDATE STOPPED: CHANGES CLASH\n\n';
+  prompt += 'Publishing VibeNode stopped because the pulled code clashed with local changes in:\n';
+  files.forEach(f => { prompt += '- `' + f + '`\n'; });
+  prompt += '\n## Instructions\n';
+  if (pulled) {
+    prompt += '0. The Update undid its pull, so the files have no conflict markers yet. Stash any uncommitted changes, run `git pull --rebase` (never with -X theirs or -X ours), and for each clash: resolve it keeping the intent of both sides, `git add` the file, `git rebase --continue`. Then `git stash pop` and resolve the same way.\n';
+  }
+  prompt += '1. Open each file and resolve every <<<<<<< / ======= / >>>>>>> block, keeping the intent of both sides.\n';
+  prompt += '2. Run `git status`: no file may stay unmerged (UU). Unstage with `git reset` so the tree is back to plain local changes.\n';
+  prompt += '3. Leave the stash git kept (`git stash list`) alone; it is a backup of the same changes.\n';
+  prompt += '4. Run the tests for the files you touched, then grep the repo for leftover conflict markers.\n';
+  prompt += '5. Do NOT make new commits or push (finishing the rebase is fine). The developer will press Publish again.\n';
+  prompt += '\nIMPORTANT: This is a public repository. Everything committed will be visible on the internet.\n';
+  _startFixSession('Resolve Update Clash', 'Resolving the clash...', prompt);
+}
+
+/**
+ * Start a new visible session that immediately works on `prompt`.
+ * Shared by the security-scan "Fix with AI" and the test-failure "Fix errors"
+ * buttons.  Uses the system default model and thinking level, like any new
+ * session the user starts.
+ */
+let _repoProjectCache = null;
+/** The VibeNode repo as a project ({root, project, registered}), or null. */
+async function _repoProject() {
+  if (_repoProjectCache) return _repoProjectCache;
+  try {
+    const r = await fetch('/api/repo-project');
+    const d = r.ok ? await r.json() : null;
+    if (d && d.ok && d.root && d.project) _repoProjectCache = d;
+  } catch (_) {}
+  return _repoProjectCache;
+}
+
+async function _startFixSession(title, preview, prompt) {
+  // The fix session works on THIS repo (its tests, its scan), so it is created
+  // in the repo's own project, never in whatever project the browser is
+  // showing.  If the browser is elsewhere, switch first so
+
+  // the user watches the session where it actually lives.
+  const repo = await _repoProject();
+  let cwd = (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '';
+  let project = localStorage.getItem('activeProject') || '';
+  if (repo) {
+    cwd = repo.root;
+    project = repo.project;
+    if (localStorage.getItem('activeProject') !== repo.project) {
+      const known = (typeof _allProjects !== 'undefined') && _allProjects.some(p => p.encoded === repo.project);
+      if (known && typeof setProject === 'function') {
+        await setProject(repo.project, true);
+      } else if (typeof showToast === 'function') {
+        showToast('Fix session created in the VibeNode project');
+      }
+    }
+  }
+
+  // Switch to sessions view and create a new session
+  if (typeof setViewMode === 'function' && typeof viewMode !== 'undefined' && viewMode !== 'sessions') {
+    setViewMode('sessions');
+  }
+
+  // Create a new session with the remediation prompt
+  const newId = crypto.randomUUID();
+  const optimistic = {
+    id: newId,
+    display_title: title,
+    custom_title: title,
+    last_activity: '',
+    size: '',
+    message_count: 0,
+    preview: preview,
+  };
+
+  if (typeof allSessions !== 'undefined') {
+    allSessions.unshift(optimistic);
+    if (typeof allSessionIds !== 'undefined') allSessionIds.add(optimistic.id);
+  }
+  if (typeof filterSessions === 'function') filterSessions();
+  if (typeof guiOpenAdd === 'function') guiOpenAdd(newId);
+
+  // Set as active session
+  if (typeof activeId !== 'undefined') activeId = newId;
+  liveSessionId = newId;
+  localStorage.setItem('activeSessionId', newId);
+
+  // Update URL
+  if (typeof _pushChatUrl === 'function') _pushChatUrl(newId);
+
+  // Mark as running and emit start_session
+  if (typeof runningIds !== 'undefined') runningIds.add(newId);
+  if (typeof sessionKinds !== 'undefined') sessionKinds[newId] = 'working';
+
+  const startOpts = {
+    session_id: newId,
+    prompt: prompt,
+    cwd: cwd,
+    project: project,
+    name: title,
+  };
+  if (typeof SessionModel !== 'undefined') {
+    const _m = SessionModel.getDefault();
+    const _t = SessionModel.getDefaultThinking();
+    if (_m) startOpts.model = _m;
+    if (_t) startOpts.thinking_level = _t;
+  }
+
+  socket.emit('start_session', startOpts);
+
+  // Switch to live panel and show the session
+  if (typeof startLivePanel === 'function') startLivePanel(newId, {skipLog: true});
+
+  // Add optimistic user bubble
+  if (typeof _addOptimisticBubble === 'function') {
+    _liveSending = true;
+    _addOptimisticBubble(newId, prompt);
+    setTimeout(() => { _liveSending = false; }, 500);
+  }
+
+  // Update toolbar
+  if (typeof setToolbarSession === 'function') setToolbarSession(newId, title, false, title);
+  if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
+}

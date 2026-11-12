@@ -1,0 +1,227 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 1120" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#7c6fe0"/>
+    </marker>
+    <marker id="arr-g" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#3a9e6e"/>
+    </marker>
+    <marker id="arr-o" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#e0a040"/>
+    </marker>
+    <marker id="arr-r" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#e06060"/>
+    </marker>
+    <linearGradient id="glow-blue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4a8fd4" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#4a8fd4" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="glow-green" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3a9e6e" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#3a9e6e" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="glow-amber" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#e0a040" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#e0a040" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="900" height="1120" fill="#0e0e12"/>
+
+  <!-- Title -->
+  <text x="450" y="36" text-anchor="middle" fill="#e0dfe6" font-size="18" font-weight="600">Cross-Session Awareness</text>
+  <text x="450" y="56" text-anchor="middle" fill="#666" font-size="11">Every session knows what other sessions are doing — file-level awareness with automatic conflict avoidance</text>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- SECTION 1: THREE SESSIONS STARTING -->
+  <!-- ═══════════════════════════════════════════ -->
+
+  <text x="40" y="96" fill="#888" font-size="10" font-weight="700" letter-spacing="1">THREE SESSIONS IN THE SAME PROJECT</text>
+  <line x1="40" y1="104" x2="860" y2="104" stroke="#2a2a35" stroke-width="1"/>
+
+  <!-- Session A -->
+  <rect x="40" y="118" width="260" height="130" rx="8" fill="#161622" stroke="#4a8fd4" stroke-width="1.2"/>
+  <rect x="40" y="118" width="260" height="28" rx="8" fill="#2a5a8a"/>
+  <rect x="40" y="136" width="260" height="10" fill="#2a5a8a"/>
+  <circle cx="56" cy="132" r="4" fill="#6ee0a0"/>
+  <text x="68" y="136" fill="#fff" font-size="11" font-weight="600">Session A — "Refactor auth"</text>
+  <text x="56" y="164" fill="#70b0e8" font-size="9" font-weight="600">WORKING · spawned 14:28</text>
+  <text x="56" y="182" fill="#999" font-size="10">Editing:</text>
+  <rect x="56" y="188" width="60" height="18" rx="3" fill="#1a2a1a" stroke="#3a9e6e" stroke-width="0.6"/>
+  <text x="86" y="201" text-anchor="middle" fill="#6ee0a0" font-size="9">auth.py</text>
+  <rect x="122" y="188" width="86" height="18" rx="3" fill="#1a2a1a" stroke="#3a9e6e" stroke-width="0.6"/>
+  <text x="165" y="201" text-anchor="middle" fill="#6ee0a0" font-size="9">middleware.py</text>
+  <rect x="214" y="188" width="70" height="18" rx="3" fill="#1a2a1a" stroke="#3a9e6e" stroke-width="0.6"/>
+  <text x="249" y="201" text-anchor="middle" fill="#6ee0a0" font-size="9">routes.py</text>
+  <text x="56" y="232" fill="#555" font-size="9">Rewriting auth module to use JWT tokens</text>
+
+  <!-- Session B -->
+  <rect x="320" y="118" width="260" height="130" rx="8" fill="#161622" stroke="#e0a040" stroke-width="1.2"/>
+  <rect x="320" y="118" width="260" height="28" rx="8" fill="#7a6520"/>
+  <rect x="320" y="136" width="260" height="10" fill="#7a6520"/>
+  <circle cx="336" cy="132" r="4" fill="#6ee0a0"/>
+  <text x="348" y="136" fill="#fff" font-size="11" font-weight="600">Session B — "Fix pagination"</text>
+  <text x="336" y="164" fill="#e0c060" font-size="9" font-weight="600">WORKING · spawned 14:32</text>
+  <text x="336" y="182" fill="#999" font-size="10">Editing:</text>
+  <rect x="336" y="188" width="80" height="18" rx="3" fill="#1a2a1a" stroke="#3a9e6e" stroke-width="0.6"/>
+  <text x="376" y="201" text-anchor="middle" fill="#6ee0a0" font-size="9">paginator.py</text>
+  <rect x="422" y="188" width="50" height="18" rx="3" fill="#1a2a1a" stroke="#3a9e6e" stroke-width="0.6"/>
+  <text x="447" y="201" text-anchor="middle" fill="#6ee0a0" font-size="9">api.py</text>
+  <rect x="478" y="188" width="86" height="18" rx="3" fill="#2a1a1a" stroke="#e06060" stroke-width="0.8"/>
+  <text x="521" y="201" text-anchor="middle" fill="#f08080" font-size="9">routes.py ⚠</text>
+  <text x="336" y="232" fill="#555" font-size="9">Adding cursor-based pagination to list endpoints</text>
+
+  <!-- Session C -->
+  <rect x="600" y="118" width="260" height="130" rx="8" fill="#161622" stroke="#9060a0" stroke-width="1.2"/>
+  <rect x="600" y="118" width="260" height="28" rx="8" fill="#5a3a6a"/>
+  <rect x="600" y="136" width="260" height="10" fill="#5a3a6a"/>
+  <circle cx="616" cy="132" r="4" fill="#e0c060"/>
+  <text x="628" y="136" fill="#fff" font-size="11" font-weight="600">Session C — "Add tests"</text>
+  <text x="616" y="164" fill="#c090e0" font-size="9" font-weight="600">IDLE · spawned 14:35</text>
+  <text x="616" y="182" fill="#999" font-size="10">Editing:</text>
+  <rect x="616" y="188" width="80" height="18" rx="3" fill="#1a2a1a" stroke="#3a9e6e" stroke-width="0.6"/>
+  <text x="656" y="201" text-anchor="middle" fill="#6ee0a0" font-size="9">test_auth.py</text>
+  <rect x="702" y="188" width="76" height="18" rx="3" fill="#1a2a1a" stroke="#3a9e6e" stroke-width="0.6"/>
+  <text x="740" y="201" text-anchor="middle" fill="#6ee0a0" font-size="9">conftest.py</text>
+  <text x="616" y="232" fill="#555" font-size="9">Writing integration tests for auth flow</text>
+
+  <!-- Conflict indicator between A and B -->
+  <line x1="284" y1="197" x2="320" y2="197" stroke="#e06060" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <text x="302" y="218" text-anchor="middle" fill="#e06060" font-size="8" font-weight="600" transform="rotate(-90, 302, 218)">⚠</text>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- SECTION 2: WHAT EACH SESSION SEES -->
+  <!-- ═══════════════════════════════════════════ -->
+
+  <!-- Injection arrows -->
+  <text x="450" y="278" text-anchor="middle" fill="#7c6fe0" font-size="10" font-weight="500">System prompt injected at session start</text>
+  <line x1="170" y1="258" x2="170" y2="306" stroke="#7c6fe0" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="450" y1="258" x2="450" y2="306" stroke="#7c6fe0" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="730" y1="258" x2="730" y2="306" stroke="#7c6fe0" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <text x="40" y="330" fill="#888" font-size="10" font-weight="700" letter-spacing="1">WHAT EACH SESSION SEES IN ITS SYSTEM PROMPT</text>
+  <line x1="40" y1="338" x2="860" y2="338" stroke="#2a2a35" stroke-width="1"/>
+
+  <!-- Session B's system prompt (center, featured) -->
+  <rect x="160" y="350" width="580" height="310" rx="8" fill="#141418" stroke="#e0a040" stroke-width="1.2"/>
+  <rect x="160" y="350" width="580" height="24" rx="8" fill="#3a3018"/>
+  <rect x="160" y="364" width="580" height="10" fill="#3a3018"/>
+  <text x="174" y="366" fill="#e0c060" font-size="10" font-weight="600">SESSION B's SYSTEM PROMPT — cross-session awareness block</text>
+
+  <!-- Prompt content -->
+  <text x="180" y="398" fill="#9b8ce0" font-size="11" font-weight="600">## Other Active Sessions in This Project</text>
+
+  <text x="180" y="422" fill="#b0aec0" font-size="10">-</text>
+  <text x="196" y="422" fill="#70b0e8" font-size="10" font-weight="500">"Refactor auth"</text>
+  <text x="304" y="422" fill="#666" font-size="10">[working, 23m]</text>
+  <text x="404" y="422" fill="#888" font-size="10">— files:</text>
+  <text x="454" y="422" fill="#6ee0a0" font-size="10">auth.py, middleware.py, routes.py</text>
+
+  <text x="180" y="444" fill="#b0aec0" font-size="10">-</text>
+  <text x="196" y="444" fill="#c090e0" font-size="10" font-weight="500">"Add tests"</text>
+  <text x="270" y="444" fill="#666" font-size="10">[idle, 5m]</text>
+  <text x="340" y="444" fill="#888" font-size="10">— files:</text>
+  <text x="390" y="444" fill="#6ee0a0" font-size="10">test_auth.py, conftest.py</text>
+
+  <!-- Conflict warning -->
+  <rect x="180" y="462" width="540" height="56" rx="5" fill="#2a1a1a" stroke="#e06060" stroke-width="0.8"/>
+  <text x="196" y="480" fill="#f08080" font-size="10" font-weight="600">⚠ Active File Overlap Detected</text>
+  <text x="196" y="498" fill="#e08080" font-size="10">routes.py — also being edited by "Refactor auth" (they spawned earlier)</text>
+  <text x="196" y="512" fill="#c06060" font-size="9">Re-read this file before editing. If you hit errors, back off.</text>
+
+  <!-- Conflict guidance -->
+  <text x="180" y="540" fill="#9b8ce0" font-size="11" font-weight="600">### Multi-Session Conflict Guidance</text>
+
+  <text x="180" y="562" fill="#999" font-size="10">1. Re-read files before editing if another session touched them</text>
+  <text x="180" y="580" fill="#999" font-size="10">2. If you hit unexpected errors on a shared file — back off, don't fight it</text>
+  <text x="180" y="598" fill="#999" font-size="10">3. Complete everything else, surface skipped work to the user in bold</text>
+  <text x="180" y="616" fill="#999" font-size="10">4. Keep edits surgical on shared files</text>
+
+  <!-- Decorative bracket showing this is injected -->
+  <rect x="155" y="386" width="3" height="238" rx="1.5" fill="#e0a040" opacity="0.4"/>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- SECTION 3: CONFLICT SCENARIO -->
+  <!-- ═══════════════════════════════════════════ -->
+
+  <text x="40" y="700" fill="#888" font-size="10" font-weight="700" letter-spacing="1">CONFLICT SCENARIO — SESSION B DETECTS OVERLAP AND BACKS OFF</text>
+  <line x1="40" y1="708" x2="860" y2="708" stroke="#2a2a35" stroke-width="1"/>
+
+  <!-- Timeline -->
+  <line x1="80" y1="740" x2="80" y2="1060" stroke="#333" stroke-width="1"/>
+  <line x1="450" y1="740" x2="450" y2="1060" stroke="#333" stroke-width="1"/>
+
+  <!-- Timeline labels -->
+  <rect x="30" y="722" width="100" height="20" rx="4" fill="#2a5a8a"/>
+  <text x="80" y="736" text-anchor="middle" fill="#fff" font-size="9" font-weight="600">Session A</text>
+  <rect x="400" y="722" width="100" height="20" rx="4" fill="#7a6520"/>
+  <text x="450" y="736" text-anchor="middle" fill="#fff" font-size="9" font-weight="600">Session B</text>
+
+  <!-- Step 1: A is editing routes.py -->
+  <rect x="100" y="755" width="240" height="36" rx="5" fill="url(#glow-blue)" stroke="#4a8fd4" stroke-width="0.8"/>
+  <text x="116" y="770" fill="#70b0e8" font-size="10" font-weight="500">Editing routes.py</text>
+  <text x="116" y="784" fill="#555" font-size="9">Rewriting auth decorators on all endpoints</text>
+
+  <!-- Step 2: B tries to edit routes.py -->
+  <rect x="470" y="755" width="280" height="36" rx="5" fill="url(#glow-amber)" stroke="#e0a040" stroke-width="0.8"/>
+  <text x="486" y="770" fill="#e0c060" font-size="10" font-weight="500">Needs to edit routes.py</text>
+  <text x="486" y="784" fill="#555" font-size="9">Adding pagination params to list endpoints</text>
+
+  <!-- Step 3: B reads the file first -->
+  <rect x="470" y="810" width="280" height="36" rx="5" fill="url(#glow-green)" stroke="#3a9e6e" stroke-width="0.8"/>
+  <text x="486" y="825" fill="#6ee0a0" font-size="10" font-weight="500">Re-reads routes.py first</text>
+  <text x="486" y="839" fill="#555" font-size="9">Sees half-refactored auth decorators — unstable</text>
+
+  <!-- Awareness arrow -->
+  <path d="M 470,828 Q 420,828 420,770 Q 420,770 340,770" stroke="#e06060" stroke-width="1.2" fill="none" stroke-dasharray="4,3" marker-end="url(#arr-r)"/>
+  <text x="380" y="800" fill="#e06060" font-size="8" font-weight="500" transform="rotate(-50, 380, 800)">sees overlap</text>
+
+  <!-- Step 4: B backs off -->
+  <rect x="470" y="862" width="280" height="50" rx="5" fill="#2a1a1a" stroke="#e06060" stroke-width="1"/>
+  <text x="486" y="878" fill="#f08080" font-size="10" font-weight="600">Backs off from routes.py</text>
+  <text x="486" y="894" fill="#c06060" font-size="9">"Another session is mid-refactor on this file.</text>
+  <text x="486" y="906" fill="#c06060" font-size="9"> I'll skip this and let the user know."</text>
+
+  <!-- Step 5: A continues normally -->
+  <rect x="100" y="810" width="240" height="36" rx="5" fill="url(#glow-blue)" stroke="#4a8fd4" stroke-width="0.8"/>
+  <text x="116" y="825" fill="#70b0e8" font-size="10" font-weight="500">Continues editing routes.py</text>
+  <text x="116" y="839" fill="#555" font-size="9">Completes auth decorator refactor</text>
+
+  <rect x="100" y="862" width="240" height="36" rx="5" fill="url(#glow-blue)" stroke="#4a8fd4" stroke-width="0.8"/>
+  <text x="116" y="877" fill="#70b0e8" font-size="10" font-weight="500">Done ✓</text>
+  <text x="116" y="891" fill="#555" font-size="9">Auth refactor complete, clean commit</text>
+
+  <!-- Step 6: B completes other work and surfaces -->
+  <rect x="470" y="928" width="380" height="78" rx="5" fill="#1a1a22" stroke="#e0a040" stroke-width="1"/>
+  <text x="486" y="944" fill="#e0c060" font-size="10" font-weight="600">Completes task, surfaces incomplete work:</text>
+  <rect x="486" y="954" width="350" height="44" rx="4" fill="#1e1e28" stroke="#555" stroke-width="0.5"/>
+  <text x="498" y="970" fill="#f0d080" font-size="10" font-weight="700">⚠ Not completed — multi-session conflict:</text>
+  <text x="498" y="986" fill="#b0aec0" font-size="9.5">Could not add pagination to routes.py — file under</text>
+  <text x="498" y="998" fill="#b0aec0" font-size="9.5">active refactor by "Refactor auth". Retry after it finishes.</text>
+
+  <!-- Result label -->
+  <rect x="100" y="928" width="240" height="36" rx="5" fill="#1a2a1a" stroke="#3a9e6e" stroke-width="1"/>
+  <text x="116" y="944" fill="#6ee0a0" font-size="10" font-weight="600">✓ No merge conflicts</text>
+  <text x="116" y="958" fill="#555" font-size="9">Both sessions completed cleanly</text>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- BOTTOM: HOW IT WORKS -->
+  <!-- ═══════════════════════════════════════════ -->
+
+  <rect x="40" y="1040" width="820" height="60" rx="8" fill="#141418" stroke="#2a2a35" stroke-width="1"/>
+  <text x="450" y="1062" text-anchor="middle" fill="#e0dfe6" font-size="11" font-weight="600">HOW IT WORKS</text>
+  <text x="108" y="1082" fill="#70b0e8" font-size="10">Daemon tracks files</text>
+  <text x="108" y="1092" fill="#555" font-size="8">Edit/Write tool → tracked_files set</text>
+  <text x="300" y="1082" fill="#7c6fe0" font-size="10">Injected at session start</text>
+  <text x="300" y="1092" fill="#555" font-size="8">ws_events.py → system prompt</text>
+  <text x="508" y="1082" fill="#e0c060" font-size="10">Agent reasons about it</text>
+  <text x="508" y="1092" fill="#555" font-size="8">Sees files, detects overlap, decides</text>
+  <text x="716" y="1082" fill="#6ee0a0" font-size="10">User sees what was skipped</text>
+  <text x="716" y="1092" fill="#555" font-size="8">Bold warning in final response</text>
+
+  <!-- Flow arrows -->
+  <line x1="240" y1="1080" x2="290" y2="1080" stroke="#555" stroke-width="1" marker-end="url(#arr)"/>
+  <line x1="462" y1="1080" x2="500" y2="1080" stroke="#555" stroke-width="1" marker-end="url(#arr)"/>
+  <line x1="672" y1="1080" x2="708" y2="1080" stroke="#555" stroke-width="1" marker-end="url(#arr)"/>
+
+</svg>

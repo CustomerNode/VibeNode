@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for leaked orphaned CPU-burning processes every 15 min
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

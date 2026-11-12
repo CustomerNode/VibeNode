@@ -1,0 +1,677 @@
+"""Claude Code SDK implementation of AgentSDK.
+
+Wraps ``claude_code_sdk.ClaudeSDKClient`` and normalizes all Claude-specific
+message types into ``VibeNodeMessage`` instances.  This is where ALL
+``claude_code_sdk`` imports live -- ``session_manager.py`` never imports
+the SDK directly.
+
+It holds:
+
+- All ``claude_code_sdk`` imports
+- ``_extract_cli_pid``
+- The transport liveness check
+- Message normalization (the isinstance() mapping for ``_process_message``)
+- The permission callback wrapper (PermissionResultAllow/Deny construction)
+- SDK patch application
+"""
+
+import asyncio
+import logging
+import os
+from typing import Any, AsyncIterator, Optional
+
+from claude_code_sdk import ClaudeSDKClient, ClaudeCodeOptions
+from claude_code_sdk.types import (
+    AssistantMessage,
+    UserMessage,
+    ResultMessage,
+    SystemMessage,
+    StreamEvent,
+    TextBlock,
+    ThinkingBlock,
+    ToolUseBlock,
+    ToolResultBlock,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ContentBlock,
+    HookMatcher,
+)
+
+from engine.backends.base import (
+    AgentSDK,
+    SessionOptions,
+    PermissionResult,
+    PermissionAction,
+)
+from engine.backends.messages import VibeNodeMessage, MessageKind, BlockKind
+
+logger = logging.getLogger(__name__)
+
+
+class ClaudeAgentSDK(AgentSDK):
+    """Claude Code SDK implementation of AgentSDK.
+
+    Wraps claude_code_sdk.ClaudeSDKClient and normalizes all Claude-specific
+    message types into VibeNodeMessage instances.
+
+    Thread safety: this class holds no mutable state.  A single instance
+    can safely manage multiple concurrent sessions.
+    """
+
+    async def create_session(self, options: SessionOptions) -> ClaudeSDKClient:
+        """Create a ClaudeSDKClient with mapped options.
+
+        Hook registration: if ``options.pre_compact_callback`` is set,
+        wire it as a ``PreCompact`` hook so SessionManager is notified
+        the instant the SDK is about to start a compaction cycle.  This
+        is the only reliable EARLY signal — ``compact_boundary`` arrives
+        at the END of compaction, by which time the UI's "Compacting…"
+        indicator is meaningless.
+        """
+        # Convert the abstract permission callback to Claude's format
+        can_use_tool = None
+        if options.permission_callback:
+            can_use_tool = self._wrap_permission_callback(options.permission_callback)
+
+        # PreCompact hook for early "compacting" UI signal.  The SDK
+        # invokes our callback before compaction begins (both manual
+        # /compact and SDK-initiated auto-compact).  We return ``{}``
+        # unconditionally so the SDK proceeds with compaction
+        # unaltered — this is a notification hook only.
+        hooks_config = None
+        if options.pre_compact_callback:
+            cb = options.pre_compact_callback
+            async def _pre_compact_wrap(input_data, tool_use_id, context):
+                logger.info("PreCompact hook fired (tool_use_id=%s)", tool_use_id)
+                try:
+                    await cb(input_data, tool_use_id, context)
+                except Exception as e:
+                    logger.warning("pre_compact_callback raised: %s", e)
+                return {}  # empty HookJSONOutput: do not alter SDK behavior
+            hooks_config = {
+                "PreCompact": [HookMatcher(matcher=None, hooks=[_pre_compact_wrap])],
+            }
+
+        # Smart termination (src/engine/smart_termination.py): the CLI's Stop hook
+        # hands us the final message; a returned reason sends the agent back.
+        # Registered AFTER PreCompact so the SDK's callback ids (hook_0,
+        # hook_1, ...) keep PreCompact at hook_0 for a reattached Session Host.
+        # Any failure lets the turn end: this hook must never trap a session.
+        if options.turn_end_callback:
+            tcb = options.turn_end_callback
+            async def _stop_wrap(input_data, tool_use_id, context):
+                try:
+                    data = input_data if isinstance(input_data, dict) else {}
+                    kw = dict(message=data.get("last_assistant_message"),
+                              continued=bool(data.get("stop_hook_active")),
+                              background_in_flight=bool(data.get("background_tasks")))
+                    import inspect
+                    try:
+                        takes_id = "cli_session_id" in inspect.signature(tcb).parameters
+                    except (TypeError, ValueError):
+                        takes_id = False
+                    if takes_id:
+                        # The CLI's own id for the session, the one its tool
+                        # calls see: the self-check stamps cards under it.
+                        kw["cli_session_id"] = str(data.get("session_id") or "")
+                    reason = await tcb(**kw)
+                except Exception as e:
+                    logger.warning("turn_end_callback raised: %s", e)
+                    return {}
+                if isinstance(reason, str) and reason:
+                    return {"decision": "block", "reason": reason}
+                return {}
+            hooks_config = dict(hooks_config or {})
+            hooks_config["Stop"] = [HookMatcher(matcher=None, hooks=[_stop_wrap])]
+        # Project tool guards (src/engine/tool_guards): refuse a call before it
+        # runs, in every permission mode.  Registered LAST so the callback ids
+        # of PreCompact and Stop stay where a reattached Session Host has them.
+        # A guard failure inside the slot itself lets the call run (a guard's
+        # own failure is refused inside its scope by src/engine/tool_guards).
+        cwd_for_guards = os.path.normpath(options.cwd) if options.cwd else ""
+
+        async def _tool_guard_wrap(input_data, tool_use_id, context):
+            try:
+                from engine import tool_guards
+                data = input_data if isinstance(input_data, dict) else {}
+                # Off the event loop: the publish guard runs the scanner in a
+                # subprocess (~0.2 s), which must not stall every other session.
+                reason = await asyncio.get_running_loop().run_in_executor(
+                    None, tool_guards.decide,
+                    data.get("tool_name", ""), data.get("tool_input") or {}, cwd_for_guards)
+                return tool_guards.hook_output(reason)
+            except Exception as e:
+                logger.warning("tool guard slot failed: %s", e)
+                return {}
+        hooks_config = dict(hooks_config or {})
+        hooks_config["PreToolUse"] = [HookMatcher(matcher=None, hooks=[_tool_guard_wrap])]
+        # Tells src/engine/smart_termination_hook.py (the settings-file copy of
+        # these rules, for CLIs an older engine starts) that this engine runs
+        # them itself, so a session is never checked twice.
+        st_env = {"VIBENODE_SMART_TERMINATION_ENGINE": "1"} if options.turn_end_callback else {}
+
+        claude_options = ClaudeCodeOptions(
+            cwd=os.path.normpath(options.cwd) if options.cwd else None,
+            resume=options.resume,
+            can_use_tool=can_use_tool,
+            model=options.model,
+            system_prompt=options.system_prompt,
+            append_system_prompt=options.append_system_prompt,
+            max_turns=options.max_turns,
+            allowed_tools=options.allowed_tools,
+            permission_mode=options.permission_mode,
+            include_partial_messages=options.include_partial_messages,
+            extra_args=options.extra_args,
+            hooks=hooks_config,
+            env=st_env,
+        )
+        if options.hosted or options.attach:
+            # The CLI runs in a Session Host (src/engine/session_host.py) and
+            # outlives a Session Engine restart.  Only connect() differs.
+            from engine.backends.claude_host import HostedSDKClient
+            return HostedSDKClient(
+                options=claude_options,
+                host_sid=(options.attach or {}).get("sid") or options.host_sid or "",
+                attach_record=options.attach,
+                cli_path=self.host_cli_path,
+            )
+        return ClaudeSDKClient(options=claude_options)
+
+    # ── Session Host ─────────────────────────────────────────────────
+
+    supports_hosting = True
+
+    #: The CLI a host launches; None = the SDK finds the real ``claude``.
+    #: Tests point it at tests/fake_cli.py's launcher.
+    host_cli_path: Optional[str] = None
+
+    @staticmethod
+    def _host_transport(client: Any):
+        """The client's ``HostTransport``, or None.  A real isinstance check,
+        never duck typing: a test double answers every attribute, and a mock
+        pid must never reach a kill path."""
+        try:
+            from engine.backends.claude_host import HostTransport
+        except Exception:      # a test's stand-in SDK lacks the transport ABC
+            return None
+        transport = getattr(client, "_transport", None) if client is not None else None
+        return transport if isinstance(transport, HostTransport) else None
+
+    def host_record(self, client: Any) -> Optional[dict]:
+        t = self._host_transport(client)
+        return t.host_record if t is not None else None
+
+    def host_hello(self, client: Any) -> dict:
+        t = self._host_transport(client)
+        return dict(t.hello) if t is not None else {}
+
+    def host_release_replay(self, client: Any, skip_ids=()) -> None:
+        t = self._host_transport(client)
+        if t is not None:
+            t.release_replay(skip_ids)
+
+    async def host_detach(self, client: Any) -> None:
+        t = self._host_transport(client)
+        if t is not None:
+            t.set_detach()
+        await self.disconnect(client)
+
+    async def host_rename(self, client: Any, new_id: str) -> None:
+        t = self._host_transport(client)
+        if t is not None:
+            await t.rename(new_id)
+
+    async def connect(self, client: ClaudeSDKClient) -> None:
+        """Connect the Claude client (spawns CLI subprocess).
+
+        PERF-CRITICAL #5: This must remain a thin wrapper -- the caller
+        overlaps mtime recording with this call.  Adding blocking work
+        here would break the overlap timing.  (The owner task below adds no
+        blocking work: one task creation, then the same client.connect().)
+
+        The client runs in its own OWNER task, which connects it and later
+        disconnects it.  The SDK enters an anyio task group
+        in connect() and exits it in disconnect(), and anyio only lets the task
+        that entered a cancel scope exit it.  Connected in the session's
+        driving task and disconnected from _close_session's task, the exit
+        raised "Attempted to exit cancel scope in a different task" and the
+        scope was left cancelled but never exited: anyio then re-delivers the
+        cancellation on every pass of the event loop, forever, and a few of
+        those keep the Session Engine busy with every session idle.  With an
+        owner task the scope is always exited by the task that entered it,
+        whichever task calls disconnect().  Tests:
+        tests/test_sdk_client_owner_task.py.
+        """
+        loop = asyncio.get_running_loop()
+        connected = loop.create_future()
+        stop = asyncio.Event()
+        state = {"connected": False}
+
+        async def _own() -> None:
+            try:
+                await client.connect()
+            except BaseException as exc:  # incl. cancellation of a pending connect
+                if not connected.done():
+                    if isinstance(exc, asyncio.CancelledError):
+                        connected.cancel()
+                    else:
+                        connected.set_exception(exc)
+                return
+            state["connected"] = True
+            if not connected.done():
+                connected.set_result(None)
+            await stop.wait()
+            await client.disconnect()
+
+        owner = loop.create_task(_own(), name="sdk-client-owner")
+        # Retrieve the result so an error after a cancelled wait is never
+        # reported as "Task exception was never retrieved".
+        owner.add_done_callback(lambda t: t.cancelled() or t.exception())
+        client._vn_owner = (owner, stop)
+        try:
+            await connected
+        except asyncio.CancelledError:
+            # The caller gave up.  A connect still in progress is aborted, as
+            # before; a finished one stays owned until disconnect() is called.
+            if not state["connected"] and not owner.done():
+                owner.cancel()
+            raise
+
+    async def send_query(self, client: ClaudeSDKClient, prompt: str) -> None:
+        """Send a query to the connected Claude session.
+        """
+        await client.query(prompt)
+
+    async def receive_response(
+        self, client: ClaudeSDKClient
+    ) -> AsyncIterator[VibeNodeMessage]:
+        """Stream response messages, normalized to VibeNodeMessage.
+
+        Uses receive_response() (NOT receive_messages()) so the
+        iterator terminates after ResultMessage.  See the comment in
+        session_manager.py.
+        """
+        async for message in client.receive_response():
+            if message is None:
+                continue  # Unknown message types (safe_parse_message patch)
+            normalized = self._normalize_message(message)
+            if normalized is not None:
+                yield normalized
+
+    async def interrupt(self, client: ClaudeSDKClient) -> None:
+        """Interrupt the current Claude turn.
+        """
+        await client.interrupt()
+
+    async def set_model(self, client: ClaudeSDKClient, model: str) -> None:
+        """Switch the model for all subsequent turns of this session.
+
+        Uses the CLI control protocol's ``set_model`` request — the same
+        mechanism behind the interactive ``/model`` command.  The CLI
+        applies the new model starting with the NEXT turn (verified by a
+        standalone probe: after the control request returned
+        success, the following assistant message reported the new model id).
+
+        SDK 0.0.25 does not expose a public ``set_model`` wrapper, so this
+        reaches the internal ``Query._send_control_request`` — the same
+        internal layer ``sdk_patches.py`` already relies on.  That call
+        raises on an error response from the CLI, so a successful return
+        IS the CLI's confirmation.
+
+        Raises:
+            RuntimeError: session not connected.
+            Exception: CLI rejected the request (unknown model, old CLI).
+                Callers must not record the new model in that case.
+        """
+        query = getattr(client, "_query", None)
+        if query is None:
+            raise RuntimeError("Session is not connected")
+        await query._send_control_request({"subtype": "set_model", "model": model})
+
+    async def set_effort(self, client: ClaudeSDKClient,
+                         effort: Optional[str]) -> Optional[str]:
+        """Change the session's thinking level (CLI effort) without a restart.
+
+        Sends the CLI control request ``apply_flag_settings`` with
+        ``{"effortLevel": effort}`` (``None`` = back to the model's default),
+        then reads the result back with ``get_settings``.  It works mid-turn:
+        the CLI applies the level to its next API request.  Probed against
+        CLI 2.1.291: answered in ~0.1s while a tool was running,
+        ``get_settings`` reported the new level at once, and an idle change
+        put nothing on the message stream (so, unlike ``set_model``, there is
+        no side-effect ``init`` for the post-turn listeners to misread).
+
+        Returns what ``get_settings`` reports as ``applied.effort``: the level
+        the CLI applies to the session's CURRENT model.  A success can differ
+        from the request:
+
+          * a model clamps a level it lacks (Sonnet 4.6 and Opus 4.6 run
+            ``xhigh`` as ``high``);
+          * a model without thinking levels (Haiku 4.5) reports ``None``, and
+            the CLI holds the level for a later switch to a model that has them;
+          * a reset (``None``) reports the model's own default.
+
+        ``apply_flag_settings`` acknowledges values it ignores (a junk level
+        comes back as success), which is why the read-back is required before
+        anything is recorded.
+
+        Raises:
+            RuntimeError: session not connected, or the CLI did not report an
+                applied level (a CLI too old to confirm the change).
+            Exception: the CLI rejected either request; a CLI that predates
+                them answers "Unsupported control request subtype".
+        """
+        query = getattr(client, "_query", None)
+        if query is None:
+            raise RuntimeError("Session is not connected")
+        await query._send_control_request({
+            "subtype": "apply_flag_settings",
+            "settings": {"effortLevel": effort},
+        })
+        resp = await query._send_control_request({"subtype": "get_settings"})
+        applied = resp.get("applied") if isinstance(resp, dict) else None
+        if not isinstance(applied, dict) or "effort" not in applied:
+            raise RuntimeError(
+                "The Claude CLI did not report its thinking level after the "
+                "change, so it cannot be confirmed"
+            )
+        level = applied.get("effort")
+        return level if isinstance(level, str) else None
+
+    @property
+    def knowledge(self):
+        """The Claude CLI's vocabulary (``claude_layout.ClaudeKnowledge``)."""
+        from engine.backends.claude_layout import CLAUDE_KNOWLEDGE
+        return CLAUDE_KNOWLEDGE
+
+    def transcript_layout(self):
+        """The Claude CLI's on-disk session layout."""
+        from engine.backends.claude_layout import ClaudeTranscriptLayout
+        return ClaudeTranscriptLayout()
+
+    def supported_models(self, client: ClaudeSDKClient) -> list:
+        """The models this session's CLI process can run, from the ``models``
+        list in its ``initialize`` response.
+
+        Entries look like ``{"value": "opus", "resolvedModel":
+        "claude-opus-5-5", "displayName": "Opus 5.5", ...}``.  The family
+        aliases (``opus``, ``fable``, ``sonnet``, ``haiku``) resolve to the
+        CLI's NEWEST model of that family, so this is the one source that
+        knows about a model released after VibeNode was last updated, and it
+        never offers a model the running process would reject.  Probed against
+        CLI 2.1.291.  Read from the SDK's stored response (no
+        request is sent).  Returns [] when the CLI did not report a list (older
+        CLIs) or the client is not connected.  Never raises.
+        """
+        query = getattr(client, "_query", None) if client is not None else None
+        init = getattr(query, "_initialization_result", None) if query is not None else None
+        models = init.get("models") if isinstance(init, dict) else None
+        return [m for m in models if isinstance(m, dict)] if isinstance(models, list) else []
+
+    async def applied_model(self, client: ClaudeSDKClient) -> Optional[str]:
+        """The model the CLI runs now, from ``get_settings`` (``applied.model``):
+        how a switch to a family alias ("opus") learns the concrete id the CLI
+        resolved it to.  None when the CLI cannot say (older CLIs)."""
+        query = getattr(client, "_query", None) if client is not None else None
+        if query is None:
+            return None
+        resp = await query._send_control_request({"subtype": "get_settings"})
+        applied = resp.get("applied") if isinstance(resp, dict) else None
+        model = applied.get("model") if isinstance(applied, dict) else None
+        return model if isinstance(model, str) and model else None
+
+    async def disconnect(self, client: ClaudeSDKClient) -> None:
+        """Disconnect the Claude client.
+
+        Runs in the client's owner task (see connect()), so the SDK's task
+        group is exited by the task that entered it, whatever task calls this.
+        """
+        own = getattr(client, "_vn_owner", None)
+        if own is None:
+            await client.disconnect()   # not connected through connect()
+            return
+        owner, stop = own
+        if owner.done():
+            # The connect never completed (failed or was aborted); there is
+            # no owner left to run it, so fall back to the direct call.
+            await client.disconnect()
+            return
+        stop.set()
+        # shield: if this caller is cancelled the owner still finishes the
+        # disconnect; awaiting it also re-raises any disconnect error.
+        await asyncio.shield(owner)
+
+    def extract_process_pid(self, client: Any) -> int:
+        """Extract CLI subprocess PID from the Claude client.
+
+        Navigates through the transport adapter wrapper.
+        """
+        if not client:
+            return 0
+        hosted = self._host_transport(client)
+        if hosted is not None:
+            # Hosted: the CLI is the host's child.  0 once the host reported
+            # the CLI's exit or the connection to the host was lost.
+            return hosted.cli_pid
+        transport = getattr(client, '_transport', None)
+        if transport is None:
+            query = getattr(client, '_query', None)
+            transport = getattr(query, 'transport', None) if query else None
+        inner = getattr(transport, 'inner', transport) if transport else None
+        proc = getattr(inner, '_process', None) if inner else None
+        if proc and proc.returncode is None:
+            return proc.pid or 0
+        return 0
+
+    def is_transport_alive(self, client: Any) -> bool:
+        """Check if the Claude transport is still connected.
+        """
+        try:
+            return (
+                client is not None
+                and client._query is not None
+                and client._query.transport is not None
+                and client._query.transport.is_ready()
+            )
+        except Exception:
+            return False
+
+    def apply_patches(self) -> list[str]:
+        """Apply Claude SDK patches (safe_parse, transport adapter, etc.).
+
+        Delegates to src/engine/sdk_patches.py.
+        """
+        from engine.sdk_patches import apply_patches
+        return apply_patches()
+
+    # ── Internal: Message Normalization ──────────────────────────────
+
+    def _normalize_message(self, message: Any) -> Optional[VibeNodeMessage]:
+        """Convert a Claude SDK message to a VibeNodeMessage.
+
+        This is the core mapping function.  Every isinstance() check
+        in session_manager.py _process_message (L2422-2790) becomes
+        a branch here instead.
+        """
+        if isinstance(message, AssistantMessage):
+            return self._normalize_assistant(message)
+        elif isinstance(message, UserMessage):
+            return self._normalize_user(message)
+        elif isinstance(message, SystemMessage):
+            return self._normalize_system(message)
+        elif isinstance(message, ResultMessage):
+            return self._normalize_result(message)
+        elif isinstance(message, StreamEvent):
+            return self._normalize_stream_event(message)
+        return None
+
+    def _normalize_assistant(self, msg: AssistantMessage) -> VibeNodeMessage:
+        """Convert AssistantMessage to VibeNodeMessage.
+        """
+        blocks = []
+        for block in (msg.content if hasattr(msg, 'content') else []):
+            if isinstance(block, TextBlock):
+                # Truncate text to 50KB to prevent memory bloat from extremely
+                # long responses.  This limit protects both server memory and
+                # the WebSocket transport to the browser.
+                blocks.append({
+                    "kind": BlockKind.TEXT.value,
+                    "text": (block.text or "")[:50000],
+                })
+            elif isinstance(block, ToolUseBlock):
+                # Defensive: block.input can be a non-dict in edge cases
+                # (malformed SDK responses, partial streaming).  Downstream
+                # code calls input.get(), so we must guarantee a dict here
+                # to avoid TypeError.
+                inp = (block.input if hasattr(block, 'input')
+                       and isinstance(block.input, dict) else {})
+                blocks.append({
+                    "kind": BlockKind.TOOL_USE.value,
+                    "name": getattr(block, 'name', '') or '',
+                    "id": getattr(block, 'id', '') or '',
+                    "input": inp,
+                })
+            elif isinstance(block, ThinkingBlock):
+                # ThinkingBlock is included in the normalized output (not
+                # discarded) so the UI can show/hide thinking based on user
+                # preference.  The actual thinking text is NOT forwarded --
+                # only the kind marker -- to avoid leaking chain-of-thought
+                # details that could confuse the user or bloat the log.
+                blocks.append({
+                    "kind": BlockKind.THINKING.value,
+                })
+        return VibeNodeMessage(kind=MessageKind.ASSISTANT, blocks=blocks, raw=msg)
+
+    def _normalize_user(self, msg: UserMessage) -> VibeNodeMessage:
+        """Convert UserMessage to VibeNodeMessage.
+        """
+        # Sub-agent detection: if parent_tool_use_id is set, this message
+        # comes from a sub-agent (e.g. a tool that spawned its own Claude
+        # session).  Sub-agent messages skip the user bubble in the UI to
+        # avoid confusing the user with messages they didn't send.
+        is_sub_agent = bool(getattr(msg, 'parent_tool_use_id', None))
+        raw_content = getattr(msg, 'content', None) or []
+
+        blocks = []
+        # Content can be either a plain string (older SDK versions) or a
+        # list of typed content blocks (current SDK).  Both formats must
+        # be handled for backward compatibility.
+        if isinstance(raw_content, str):
+            if raw_content.strip():
+                blocks.append({
+                    "kind": BlockKind.TEXT.value,
+                    "text": raw_content[:20000],
+                })
+        elif isinstance(raw_content, list):
+            for block in raw_content:
+                if isinstance(block, ToolResultBlock):
+                    # ToolResultBlock.content can be EITHER a string (simple
+                    # tool output like bash stdout) OR a list of typed dicts
+                    # (complex output with multiple parts).  We must handle
+                    # both formats and extract the text content from each.
+                    rc = getattr(block, 'content', '') or ''
+                    if isinstance(rc, list):
+                        # List content: each element is either a dict with
+                        # {"type": "text", "text": "..."} or an object with
+                        # a .text attribute.  Extract and join all text parts.
+                        text_parts = []
+                        for b in rc:
+                            if isinstance(b, dict) and b.get("type") == "text":
+                                text_parts.append(b.get("text", ""))
+                            elif hasattr(b, 'text'):
+                                text_parts.append(b.text or "")
+                        rt = " ".join(text_parts)
+                    elif isinstance(rc, str):
+                        rt = rc
+                    else:
+                        rt = str(rc)
+                    blocks.append({
+                        "kind": BlockKind.TOOL_RESULT.value,
+                        "text": rt[:20000],
+                        "tool_use_id": getattr(block, 'tool_use_id', '') or '',
+                        "is_error": bool(getattr(block, 'is_error', False)),
+                    })
+                elif isinstance(block, TextBlock):
+                    blocks.append({
+                        "kind": BlockKind.TEXT.value,
+                        "text": (block.text or "")[:20000],
+                    })
+
+        return VibeNodeMessage(
+            kind=MessageKind.USER,
+            blocks=blocks,
+            is_sub_agent=is_sub_agent,
+            raw=msg,
+        )
+
+    def _normalize_system(self, msg: SystemMessage) -> VibeNodeMessage:
+        """Convert SystemMessage to VibeNodeMessage.
+        """
+        subtype = getattr(msg, 'subtype', '') or ''
+        data = getattr(msg, 'data', {}) or {}
+        return VibeNodeMessage(
+            kind=MessageKind.SYSTEM,
+            subtype=subtype,
+            data=data,
+            raw=msg,
+        )
+
+    def _normalize_result(self, msg: ResultMessage) -> VibeNodeMessage:
+        """Convert ResultMessage to VibeNodeMessage.
+        """
+        raw_usage = getattr(msg, 'usage', None)
+        return VibeNodeMessage(
+            kind=MessageKind.RESULT,
+            # subtype distinguishes success / error_during_execution /
+            # error_max_turns; the daemon uses it (plus the result text below)
+            # to classify an is_error result as transient vs permanent for the
+            # API-error auto-retry.  See SessionManager._classify_result_error.
+            subtype=getattr(msg, 'subtype', '') or '',
+            cost_usd=getattr(msg, 'total_cost_usd', 0.0) or 0.0,
+            is_error=getattr(msg, 'is_error', False),
+            session_id=getattr(msg, 'session_id', None),
+            usage=dict(raw_usage) if raw_usage and isinstance(raw_usage, dict) else {},
+            duration_ms=getattr(msg, 'duration_ms', 0) or 0,
+            num_turns=getattr(msg, 'num_turns', 0) or 0,
+            # The error/result text — carried so the retry classifier can match
+            # transient signatures (overload / 429 / 529 / 5xx / timeout / …).
+            data={'result': getattr(msg, 'result', '') or ''},
+            raw=msg,
+        )
+
+    def _normalize_stream_event(self, msg: StreamEvent) -> VibeNodeMessage:
+        """Convert StreamEvent to VibeNodeMessage.
+        """
+        event_data = {}
+        if hasattr(msg, 'event'):
+            event_data['event'] = msg.event
+        if hasattr(msg, 'data'):
+            event_data['data'] = msg.data
+        return VibeNodeMessage(
+            kind=MessageKind.STREAM_EVENT,
+            data=event_data,
+            raw=msg,
+        )
+
+    # ── Internal: Permission callback wrapper ────────────────────────
+
+    def _wrap_permission_callback(self, callback: Any) -> Any:
+        """Wrap the abstract permission callback into Claude SDK format.
+
+        The Claude SDK expects can_use_tool to return PermissionResultAllow
+        or PermissionResultDeny.  This wrapper converts our abstract
+        PermissionResult into the SDK-specific types.
+        """
+        async def claude_can_use_tool(tool_name, tool_input, context):
+            result = await callback(tool_name, tool_input, context)
+            if result.action == PermissionAction.ALLOW:
+                return PermissionResultAllow(
+                    updated_input=result.updated_input,
+                    updated_permissions=None,
+                )
+            else:
+                return PermissionResultDeny(
+                    message=result.message,
+                    interrupt=result.interrupt,
+                )
+        return claude_can_use_tool
