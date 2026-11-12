@@ -733,6 +733,33 @@ async function _doRestart(scope) {
     });
   } catch (e) { /* expected — server is going down */ }
 
+  // A Session Engine restart leaves the web server running (it starts only
+  // the engine), so wait on the engine itself instead of on the page.
+  if (scope === 'daemon') {
+    const _engineUp = async () => {
+      try {
+        const r = await fetch('/api/health', { cache: 'no-store', signal: AbortSignal.timeout(2000) });
+        return r.ok ? !!(await r.json()).daemon : null;
+      } catch (e) { return null; }
+    };
+    statusEl.textContent = 'Shutting down…';
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      const up = await _engineUp();
+      if (up === false || up === null) break;   // engine down (or the whole app, on a full start)
+    }
+    statusEl.textContent = 'Starting up…';
+    for (let i = 0; i < 90; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      if (i > 8) statusEl.textContent = 'Almost there…';
+      if (await _engineUp() === true) break;
+    }
+    clearInterval(_timer);
+    statusEl.textContent = 'Back online — reloading';
+    setTimeout(() => window.location.reload(), 500);
+    return;
+  }
+
   // Phase 1: Wait for the old server to actually go down.
   // Without this, the poll below catches the still-alive old process.
   statusEl.textContent = 'Shutting down…';
