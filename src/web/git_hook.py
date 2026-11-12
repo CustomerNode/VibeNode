@@ -78,7 +78,9 @@ def commit_msg(path: str) -> int:
 
 
 def pre_push(stdin: str) -> int:
-    from web.git_scanner import _identity_findings, _note_findings, _own_words_findings
+    import re
+    from web.git_scanner import (_BINARY_EXT, _SCANNER_ITSELF, _identity_findings, _note_findings,
+                                 _own_words_findings)
     found = []
     for line in stdin.splitlines():
         parts = line.split()
@@ -91,10 +93,20 @@ def pre_push(stdin: str) -> int:
             continue
         for chunk in r.stdout.decode("utf-8", "ignore").split("\x00")[1:]:
             sha, _, body = chunk.partition("\n")
-            added = "\n".join(l[1:] if l.startswith("+") else l for l in body.splitlines()
-                              if not (l.startswith("+++") or l.startswith("---") or l.startswith("-")))
-            for f in _identity_findings(added) + _note_findings(added) + _own_words_findings("PUSH", added):
-                found.append({"file": f"commit {sha[:10]}", **f})
+            message, *files = re.split(r"(?m)^diff --git ", body)
+            parts_to_scan = [("message", message)]
+            for f in files:
+                m = re.search(r"(?m)^\+\+\+ b/(.+)$", f)
+                path = m.group(1).strip() if m else ""
+                # The scanner's own file holds the very examples it refuses,
+                # and Publish leaves it out too; binaries are not text.
+                if not path or _SCANNER_ITSELF.search(path) or _BINARY_EXT.search(path):
+                    continue
+                parts_to_scan.append((path, "\n".join(l[1:] for l in f.splitlines()
+                                                     if l.startswith("+") and not l.startswith("+++"))))
+            for where, text in parts_to_scan:
+                for f in _identity_findings(text) + _note_findings(text) + _own_words_findings("PUSH", text):
+                    found.append({"file": f"commit {sha[:10]} {where}", **f})
     return _report("pre-push", found)
 
 

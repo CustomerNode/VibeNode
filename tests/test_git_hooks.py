@@ -95,3 +95,17 @@ def test_install_leaves_a_developers_own_hooks_alone(tmp_path):
     _git(other, "init", "-q")
     _git(other, "config", "core.hooksPath", "my-hooks")
     assert ensure_installed(other).startswith("left alone")
+
+
+def test_a_push_never_scans_the_scanners_own_examples(repo, tmp_path):
+    w, env = repo
+    _git(tmp_path, "init", "-q", "--bare", "remote2.git")
+    assert _commit(w, env, "# " + TYPED + "\n").returncode != 0      # indexes the words
+    (w / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (w / "src" / "web").mkdir(parents=True)
+    (w / "src" / "web" / "git_scanner.py").write_text('EXAMPLE = "' + TYPED + '"\n', encoding="utf-8")
+    _git(w, "add", "-A", env=env)
+    assert _git(w, "commit", "-q", "--no-verify", "-m", "start", env=env).returncode == 0
+    _git(w, "remote", "add", "origin2", "../remote2.git")
+    r = _git(w, "push", "origin2", "HEAD:main", env=env)
+    assert r.returncode == 0, r.stderr
