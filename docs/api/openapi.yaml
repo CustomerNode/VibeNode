@@ -6429,6 +6429,42 @@ paths:
                   pip_output_tail:
                     type: string
 
+  /api/git-sync-stream:
+    post:
+      tags: [Git]
+      summary: Git sync, reporting each step as it starts
+      description: >
+        The same sync and request body as /api/git-sync, answered as
+        newline-delimited JSON: one {"type": "steps", "steps": [{key, label}]}
+        line first, then {"type": "step", "key": ...} as each step begins,
+        then {"type": "done", "result": {...}} holding exactly what
+        /api/git-sync returns. The sync runs on its own thread, so a reader
+        that goes away never stops it half way.
+      operationId: gitSyncStream
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                action:
+                  type: string
+                  enum: [pull, push, both]
+                  default: both
+                confirm_branch:
+                  type: boolean
+                summary:
+                  type: string
+                gate:
+                  type: object
+      responses:
+        "200":
+          description: Step events, then the sync result
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+
   /api/git-scan:
     get:
       tags: [Git]

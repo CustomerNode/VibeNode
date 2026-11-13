@@ -2124,8 +2124,14 @@ pre.vn-code code { white-space: inherit; overflow-wrap: inherit; }
 .gs-min { display: none; top: 20px; right: 20px; align-items: center; justify-content: center; font-size: var(--fs-2xl); }
 .gs-card .pm-input { box-sizing: border-box; }
 .gs-label { font-size: var(--fs-md); font-weight: 600; color: var(--text-secondary); margin: 0 0 6px; }
-.gs-choice { display: flex; gap: var(--sp-3); }
-.gs-choice .pm-btn { flex: 1; padding-left: 8px; padding-right: 8px; }
+.gs-seg { display: flex; gap: 2px; padding: 3px; background: var(--bg-input-alt); border: 1px solid var(--border-input); border-radius: var(--r-md); }
+.gs-seg button { flex: 1; padding: 7px 0; border: 0; border-radius: calc(var(--r-md) - 2px); background: transparent; color: var(--text-muted);
+  font: 600 var(--fs-lg) var(--font-sans); cursor: pointer; outline: none; transition: background .15s var(--ease-out), color .15s var(--ease-out); }
+.gs-seg button:hover { color: var(--text-heading); }
+.gs-seg button:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+.gs-seg button.on { background: var(--bg-btn); color: var(--text-heading); box-shadow: var(--elev-1, 0 1px 2px rgba(0,0,0,.3)); }
+[data-theme="light"] .gs-seg { background: var(--bg-subtle-hover, rgba(0,0,0,.06)); }
+[data-theme="light"] .gs-seg button.on { background: var(--bg-modal); box-shadow: 0 1px 3px rgba(0,0,0,.14), 0 0 0 1px rgba(0,0,0,.04); }
 .gs-hint { font-size: var(--fs-md); color: var(--text-muted); margin-top: 8px; line-height: 1.45; }
 .gs-card .trun { padding-top: 4px; }
 .gs-card .trun-pct svg { width: 26px; height: 26px; display: block; }
@@ -2138,10 +2144,6 @@ pre.vn-code code { white-space: inherit; overflow-wrap: inherit; }
 .gs-card .trun-pct:empty + .trun-desc { margin-top: 14px; }
 .trun-ring-fill.trun-ring-ok { stroke: var(--green); }
 .trun-pct.trun-ok { color: var(--green); }
-/* A step whose length is unknown (the git operation): the ring turns. */
-.trun-ring.gs-spin { animation: gsSpin 1.1s linear infinite; }
-@keyframes gsSpin { from { transform: rotate(-90deg); } to { transform: rotate(270deg); } }
-@media (prefers-reduced-motion: reduce) { .trun-ring.gs-spin { animation: none; } }
 .gs-file { font-size: var(--fs-sm); color: var(--text-faint); margin-top: 3px; max-width: 360px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .gs-lines { list-style: none; margin: 12px 0 0; padding: 0; font-size: var(--fs-md); color: var(--text-muted); line-height: 1.55; }
 .gs-lines li + li { margin-top: 2px; }
@@ -2218,6 +2220,15 @@ pre.vn-code code { white-space: inherit; overflow-wrap: inherit; }
   border-top-color: var(--accent, #7c6fe0);
   animation: spin 0.7s linear infinite;
 }
+/* The pill's progress: a small ring that fills with the dialog's (git-sync.js
+   _gsMiniFollow), never a spinner. */
+.git-sync-mini-spinner.progress { width: 18px; height: 18px; border-radius: 0; }
+.git-sync-mini-spinner.progress svg { width: 18px; height: 18px; display: block; transform: rotate(-90deg); }
+.git-sync-mini-spinner.progress circle { fill: none; stroke-width: 3; }
+.git-sync-mini-spinner.progress .gsm-track { stroke: rgba(127,127,127,0.25); }
+.git-sync-mini-spinner.progress .gsm-fill { stroke: var(--accent); stroke-linecap: round; transition: stroke-dashoffset .3s var(--ease-out); }
+.git-sync-mini-pct { font-size: var(--fs-md); color: var(--text-muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.git-sync-mini-pct:empty { display: none; }
 .git-sync-mini-spinner.done {
   width: 14px; height: 14px;
   background: #22c55e;

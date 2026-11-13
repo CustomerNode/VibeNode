@@ -1123,6 +1123,14 @@ def pytest_collection_finish(session):
 def pytest_runtest_logreport(report):
     # setup + call + teardown, so a slow fixture counts as the test's cost.
     _test_durations[report.nodeid] = _test_durations.get(report.nodeid, 0.0) + report.duration
+    if _stall_guard is not None:
+        _stall_guard.note_report(report)
+
+
+# A parallel run that stops making progress ends itself (tests/_stall_guard.py):
+# after a worker crash xdist could leave every worker idle and the controller
+# waiting forever, the Publish ring frozen at 98%.  Started in pytest_sessionstart.
+_stall_guard = None
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -1255,6 +1263,11 @@ def pytest_sessionstart(session):
         workers = config.getoption("numprocesses")
     except ValueError:  # pytest-xdist not installed
         return
+    global _stall_guard
+    from tests import _stall_guard as sg
+    if workers and sg.enabled() and _stall_guard is None:
+        _stall_guard = sg.StallGuard(config, sg.limit_for(config.getoption("timeout", None)))
+        _stall_guard.start()
     from tests import _run_lock as rl
     if not workers or not rl.enabled():
         return
@@ -1273,7 +1286,10 @@ _LOCK_HELD_ENV = "VIBENODE_TEST_RUN_LOCK_HELD"
 
 
 def pytest_unconfigure(config):
-    global _run_lock
+    global _run_lock, _stall_guard
+    if _stall_guard is not None:
+        _stall_guard.stop()
+        _stall_guard = None
     if _run_lock is not None:
         _run_lock.release()
         _run_lock = None

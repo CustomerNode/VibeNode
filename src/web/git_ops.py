@@ -357,8 +357,29 @@ def _run_post_update(proj) -> bool:
         return False
 
 
+# The steps an Update / Publish reports while it runs, in order, so the dialog
+# can fill its ring step by step instead of spinning (git_api.py
+# /api/git-sync-stream).  A step that does not apply is skipped, never added.
+SYNC_STEPS = {
+    "pull": [("pull", "Pulling in updates"), ("restore", "Putting your edits back"),
+             ("finish", "Finishing the update")],
+    "push": [("scan", "Checking files for keys"), ("save", "Saving a new version"),
+             ("upload", "Uploading")],
+}
+
+
+def sync_steps(action: str) -> list:
+    """The ordered (key, label) steps ``do_git_sync(action)`` can report."""
+    steps = []
+    if action in ("pull", "both"):
+        steps += SYNC_STEPS["pull"]
+    if action in ("push", "both"):
+        steps += SYNC_STEPS["push"]
+    return steps
+
+
 def do_git_sync(action: str, confirm_branch: bool = False,
-                summary: str = "", gate=None) -> dict:
+                summary: str = "", gate=None, progress=None) -> dict:
     """
     Perform git sync (pull, push, or both).
     Returns {"ok": bool, "messages": list[str]} plus, after a pull that changed
@@ -368,6 +389,9 @@ def do_git_sync(action: str, confirm_branch: bool = False,
     ``summary`` is the user's one-line "What changed" for the commit (auto
     generated from the staged paths when empty); ``gate`` records the publish
     gate outcome (see ``format_publish_gate``).
+
+    ``progress(key)`` is called as each step of ``sync_steps(action)`` starts;
+    it never changes what the sync does, and an error in it is ignored.
 
     If the working copy is not on the repo's default branch, this short-circuits
     and returns {"needs_branch_confirm": True, ...} WITHOUT touching git, so a
@@ -401,6 +425,13 @@ def do_git_sync(action: str, confirm_branch: bool = False,
     ok = True
     pip_result = None
 
+    def step(key):
+        if progress is not None:
+            try:
+                progress(key)
+            except Exception:
+                pass
+
     adopted = False
     if action in ("pull", "both"):
         # A clash left by an earlier Update's stash pop blocks everything after
@@ -419,6 +450,7 @@ def do_git_sync(action: str, confirm_branch: bool = False,
         # `--no-rebase` refuses "unrelated histories": the Update dies and never
         # recovers.  When the remote's default branch has no common ancestor
         # with this clone, the only safe way on is to adopt it wholesale.
+        step("pull")
         default = _default_branch(proj) or "main"
         if _remote_history_is_unrelated(proj, default):
             res = _adopt_republished_history(proj, default)
@@ -475,6 +507,7 @@ def do_git_sync(action: str, confirm_branch: bool = False,
                 messages.append("Could not pull: " + (pull.stderr.strip() or pull.stdout.strip()) + kept)
                 return {"ok": False, "messages": messages}
             out = pull.stdout.strip()
+            step("restore")
             if stashed:
                 pop = subprocess.run(["git", "-C", str(proj), "stash", "pop"],
                                      capture_output=True, text=True, creationflags=_NO_WINDOW)
@@ -492,6 +525,7 @@ def do_git_sync(action: str, confirm_branch: bool = False,
                 messages.append("VibeNode is already up to date.")
             else:
                 messages.append("Pulled latest VibeNode updates from remote.")
+            step("finish")
             # The update changed requirements.txt: install what it asks for, with
             # the interpreter that runs this server.  A pip failure is reported
             # but never undoes the pull.
@@ -521,6 +555,7 @@ def do_git_sync(action: str, confirm_branch: bool = False,
             ], "conflicts": clashed}
 
         # ── Security scan before push ──
+        step("scan")
         from .git_scanner import scan_staged_files
         scan = scan_staged_files(proj)
         if not scan["ok"]:
@@ -530,6 +565,7 @@ def do_git_sync(action: str, confirm_branch: bool = False,
             ], "scan": scan}
 
         # Auto-commit any uncommitted changes before pushing
+        step("save")
         dirty = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"],
                                capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW)
         if dirty.stdout.strip():
@@ -573,6 +609,7 @@ def do_git_sync(action: str, confirm_branch: bool = False,
                 "Nothing was pushed. Fix with AI can move this copy onto the published history.",
             ], "scan": {"ok": False, "findings": outgoing, "blocked_files": [],
                         "summary": "Owner names in versions waiting to publish."}}
+        step("upload")
         push = subprocess.run(["git", "-C", str(proj), "push"],
                                capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
         if push.returncode != 0:

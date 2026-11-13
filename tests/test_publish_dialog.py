@@ -44,8 +44,13 @@ def _page_html() -> str:
   window.__testDone = null;      // set by a test: the summary the fake run ends with
   function escHtml(s) {{ return String(s).replace(/[&<>"]/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}})[c]); }}
   function showToast(m) {{ window.__toasts.push(m); }}
+  window.__stream = null;        // set by a test: a ReadableStream of step lines
   window.fetch = function (url, opts) {{
     var body = {{}};
+    if (url === '/api/git-sync-stream' && window.__stream) {{
+      window.__posts.push(JSON.parse(opts.body));
+      return Promise.resolve(new Response(window.__stream, {{headers: {{'Content-Type': 'application/x-ndjson'}}}}));
+    }}
     if (url === '/api/test-modes') body = {{modes: {json.dumps(MODES)}}};
     else if (url === '/api/git-sync') {{ window.__posts.push(JSON.parse(opts.body)); body = window.__syncResult; }}
     else if (url === '/api/git-status') body = {{ahead: 1, behind: 0, uncommitted: true, on_default: true}};
@@ -107,6 +112,9 @@ def test_the_dialog_has_the_summary_field_and_honest_mode_labels(page):
     _gate(page, "skip")
     assert hint() == "Skip: no tests run; the commit message says so."
     assert page.locator('#gs-gate [aria-checked="true"]').get_attribute("data-gate") == "skip"
+    # The picked option is the grey raised segment, never the purple main button.
+    assert page.locator("#gs-gate .pm-btn-primary").count() == 0
+    assert page.locator("#gs-gate .on").get_attribute("data-gate") == "skip"
     assert [b.strip() for b in page.locator("#gs-gate button").all_text_contents()] == ["Fast", "Full", "Skip"]
     labels = [b.strip() for b in page.locator("#git-sync-actions button").all_text_contents()]
     assert labels == ["Cancel", "Publish"]
@@ -208,6 +216,44 @@ def test_a_clash_in_the_pull_itself_tells_the_session_to_redo_the_pull(page):
     _click(page, "Fix with AI")
     prompt = page.evaluate("() => window.__fix.prompt")
     assert "git pull --rebase" in prompt and "never with -X theirs" in prompt
+
+
+def test_publishing_fills_the_ring_step_by_step_and_never_spins(page):
+    """The server names its steps and says when each starts
+    (/api/git-sync-stream); the dialog shows the step, "Step i of n", and a
+    ring that has moved, never a spinning ring."""
+    page.evaluate("""() => {
+      const enc = new TextEncoder();
+      window.__push = null;
+      window.__stream = new ReadableStream({start(c) { window.__push = l => c.enqueue(enc.encode(JSON.stringify(l) + String.fromCharCode(10))); window.__end = () => c.close(); }});
+    }""")
+    page.evaluate("() => { executeGitAction('push', 'btn-git-publish', 'Publish App Update'); }")   # not awaited: it ends when the stream does
+    _until(page, "() => window.__push && window.__posts.length === 1")
+    page.evaluate("""() => {
+      __push({type: 'steps', steps: [{key: 'scan', label: 'Checking files for keys'},
+        {key: 'save', label: 'Saving a new version'}, {key: 'upload', label: 'Uploading'}]});
+      __push({type: 'step', key: 'save'});
+    }""")
+    _until(page, "() => /Saving a new version/.test(document.getElementById('sync-step-label').textContent)")
+    assert page.locator("#scan-progress-text").text_content() == "Step 2 of 3"
+    page.clock.run_for(3000)
+    full = 2 * 3.141592653589793 * 52
+    off = float(page.get_attribute("#gs-ring", "stroke-dashoffset"))
+    assert full * (1 - 2 / 3) < off < full * (1 - 1 / 3), "the ring sits inside step 2's share"
+    assert page.evaluate("() => document.querySelectorAll('.gs-spin').length") == 0
+    # Minimized, the pill shows the same progress: a filled ring and a percentage, no spinner.
+    page.evaluate("() => minimizeGitSyncModal()")
+    page.clock.run_for(600)
+    pct = page.locator("#git-sync-mini-pct").text_content()
+    assert pct.endswith("%") and 34 <= int(pct[:-1]) < 67, pct
+    assert page.locator("#git-sync-mini-spinner.working").count() == 0
+    mini_off = float(page.get_attribute("#git-sync-mini-ring", "stroke-dashoffset"))
+    mini_full = 2 * 3.141592653589793 * 8
+    assert abs((1 - mini_off / mini_full) - (1 - off / full)) < 0.1
+    page.evaluate("""() => { __push({type: 'done', result: {ok: true, messages: ['Pushed.'],
+      git_status: {ahead: 0, behind: 0, uncommitted: false}}}); __end(); }""")
+    _until(page, "() => /Published/.test(document.getElementById('git-sync-mini-label').textContent)")
+    assert page.locator("#git-sync-mini-spinner.done").count() == 1
 
 
 def test_the_publish_dialog_code_refreshes_in_an_open_tab():

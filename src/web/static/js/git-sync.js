@@ -101,14 +101,14 @@ const _GS_ICON = {
 };
 
 /** The ring with a big line, a description and a count line under it.
- *  o: {pct, tone: 'ok'|'bad'|'', big, mark, desc, counts, spin, file}
+ *  o: {pct, tone: 'ok'|'bad'|'', big, mark, desc, counts, file}
  *  mark: an icon drawn inside the ring (a finished result). */
 function _gsRing(o) {
   const off = (_GS_RC * (1 - (o.pct || 0) / 100)).toFixed(2);
   const ring = o.tone === 'ok' ? ' trun-ring-ok' : o.tone === 'bad' ? ' trun-ring-bad' : '';
   const big = o.tone === 'ok' ? ' trun-ok' : o.tone === 'bad' ? ' trun-bad' : '';
   return '<div class="trun"><div class="gs-ringwrap">'
-    + '<svg class="trun-ring' + (o.spin ? ' gs-spin' : '') + '" id="gs-ring-svg" viewBox="0 0 120 120" aria-hidden="true">'
+    + '<svg class="trun-ring" id="gs-ring-svg" viewBox="0 0 120 120" aria-hidden="true">'
     +   '<circle class="trun-ring-track" cx="60" cy="60" r="52"/>'
     +   '<circle class="trun-ring-fill' + ring + '" id="gs-ring" cx="60" cy="60" r="52"'
     +     ' stroke-dasharray="' + _GS_RC.toFixed(2) + '" stroke-dashoffset="' + off + '"/>'
@@ -124,22 +124,100 @@ function _gsRing(o) {
 
 /** Move the ring to a known percentage. */
 function _gsProgress(pct) {
-  const svg = document.getElementById('gs-ring-svg');
-  const fill = document.getElementById('gs-ring');
+  _gsStopCreep();
+  _gsFill(pct);
   const big = document.getElementById('gs-big');
-  if (svg) svg.classList.remove('gs-spin');
-  if (fill) fill.setAttribute('stroke-dashoffset', (_GS_RC * (1 - pct / 100)).toFixed(2));
   if (big) big.textContent = Math.round(pct) + '%';
 }
 
-/** A step whose length nobody knows (the git operation): the ring turns. */
-function _gsSpin() {
-  const svg = document.getElementById('gs-ring-svg');
+function _gsFill(pct) {
   const fill = document.getElementById('gs-ring');
+  if (fill) fill.setAttribute('stroke-dashoffset', (_GS_RC * (1 - Math.max(0, Math.min(100, pct)) / 100)).toFixed(2));
+}
+
+// ── The git steps: the ring fills step by step, never spins ──
+// The server names its steps up front and says when each starts
+// (/api/git-sync-stream).  Within a step the ring moves slowly toward the
+// step's end and never reaches it, so it always shows where the run is and
+// that it is still moving.  A server without the stream gives one step.
+let _gsSteps = null;     // [{key, label}]
+let _gsCreepTimer = null;
+
+function _gsStopCreep() {
+  if (_gsCreepTimer) { clearInterval(_gsCreepTimer); _gsCreepTimer = null; }
+}
+
+/** Show step `i` of the run: its name, "Step i of n", and the ring moving through it. */
+function _gsStep(i, label) {
+  const n = (_gsSteps && _gsSteps.length) || 1;
+  const from = 100 * i / n, span = 100 / n;
+  const el = document.getElementById('sync-step-label');
+  const text = document.getElementById('scan-progress-text');
+  const fname = document.getElementById('scan-file-name');
   const big = document.getElementById('gs-big');
-  if (svg) svg.classList.add('gs-spin');
-  if (fill) fill.setAttribute('stroke-dashoffset', (_GS_RC * 0.72).toFixed(2));
+  if (el) el.textContent = label;
+  if (text) text.textContent = n > 1 ? 'Step ' + (i + 1) + ' of ' + n : '';
+  if (fname) fname.textContent = '';
   if (big) big.textContent = '';
+  _gsStopCreep();
+  _gsFill(from);
+  const t0 = Date.now();
+  // Moves 90% of the way through the step's share, quickly at first; a step
+  // that runs long still moves, more slowly.
+  _gsCreepTimer = setInterval(() => {
+    if (!document.getElementById('gs-ring')) return _gsStopCreep();
+    _gsFill(from + span * 0.9 * (1 - Math.exp(-(Date.now() - t0) / 5000)));
+  }, 120);
+  _gitSyncMiniLabel = label;
+  if (_gitSyncMinimized) {
+    const miniLabel = document.getElementById('git-sync-mini-label');
+    if (miniLabel) miniLabel.textContent = label;
+  }
+}
+
+/** Run the sync, showing each step the server reports.  Returns its result. */
+async function _gsRunSync(payload) {
+  const req = {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)};
+  _gsSteps = null;
+  let res = null;
+  try { res = await fetch('/api/git-sync-stream', req); } catch (_) { res = null; }
+  const ndjson = res && res.ok && res.body && res.headers
+    && /ndjson/.test(res.headers.get('content-type') || '');
+  if (!ndjson) {
+    // A web server from before the stream: one step, the same request.
+    _gsSteps = [{key: 'all', label: payload.action === 'pull' ? 'Pulling in updates' : 'Saving and uploading'}];
+    _gsStep(0, _gsSteps[0].label);
+    const r = await (await fetch('/api/git-sync', req)).json();
+    _gsStopCreep();
+    return r;
+  }
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '', result = null;
+  for (;;) {
+    const {value, done} = await reader.read();
+    if (value) buf += dec.decode(value, {stream: true});
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      let ev;
+      try { ev = JSON.parse(line); } catch (_) { continue; }
+      if (ev.type === 'steps') {
+        _gsSteps = ev.steps || [];
+      } else if (ev.type === 'step') {
+        const i = (_gsSteps || []).findIndex(s => s.key === ev.key);
+        if (i >= 0) _gsStep(i, _gsSteps[i].label);
+      } else if (ev.type === 'done') {
+        result = ev.result;
+      }
+    }
+    if (done) break;
+  }
+  _gsStopCreep();
+  if (!result) throw new Error('The sync ended without a result');
+  return result;
 }
 
 /** Words for each action, from the button label the callers pass. */
@@ -161,10 +239,12 @@ function _gateChoiceHtml(modes, verb) {
   return '<input id="git-publish-summary" class="pm-input" type="text" maxlength="120" autocomplete="off" '
     + 'aria-label="What changed? (one line, optional)" placeholder="What changed? Optional, written for you if empty">'
     + '<div class="gs-label">Tests before ' + verb + '</div>'
-    + '<div class="gs-choice" id="gs-gate" role="radiogroup">'
+    // A segmented switch: the picked one is raised in grey, so it never looks
+    // like the purple Publish button below it.
+    + '<div class="gs-seg" id="gs-gate" role="radiogroup" aria-label="Tests before ' + verb + '">'
     + [['fast', 'Fast'], ['full', 'Full'], ['skip', 'Skip']].map(([k, l], i) =>
         '<button type="button" role="radio" aria-checked="' + (i === 0) + '" data-gate="' + k + '"'
-        + ' data-hint="' + escHtml(hint[k]) + '" class="pm-btn ' + (i === 0 ? 'pm-btn-primary' : 'pm-btn-secondary') + '"'
+        + ' data-hint="' + escHtml(hint[k]) + '" class="' + (i === 0 ? 'on' : '') + '"'
         + ' onclick="_gsPickGate(this)">' + l + '</button>').join('')
     + '</div><div class="gs-hint" id="gs-gate-hint">' + escHtml(hint.fast) + '</div>';
 }
@@ -172,8 +252,7 @@ function _gateChoiceHtml(modes, verb) {
 function _gsPickGate(btn) {
   btn.parentElement.querySelectorAll('[data-gate]').forEach(b => {
     const on = b === btn;
-    b.classList.toggle('pm-btn-primary', on);
-    b.classList.toggle('pm-btn-secondary', !on);
+    b.classList.toggle('on', on);
     b.setAttribute('aria-checked', String(on));
   });
   const hint = document.getElementById('gs-gate-hint');
@@ -563,10 +642,51 @@ function minimizeGitSyncModal() {
   const spinner = document.getElementById('git-sync-mini-spinner');
   const closeBtn = document.getElementById('git-sync-mini-close');
   label.textContent = _gitSyncMiniLabel || document.getElementById('git-sync-title').textContent || 'Working...';
-  spinner.className = 'git-sync-mini-spinner working';
+  // A small copy of the dialog's ring, filled as far as the dialog's is: the
+  // pill shows how far along the run is, never a spinner.
+  spinner.className = 'git-sync-mini-spinner progress';
+  spinner.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true"><circle class="gsm-track" cx="10" cy="10" r="8"/>'
+    + '<circle class="gsm-fill" id="git-sync-mini-ring" cx="10" cy="10" r="8" stroke-dasharray="' + _GSM_RC.toFixed(2)
+    + '" stroke-dashoffset="' + _GSM_RC.toFixed(2) + '"/></svg>';
   closeBtn.style.display = 'none';
   mini.classList.add('show');
+  _gsMiniFollow();
   if (typeof _updateFloatOffset === 'function') _updateFloatOffset();   // shared float stack (utils.js)
+}
+
+const _GSM_RC = 2 * Math.PI * 8;
+let _gsMiniTimer = null;
+
+/** How far the dialog's ring is filled (0..1): the git steps, the scan or the tests. */
+function _gsDialogFraction() {
+  const ring = document.getElementById('gs-ring') || document.getElementById('test-progress-ring');
+  if (!ring) return null;
+  const c = parseFloat(ring.getAttribute('stroke-dasharray'));
+  const off = parseFloat(ring.getAttribute('stroke-dashoffset'));
+  if (!(c > 0) || isNaN(off)) return null;
+  return Math.max(0, Math.min(1, 1 - off / c));
+}
+
+/** While minimized, keep the pill's ring and percentage in step with the dialog's. */
+function _gsMiniFollow() {
+  if (_gsMiniTimer) clearInterval(_gsMiniTimer);
+  const tick = () => {
+    if (!_gitSyncMinimized || _gitSyncFinished) { clearInterval(_gsMiniTimer); _gsMiniTimer = null; return; }
+    const f = _gsDialogFraction();
+    const ring = document.getElementById('git-sync-mini-ring');
+    if (ring && f !== null) ring.setAttribute('stroke-dashoffset', (_GSM_RC * (1 - f)).toFixed(2));
+    let pct = document.getElementById('git-sync-mini-pct');
+    const label = document.getElementById('git-sync-mini-label');
+    if (!pct && label) {
+      pct = document.createElement('span');
+      pct.id = 'git-sync-mini-pct';
+      pct.className = 'git-sync-mini-pct';
+      label.after(pct);
+    }
+    if (pct) pct.textContent = f === null ? '' : Math.round(f * 100) + '%';
+  };
+  tick();
+  _gsMiniTimer = setInterval(tick, 250);
 }
 
 function restoreGitSyncModal() {
@@ -600,7 +720,10 @@ function _notifyMiniComplete(title, isOk) {
   const spinner = document.getElementById('git-sync-mini-spinner');
   const closeBtn = document.getElementById('git-sync-mini-close');
   label.textContent = title;
+  spinner.innerHTML = '';
   spinner.className = 'git-sync-mini-spinner ' + (isOk ? 'done' : 'error');
+  const pct = document.getElementById('git-sync-mini-pct');
+  if (pct) pct.textContent = '';
   closeBtn.style.display = 'inline-flex';
   if (typeof _layoutFloats === 'function') _layoutFloats();   // its size just changed
   // Flash the indicator to draw attention
@@ -610,24 +733,7 @@ function _notifyMiniComplete(title, isOk) {
 }
 
 function _syncStatusHtml(stepLabel) {
-  return _gsRing({spin: true, pct: 28, desc: stepLabel || 'Working…'});
-}
-
-/** The scan is done: the git operation runs next, for an unknown time. */
-function _setSyncStep(label) {
-  const el = document.getElementById('sync-step-label');
-  const text = document.getElementById('scan-progress-text');
-  const fname = document.getElementById('scan-file-name');
-  if (el) el.textContent = label;
-  if (text) text.textContent = '';
-  if (fname) fname.textContent = '';
-  _gsSpin();
-  // Update mini indicator label if minimized
-  _gitSyncMiniLabel = label;
-  if (_gitSyncMinimized) {
-    const miniLabel = document.getElementById('git-sync-mini-label');
-    if (miniLabel) miniLabel.textContent = label;
-  }
+  return _gsRing({pct: 0, desc: stepLabel || 'Starting…', counts: ''});
 }
 
 // ── Branch guard warning ──
@@ -672,7 +778,7 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
 
   const W = _gsWords(btnLabel);
   // Show the ring for all actions: the scan's progress first when pushing.
-  showGitSyncModal(W.ing, isPush ? _scanAnimationHtml() : _syncStatusHtml(isPull ? 'Pulling in the latest updates…' : 'Working…'),
+  showGitSyncModal(W.ing, isPush ? _scanAnimationHtml() : _syncStatusHtml('Starting…'),
     [], {center: true});
 
   // For push/sync: run streaming scan first
@@ -690,11 +796,8 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
         btn.disabled = false;
         return;
       }
-      // Scan passed — transition to the git step
-      _setSyncStep(isPull ? 'Pulling in updates, then uploading…' : 'Uploading…');
     } catch(_) {
       // Stream failed — fall through to normal sync (server has its own scan)
-      _setSyncStep(isPull ? 'Pulling in updates, then uploading…' : 'Uploading…');
     }
   }
 
@@ -704,11 +807,7 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
       payload.summary = _publishSummary || '';
       payload.gate = _publishGate || {mode: 'skipped'};
     }
-    const res = await fetch('/api/git-sync', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(payload)
-    });
-    const r = await res.json();
+    const r = await _gsRunSync(payload);
     if (isPush && !r.needs_branch_confirm) { _publishSummary = ''; _publishGate = null; }
 
     // Server-side branch guard (in case the polled status was stale).
@@ -758,6 +857,7 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
       await pollGitStatus();
     }
   } catch(e) {
+    _gsStopCreep();
     showGitSyncModal('Something went wrong', '<p>Could not complete. Try again.</p>',
       [{label: 'OK', primary: true, onclick: closeGitSyncModal}], {tone: 'bad'});
   } finally {

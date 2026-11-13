@@ -10,7 +10,7 @@ from ..platform_utils import NO_WINDOW as _NO_WINDOW
 
 from flask import Blueprint, jsonify, request, Response
 
-from ..git_ops import get_git_cache, refresh_if_idle, do_git_sync
+from ..git_ops import get_git_cache, refresh_if_idle, do_git_sync, sync_steps
 from ..config import get_active_project, _decode_project, _sessions_dir, _CLAUDE_PROJECTS
 
 bp = Blueprint('git_api', __name__)
@@ -38,6 +38,51 @@ def api_git_sync():
     # directly instead of making a separate poll that might race.
     result["git_status"] = get_git_cache()
     return jsonify(result)
+
+
+@bp.route("/api/git-sync-stream", methods=["POST"])
+def api_git_sync_stream():
+    """The same sync as /api/git-sync, reporting each step as it starts.
+
+    One JSON object per line: ``{"type": "steps", "steps": [{key, label}]}``
+    first, then ``{"type": "step", "key": ...}`` as each step begins, then
+    ``{"type": "done", "result": {...}}`` with exactly what /api/git-sync
+    returns.  The sync runs on its own thread, so a reader that goes away never
+    stops it half way.
+    """
+    import json
+    import queue
+    import threading
+
+    data = request.get_json() or {}
+    action = data.get("action", "both")
+    confirm_branch = bool(data.get("confirm_branch", False))
+    summary = str(data.get("summary") or "")
+    gate = data.get("gate") if isinstance(data.get("gate"), dict) else None
+    events = queue.Queue()
+
+    def run():
+        try:
+            result = do_git_sync(action, confirm_branch=confirm_branch, summary=summary, gate=gate,
+                                 progress=lambda key: events.put({"type": "step", "key": key}))
+        except Exception as e:   # the dialog must always get an answer
+            result = {"ok": False, "messages": ["Could not complete: " + str(e)]}
+        result["git_status"] = get_git_cache()
+        events.put({"type": "done", "result": result})
+
+    threading.Thread(target=run, name="git-sync-stream", daemon=True).start()
+
+    def generate():
+        steps = [{"key": k, "label": label} for k, label in sync_steps(action)]
+        yield json.dumps({"type": "steps", "steps": steps}) + "\n"
+        while True:
+            ev = events.get()
+            yield json.dumps(ev) + "\n"
+            if ev["type"] == "done":
+                return
+
+    return Response(generate(), mimetype="application/x-ndjson",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @bp.route("/api/git-scan")
