@@ -989,6 +989,40 @@ _VALIDATE_PICTURE = re.compile(
     r"|/api/preview/asset/|/api/card-picture\b)", re.I)
 
 
+# A page of this app that is only a picture in a frame: an HTML file whose
+# body is screenshots and a caption, with nothing to press or run.  Wrapping a
+# screenshot in a page does not make it a place to try the work.  Anything a
+# person can use (a script, a frame of the live page, a form, a link, a video
+# or canvas) makes it a real page; so does more than a caption of text.
+_PAGE_INTERACTIVE = re.compile(
+    r"<(?:script|iframe|frame|object|embed|form|input|button|select|textarea|video|canvas|a\s[^>]*href)\b",
+    re.I)
+_PAGE_PICTURE = re.compile(r"<img\b|<picture\b|background(?:-image)?\s*:[^;\"']*url\(", re.I)
+_PAGE_CAPTION_WORDS = 80
+
+
+def picture_page(url) -> bool:
+    """True when ``url`` is a page of this app (``/static/….html``) that only
+    frames screenshots: pictures, at most a caption, and nothing to use."""
+    u = _s(url).strip()
+    if not u.startswith("/static/"):
+        return False
+    rel = urllib.parse.unquote(re.sub(r"[?#].*$", "", u)[len("/static/"):])
+    if not re.search(r"\.html?$", rel, re.I):
+        return False
+    try:
+        f = (_STATIC_DIR / rel).resolve()
+        f.relative_to(_STATIC_DIR.resolve())
+        text = f.read_text(encoding="utf-8", errors="replace")[:400_000]
+    except (OSError, ValueError):
+        return False
+    if _PAGE_INTERACTIVE.search(text) or not _PAGE_PICTURE.search(text):
+        return False
+    body = re.sub(r"<(style|head|title)\b.*?</\1\s*>", " ", text, flags=re.I | re.S)
+    words = re.sub(r"<[^>]*>", " ", body).split()
+    return len(words) <= _PAGE_CAPTION_WORDS
+
+
 def validate_picture_problem(card: dict) -> Optional[str]:
     """Why the card's Validate row opens a picture instead of a place to try
     the work, or None."""
@@ -996,6 +1030,13 @@ def validate_picture_problem(card: dict) -> Optional[str]:
         return None
     v = card.get("validate") if isinstance(card.get("validate"), dict) else {}
     url = _s(v.get("url")).strip()
+    if url and picture_page(url):
+        return (f"validate.url ({url}) is a page that only shows a screenshot: wrapping a picture in "
+                "a page does not give the user anything to try. validate.url is the LIVE place the "
+                "work shows: the app's own address (\"http://127.0.0.1:<port>/...\", the copy the user "
+                "is signed in to) or a deep link to the exact spot, or a demo page that loads the "
+                "real code. The screenshot goes in \"links\" as \"kind\": \"image\", drawn beside the "
+                "row as \"OR just look\".")
     if not url or not _VALIDATE_PICTURE.search(url):
         return None
     return (f"validate.url ({url}) is a screenshot: the user cannot try anything in a picture, so "
@@ -2716,8 +2757,9 @@ records or history), show a "compare" of what reads differently now. It must \
 have "validate": one line on how the user checks it works himself, and in \
 "url" the page the user opens to try it NOW and do what "how" says, on the \
 very thing the user asked for (each part of it: asked for a phone version too, \
-the user tries it at phone size). A screenshot is never that page: pictures go \
-in "links" and are drawn beside the row as "OR just look". When the app's own \
+the user tries it at phone size). A screenshot is never that page, and neither \
+is a scratch page that only holds a screenshot: pictures go in "links" and are \
+drawn beside the row as "OR just look". When the app's own \
 page cannot be linked to the exact spot, build a demo page in the scratch \
 folder that loads the real code and opens on it. When the real check \
 only happens later (the next time something occurs), build a demo page that \

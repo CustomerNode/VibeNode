@@ -649,6 +649,56 @@ def test_a_page_named_after_pictures_is_still_a_page(url):
 
 def test_the_done_guidance_says_a_screenshot_is_never_the_page_to_try():
     assert "A screenshot is never that page" in hr.INSTRUCTIONS
+    assert "only holds a screenshot" in hr.INSTRUCTIONS
+
+
+# A picture wrapped in a page is still a picture: a scratch page whose body is
+# a screenshot and a caption gives the user nothing to try.
+_FRAMED_ONLY = ('<!doctype html><html><head><title>Garden shed after the fix</title>'
+                '<style>img{max-width:100%}</style></head><body><p>The shed planner, captured '
+                'after the fix.</p><img src="/static/scratch/shed.png" alt="Shed"></body></html>')
+_GALLERY = ('<html><body><h1>Shed planner now</h1><div><img src="shed-web.png"><p>Web</p></div>'
+            '<div style="background-image: url(shed-phone.png)"></div><p>Phone</p></body></html>')
+_LIVE_FRAME = ('<html><body><h1>Shed planner, live</h1><img src="logo.png">'
+               '<iframe src="http://127.0.0.1:8123/sheds/7"></iframe></body></html>')
+_REAL_DEMO = '<html><body><img src="shed.png"><script src="/static/js/shed.js"></script></body></html>'
+_LINKED = '<html><body><img src="shed.png"><a href="http://127.0.0.1:8123/sheds/7">Open it</a></body></html>'
+_LONG_TEXT = ('<html><body><img src="shed.png"><p>' + "step " * 120 + '</p></body></html>')
+
+
+@pytest.fixture
+def scratch_page(tmp_path, monkeypatch):
+    static = tmp_path / "static"
+    (static / "scratch").mkdir(parents=True)
+    monkeypatch.setattr(hr, "_STATIC_DIR", static)
+
+    def make(name, html):
+        (static / "scratch" / name).write_text(html, encoding="utf-8")
+        return "/static/scratch/" + name
+    return make
+
+
+@pytest.mark.parametrize("html", [_FRAMED_ONLY, _GALLERY])
+def test_a_page_that_only_frames_a_screenshot_is_not_a_place_to_try(scratch_page, html):
+    url = scratch_page("shed-after.html", html)
+    card = dict(DONE, validate={"how": "Open the shed planner and add a door", "url": url + "#web"},
+                links=[{"label": "Shed planner", "kind": "image", "url": "/static/scratch/shed.png"}])
+    reason = hr.validate_picture_problem(card)
+    assert reason and "only shows a screenshot" in reason and "LIVE place" in reason
+    assert any("only shows a screenshot" in p for p in hr.format_problems(card))
+
+
+@pytest.mark.parametrize("html", [_LIVE_FRAME, _REAL_DEMO, _LINKED, _LONG_TEXT])
+def test_a_page_with_something_to_use_is_still_a_page(scratch_page, html):
+    url = scratch_page("shed-demo.html", html)
+    card = dict(DONE, validate={"how": "Open the shed planner and add a door", "url": url})
+    assert hr.validate_picture_problem(card) is None
+
+
+def test_a_missing_or_outside_page_is_left_to_the_link_check(scratch_page):
+    for url in ("/static/scratch/nowhere.html", "/static/../../etc/passwd.html",
+                "http://127.0.0.1:8123/sheds/7"):
+        assert hr.picture_page(url) is False
 
 
 # A Validate row that links the app the user is already in is useless.  The
