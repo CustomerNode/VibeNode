@@ -35,12 +35,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 _REPO = Path(__file__).resolve().parents[2]
-_SELF = "handoff_check"
+# The check's own run, not a test file named after it ("test_handoff_check.py"):
+# hiding that one dropped the session's test runs from its own evidence.
+_SELF = re.compile(r"(?<![\w])handoff_check\b")
 
 
 def as_message(draft: str) -> str:
@@ -58,7 +61,7 @@ def _entries(session_id: str, cwd: str) -> list:
     rows = ClaudeJsonlStore().read_log_entries(session_id, cwd, max_entries=0)
     out, skip = [], set()
     for r in rows:
-        if r.get("kind") == "tool_use" and _SELF in (r.get("desc") or ""):
+        if r.get("kind") == "tool_use" and _SELF.search(r.get("desc") or ""):
             skip.add(r.get("id"))
             continue
         if r.get("kind") == "tool_result" and r.get("tool_use_id") in skip:

@@ -649,7 +649,46 @@ def test_a_page_named_after_pictures_is_still_a_page(url):
 
 def test_the_done_guidance_says_a_screenshot_is_never_the_page_to_try():
     assert "A screenshot is never that page" in hr.INSTRUCTIONS
-    assert "only holds a screenshot" in hr.INSTRUCTIONS
+    assert "only shows screenshots" in hr.INSTRUCTIONS
+
+
+# A scratch page whose only content is a picture is a screenshot with a
+# title: "Try it yourself" on it gives the user nothing to try.
+_WRAPPER = ('<!doctype html><title>Gadget list sorts</title><body><h1>After the fix</h1>'
+            '<img src="gadget-sort.png"></body>')
+_GALLERY = ('<style>.hero{background-image:url(before.png)}</style><figure><img src="a.png">'
+            '<figcaption>Before</figcaption></figure><a href="after.png">full size</a>')
+
+
+@pytest.mark.parametrize("page", [_WRAPPER, _GALLERY])
+def test_a_page_that_only_shows_a_picture_is_not_a_place_to_try(tmp_path, monkeypatch, page):
+    monkeypatch.setattr(hr, "_SCRATCH_DIR", tmp_path)
+    (tmp_path / "gadget-demo.html").write_text(page)
+    card = dict(DONE, validate={"how": "Sort the gadget list by price", "url": "/static/scratch/gadget-demo.html"},
+                links=[{"label": "Gadget list sorted", "kind": "image", "url": "/static/scratch/a.png"}])
+    reason = hr.validate_picture_problem(card)
+    assert reason and "only shows a picture" in reason and "live page" in reason
+    assert any("only shows a picture" in p for p in hr.format_problems(card))
+
+
+@pytest.mark.parametrize("page", [
+    '<img src="a.png"><iframe src="http://127.0.0.1:8000/gadgets"></iframe>',
+    '<img src="a.png"><script src="/static/js/gadgets.js"></script>',
+    '<img src="a.png"><button>Sort by price</button>',
+    '<img src="a.png"><a href="http://127.0.0.1:8000/gadgets">Open the list</a>',
+    '<div onclick="go()">Gadgets</div>',
+    '<h1>No pictures at all</h1>',
+])
+def test_a_page_that_runs_or_responds_is_a_place_to_try(tmp_path, monkeypatch, page):
+    monkeypatch.setattr(hr, "_SCRATCH_DIR", tmp_path)
+    (tmp_path / "gadget-demo.html").write_text(page)
+    card = dict(DONE, validate={"how": "Sort the gadget list by price", "url": "/static/scratch/gadget-demo.html#x"})
+    assert hr.validate_picture_problem(card) is None
+
+
+def test_a_live_page_of_another_app_is_never_read_as_a_picture_page():
+    assert not hr.picture_only_page("http://127.0.0.1:8000/app/gadgets")
+    assert not hr.picture_only_page("/static/scratch/does-not-exist.html")
 
 
 # A picture wrapped in a page is still a picture: a scratch page whose body is
@@ -657,7 +696,7 @@ def test_the_done_guidance_says_a_screenshot_is_never_the_page_to_try():
 _FRAMED_ONLY = ('<!doctype html><html><head><title>Garden shed after the fix</title>'
                 '<style>img{max-width:100%}</style></head><body><p>The shed planner, captured '
                 'after the fix.</p><img src="/static/scratch/shed.png" alt="Shed"></body></html>')
-_GALLERY = ('<html><body><h1>Shed planner now</h1><div><img src="shed-web.png"><p>Web</p></div>'
+_SHED_GALLERY = ('<html><body><h1>Shed planner now</h1><div><img src="shed-web.png"><p>Web</p></div>'
             '<div style="background-image: url(shed-phone.png)"></div><p>Phone</p></body></html>')
 _LIVE_FRAME = ('<html><body><h1>Shed planner, live</h1><img src="logo.png">'
                '<iframe src="http://127.0.0.1:8123/sheds/7"></iframe></body></html>')
@@ -671,6 +710,7 @@ def scratch_page(tmp_path, monkeypatch):
     static = tmp_path / "static"
     (static / "scratch").mkdir(parents=True)
     monkeypatch.setattr(hr, "_STATIC_DIR", static)
+    monkeypatch.setattr(hr, "_SCRATCH_DIR", static / "scratch")
 
     def make(name, html):
         (static / "scratch" / name).write_text(html, encoding="utf-8")
@@ -678,14 +718,14 @@ def scratch_page(tmp_path, monkeypatch):
     return make
 
 
-@pytest.mark.parametrize("html", [_FRAMED_ONLY, _GALLERY])
+@pytest.mark.parametrize("html", [_FRAMED_ONLY, _SHED_GALLERY])
 def test_a_page_that_only_frames_a_screenshot_is_not_a_place_to_try(scratch_page, html):
     url = scratch_page("shed-after.html", html)
     card = dict(DONE, validate={"how": "Open the shed planner and add a door", "url": url + "#web"},
                 links=[{"label": "Shed planner", "kind": "image", "url": "/static/scratch/shed.png"}])
     reason = hr.validate_picture_problem(card)
-    assert reason and "only shows a screenshot" in reason and "LIVE place" in reason
-    assert any("only shows a screenshot" in p for p in hr.format_problems(card))
+    assert reason and "only shows a picture" in reason and "live page" in reason
+    assert any("only shows a picture" in p for p in hr.format_problems(card))
 
 
 @pytest.mark.parametrize("html", [_LIVE_FRAME, _REAL_DEMO, _LINKED, _LONG_TEXT])

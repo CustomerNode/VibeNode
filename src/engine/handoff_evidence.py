@@ -886,7 +886,7 @@ def _web_action(a: Action) -> bool:
 # this, an answer given from knowledge could never say "no tools used".
 # Only these three, never a bare "handoff": a web search for "agent handoff
 # reports" is research the card must report.
-_SUMMARY_WORK = re.compile(r"handoff_check|handoff-card|```handoff", re.I)
+_SUMMARY_WORK = re.compile(r"(?<![\w])handoff_check\b|handoff-card|```handoff", re.I)
 
 
 def research_problems(card: dict, facts: TurnFacts) -> list:

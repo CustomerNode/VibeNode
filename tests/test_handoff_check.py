@@ -326,3 +326,14 @@ def test_the_folder_is_the_one_claude_recorded_under_the_sessions_id(tmp_path, m
     assert hc.home_folder("sess-2") == ""
     assert hc.home_folder("missing") == ""
     assert hc.home_folder("") == ""
+
+
+# The check leaves its own calls out of the evidence, but a test run that
+# names a test file after it is the session's real work and must count.
+def test_a_test_run_naming_the_checks_test_file_is_still_evidence():
+    assert hc._SELF.search('python3 src/engine/handoff_check.py --start')
+    assert hc._SELF.search('python -m engine.handoff_check')
+    assert not hc._SELF.search('python3 -m pytest tests/test_handoff_check.py tests/test_widgets.py')
+    from engine import handoff_evidence as ev
+    assert ev._SUMMARY_WORK.search('python3 src/engine/handoff_check.py <<CARD')
+    assert not ev._SUMMARY_WORK.search('python3 -m pytest tests/test_handoff_check.py')
