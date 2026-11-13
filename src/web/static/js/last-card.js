@@ -2959,6 +2959,7 @@
   let _urlKey = _hasHistory ? (new URL(location.href).searchParams.get(_P) || '') : '';   // the panel in the URL, as last known
   let _lastBase = '';    // the URL without ?panel when this file last wrote a panel entry
   let _switching = false, _navClosing = false;
+  const _BACK_GRACE_MS = 1500;   // how long a step back may take before _panelClosed drops ?panel itself
   function _panelUrl(key) {
     const u = new URL(location.href);
     if (key) u.searchParams.set(_P, key); else u.searchParams.delete(_P);
@@ -2982,7 +2983,21 @@
     // Our own entry: step back over it, so Forward reopens the panel (the
     // popstate handler sees ?panel go and keeps the app's handlers out).  A
     // pasted link has no entry of ours behind it: drop the parameter in place.
-    if (history.state && history.state.vnPanel) { _lastBase = _panelUrl(null).href; history.back(); return; }
+    // Chrome can drop that step back (seen under heavy load, with the
+    // review's frame still loading): the panel closed but ?panel stayed, and
+    // a refresh of that entry reopened it.  If no popstate has taken the
+    // panel out of the URL a moment later, drop it in place.
+    if (history.state && history.state.vnPanel) {
+      const key = _urlKey;
+      _lastBase = _panelUrl(null).href;
+      history.back();
+      setTimeout(() => {
+        if (window.VNLastCard !== _api || _curKey || _urlKey !== key) return;   // stepped back, or a panel is open again
+        if ((new URL(location.href).searchParams.get(_P) || '') !== key) return;
+        _dropPanelParam();
+      }, _BACK_GRACE_MS);
+      return;
+    }
     _urlKey = '';
     const st = Object.assign({}, history.state || {});
     delete st.vnPanel;

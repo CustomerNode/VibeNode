@@ -147,6 +147,13 @@ async def _drive(url):
             await ev("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))")
             await until("!new URL(location.href).searchParams.get('panel')")
             out["review_escape"] = await ev(state)
+            # a step back the browser drops (seen under load): ?panel still goes
+            await ev("window.__back = history.back; history.back = () => {}")
+            await ev("document.querySelector('.lm-review').click()")
+            await ev("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))")
+            await until("!new URL(location.href).searchParams.get('panel')")
+            out["review_dropped_back"] = await ev(state)
+            await ev("history.back = window.__back")
             # decide: open, refresh reopens it
             await ev("document.querySelector('.lm-decide').click()")
             out["decide_open"] = await ev(state)
@@ -184,6 +191,7 @@ def test_full_screen_panels_follow_back_forward_and_refresh(site):
     assert r["img_closed"]["panel"] is None and not r["img_closed"]["view"]
     assert r["review_open"]["panel"] == "review:/other.html" and r["review_open"]["review"]
     assert r["review_escape"]["panel"] is None and not r["review_escape"]["review"]
+    assert r["review_dropped_back"]["panel"] is None and not r["review_dropped_back"]["review"]
     assert r["decide_open"]["panel"] == "decide:1" and r["decide_open"]["decide"]
     assert r["decide_reload"]["decide"]
     assert r["decide_back"]["panel"] is None and not r["decide_back"]["decide"]

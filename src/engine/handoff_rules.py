@@ -367,10 +367,11 @@ def visual_choice_problem(card: dict) -> Optional[str]:
             "app as it is today tagged data-option=\"now\", when there is one). Put the page "
             "in needs.look and give each reply \"screens\": [{\"label\": \"...\", \"url\": "
             "\"/static/scratch/<topic>.html#<key>\", \"device\": \"web|phone|both\"}]. "
-            "A screenshot per option (a \"kind\": \"image\" link) also works. In a project "
-            "whose instructions show options in its real app (design trials in that "
-            "app), follow them instead: each reply's \"screens\" are that app's live "
-            "pages on this machine, with their pictures in \"image\".")
+            "A screenshot per option (a \"kind\": \"image\" link) also works. When the choice "
+            "is about another project's app, build the variants IN that app (its design "
+            "trials when it has them) instead of redrawing it on a scratch page: each "
+            "reply's \"screens\" are that app's live pages on this machine, with their "
+            "pictures in \"image\".")
 
 
 _SHIP_IT = re.compile(r"\b(?:ship|look(?:s)?\s+(?:right|good|ok|okay|fine)|approve|accept|go\s+live|publish|"
@@ -2806,7 +2807,9 @@ or is presented (a design, layout, style, slides, a deck) must SHOW every \
 option before you ask: a scratch page of clickable mockups in needs.look and \
 each reply's "screens" pointing at its own section of that page \
 ("<page>.html#<id>"), shown live like the Now tab, never a screenshot. A file \
-to read is not a preview; such a card is sent back. An approval of something \
+to read is not a preview; such a card is sent back. When the choice is about \
+another project's app, the variants are built in that app and shown from it, \
+never redrawn by hand on a scratch page. An approval of something \
 the user must see ("ship the new dashboard?") puts ONE page to review in needs.look[0] \
 (the live page, or a review page in the scratch folder laying the screens out the way they \
 are judged: Before | After side by side for each place, each labelled) and at most two \

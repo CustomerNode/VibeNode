@@ -1767,6 +1767,135 @@ def direction_variants_problems(card: dict, facts: TurnFacts) -> list:
             "\"One version because\"."]
 
 
+# A design choice about an app that exists and runs (another project's own
+# product, which the session has been driving on this machine) is shown with
+# variants built IN that app: its own components, styles and data, on its live
+# pages (through its design-trial machinery when it has one), or pictures of
+# them.  A scratch page here that redraws the product by hand in its own HTML
+# and CSS is an imitation: it judges a picture of an idea, not the product, and
+# the pick then has to be rebuilt and judged again.  "The demo data is thin" is
+# not a reason: seed the dev copy.  A scratch page stays right for VibeNode
+# itself (its scratch pages load the real stylesheet) and for things with no
+# app (a deck, an image, copy), and a page that frames the real app (an
+# iframe, a picture of it, a page on its port) is the real product.
+_LOCAL_PORT = re.compile(r"(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\]):(\d{2,5})\b", re.I)
+# Words naming a part of a product's screen that the general visual-choice
+# pattern leaves out (it serves other checks, so it is not widened here).
+_SCREEN_WORDS = re.compile(r"\b(?:re-?design(?:s|ed|ing)?|windows?|pages?|panels?|views?|tabs?|cards?|forms?|"
+                           r"home\s*page|shows?|shown|showing|appears?|reads?\s+as)\b", re.I)
+_PRODUCT_DRAWN = re.compile(r"<(?:iframe|img|video|object|embed)\b", re.I)
+
+
+def _is_vibenode_folder(cwd: str) -> bool:
+    from pathlib import Path
+    try:
+        return (Path(cwd) / "src" / "engine" / "handoff_rules.py").is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def _app_ports_used(facts: TurnFacts) -> list:
+    """Local ports other than VibeNode's that this session's tool calls reached."""
+    from engine import handoff_rules
+    own = {handoff_rules._own_port(), "5050", "5051"}
+    ports = []
+    for a in getattr(facts, "actions", None) or ():
+        for txt in (getattr(a, "detail", "") or "", (getattr(a, "output", "") or "")[:20000]):
+            for p in _LOCAL_PORT.findall(txt):
+                if p not in own and p not in ports:
+                    ports.append(p)
+    return ports
+
+
+_NOT_APP_DIRS = {"node_modules", "venv", "cn_venv", "env", "build", "dist", "site-packages"}
+
+
+def _has_front_end(cwd: str) -> bool:
+    """The project folder holds a web app's front end of its own."""
+    from pathlib import Path
+    try:
+        level = [Path(cwd)]
+        for _ in range(3):   # the folder, its children and grandchildren
+            if any((d / "package.json").is_file() for d in level):
+                return True
+            level = [c for d in level for c in sorted(d.iterdir())[:200]
+                     if c.is_dir() and not c.name.startswith((".", "_")) and c.name not in _NOT_APP_DIRS]
+        return False
+    except (OSError, ValueError):
+        return False
+
+
+def _hand_drawn_variants(text: str, keys: list) -> list:
+    """The variant keys whose section of a scratch page shows no part of a real
+    app: no frame, picture or video, and no address on a local app's port."""
+    from engine import handoff_rules
+    own = {handoff_rules._own_port(), "5050", "5051"}
+    out = []
+    for k in keys:
+        sec = handoff_rules._section_html(text, k)
+        if not sec:
+            continue
+        if _PRODUCT_DRAWN.search(sec) or any(p not in own for p in _LOCAL_PORT.findall(sec)):
+            continue
+        out.append(k)
+    return out
+
+
+def real_product_problems(card: dict, facts: TurnFacts) -> list:
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    if needs.get("kind") != "decision":
+        return []
+    cwd = getattr(facts, "cwd", "") or ""
+    if not cwd or _is_vibenode_folder(cwd):
+        return []
+    from engine import handoff_rules
+    pages = []
+    for r in needs.get("replies") or []:
+        for sc in (r.get("screens") or []) if isinstance(r, dict) else []:
+            u = sc.get("url") if isinstance(sc, dict) else ""
+            if isinstance(u, str) and handoff_rules._MOCKUP_PAGE.match(u):
+                page = re.sub(r"[?#].*$", "", u)
+                if page not in pages:
+                    pages.append(page)
+    if not pages:
+        return []
+    naming = [card.get("title"), card.get("headline"), needs.get("ask")]
+    naming += [r.get("label") for r in needs.get("replies") or [] if isinstance(r, dict)]
+    said = " \n ".join(x for x in naming if isinstance(x, str))
+    if not (handoff_rules._VISUAL_CHOICE.search(said) or _SCREEN_WORDS.search(said)):
+        return []
+    ports = _app_ports_used(facts)
+    if not ports and not _has_front_end(cwd):
+        return []
+    drawn = []
+    for page in pages:
+        try:
+            f = (handoff_rules._SCRATCH_DIR / page.rsplit("/", 1)[-1]).resolve()
+            if f.parent != handoff_rules._SCRATCH_DIR.resolve() or not f.is_file():
+                continue
+            text = f.read_text(encoding="utf-8", errors="replace")[:600_000]
+        except OSError:
+            continue
+        keys = [k for k in dict.fromkeys(m.strip() for m in handoff_rules._OPTION_ATTR.findall(text))
+                if k.lower() != "now"]
+        if len(keys) < 2:
+            continue
+        bad = _hand_drawn_variants(text, keys)
+        if len(bad) * 2 >= len(keys):
+            drawn.append((page.rsplit("/", 1)[-1], bad))
+    if not drawn:
+        return []
+    page, bad = drawn[0]
+    return [f"These variants are drawn by hand on a scratch page ({page}: {', '.join(bad[:4])} show no part of the "
+            f"real app), but this session works on a project with an app of its own"
+            + (f" (running on this machine, port {', '.join(ports[:3])})" if ports else "") + ". A design choice about that app is shown with real product variants: build "
+            "each one IN the app, from its own components, styles and data (through the project's design-trial "
+            "way of showing options when it has one), and give each reply \"screens\" on the app's live page "
+            "(\"http://127.0.0.1:<port>/...\") with its pictures in \"image\", or frame the live app or its "
+            "screenshots on the scratch page. Too little data to show it is not a reason to imitate it: add "
+            "realistic data to the dev copy first."]
+
+
 def problems(card: dict, facts: Optional[TurnFacts]) -> list:
     if not isinstance(card, dict):
         return []
@@ -1779,4 +1908,4 @@ def problems(card: dict, facts: Optional[TurnFacts]) -> list:
             + working_problems(card, facts) + redo_kind_problems(card, facts) + open_choice_problems(card, facts)
             + ship_ask_problems(card, facts)
             + one_version_problems(card, facts) + refine_variants_problems(card, facts)
-            + direction_variants_problems(card, facts))
+            + direction_variants_problems(card, facts) + real_product_problems(card, facts))
