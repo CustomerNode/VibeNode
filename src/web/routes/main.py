@@ -316,6 +316,12 @@ def restart_server():
         if not ports:
             ports = [web_port]
 
+        # Tell the Start page this outage is planned: it shows "Restarting"
+        # instead of the outage page and starts VibeNode itself if the web
+        # server does not come back (shared/planned_restart.py).
+        from shared import planned_restart
+        planned_restart.write(scope, data.get("reason", ""))
+
         # Launch via session_manager.py (not run.py) so the boot splash shows
         entry_script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "launcher", "session_manager.py")
         entry_script = os.path.abspath(entry_script)
@@ -449,9 +455,17 @@ def restart_server():
             # single-quoted args here.  Newlines in ``target_pids`` are
             # handled by word-splitting in ``for _pid in $target_pids``,
             # which is bash's default IFS behavior.
+            #
+            # LISTENERS ONLY (``-sTCP:LISTEN``).  A bare ``lsof -ti :5051``
+            # also lists every process with a CONNECTION to that port: the
+            # web server is the Session Engine's client, so an engine-only
+            # restart killed the web server too and the reviver's Stopped
+            # page appeared on its own.  On 5050 a bare match also catches
+            # the browser's connections.  Only the process serving the port
+            # is the one being restarted.
             kill_cmds = (
                 f"target_pids=$(for _pp in {port_list_bash}; do "
-                "lsof -ti :$_pp 2>/dev/null; done | sort -u); "
+                "lsof -ti tcp:$_pp -sTCP:LISTEN 2>/dev/null; done | sort -u); "
                 "for _i in $(seq 1 10); do "
                 "_alive=; "
                 "for _pid in $target_pids; do "

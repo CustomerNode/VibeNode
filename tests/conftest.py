@@ -476,6 +476,11 @@ os.environ["VIBENODE_OWNER_FILE"] = os.path.join(tempfile.gettempdir(), "vibenod
 # the suite's made-up summaries must never write into data/card_pictures.
 # tests/test_card_pictures.py points it at a temp folder per test.
 os.environ["VIBENODE_CARD_PICTURES"] = "0"
+# A test that calls /api/restart must never leave a restart note where the
+# real Start page reads it (src/shared/planned_restart.py): the page would
+# say "restarting" and could start VibeNode by itself.
+os.environ["VIBENODE_PLANNED_RESTART_FILE"] = os.path.join(
+    tempfile.gettempdir(), "vibenode-test-planned-restart-%d.json" % os.getpid())
 # The suite's own tests of the publish gate must never find a real passing-run
 # record and skip the run they are testing (src/web/gate_reuse.py); nested pytest
 # runs the suite starts must not write records either.  tests/test_gate_reuse.py

@@ -250,7 +250,7 @@ class TestPycacheCleanupPrunesVenv:
         src = _MAIN_PY.read_text(encoding="utf-8")
         # Kill loop preserved (both platforms).
         assert "Get-NetTCPConnection -LocalPort" in src
-        assert "lsof -ti :" in src
+        assert "lsof -ti tcp:$_pp -sTCP:LISTEN" in src
         # Preserve-daemon plumbing preserved (both platforms).
         assert "$env:VIBENODE_PRESERVE_DAEMON='1'" in src
         assert "export VIBENODE_PRESERVE_DAEMON=1" in src
@@ -1149,3 +1149,51 @@ class TestRestartKillLoopCapturesInitialPids:
                         p.wait(timeout=5)
                 except Exception:
                     pass
+
+
+class TestEngineRestartSparesTheWebServer:
+    """An engine-only restart must not kill the web server.
+
+    The web server holds a client connection to the Session Engine's
+    port, so a kill list built from a bare ``lsof -ti :<port>`` included
+    it and every automatic engine restart left the Stopped page up.
+    """
+
+    def test_kill_list_matches_listeners_only(self):
+        src = _MAIN_PY.read_text(encoding="utf-8")
+        assert "lsof -ti :$_pp" not in src
+        assert "lsof -ti tcp:$_pp -sTCP:LISTEN" in src
+
+    def test_the_query_leaves_out_a_connected_client(self):
+        import shutil
+        import socket
+        import subprocess
+        import sys
+
+        if sys.platform == "win32" or not shutil.which("lsof"):
+            pytest.skip("needs lsof")
+        server = subprocess.Popen(
+            [sys.executable, "-c",
+             "import socket,sys,time\n"
+             "s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen()\n"
+             "print(s.getsockname()[1], flush=True)\n"
+             "c,_=s.accept(); time.sleep(30)\n"],
+            stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            port = int(server.stdout.readline())
+            client = socket.create_connection(("127.0.0.1", port))
+            try:
+                bare = subprocess.run(["bash", "-c", f"lsof -ti :{port}"],
+                                      capture_output=True, text=True).stdout.split()
+                listen = subprocess.run(
+                    ["bash", "-c", f"_pp={port}; lsof -ti tcp:$_pp -sTCP:LISTEN"],
+                    capture_output=True, text=True).stdout.split()
+            finally:
+                client.close()
+            me = str(__import__("os").getpid())
+            assert me in bare  # the old query caught the client
+            assert listen == [str(server.pid)]
+        finally:
+            server.kill()
+            server.wait()

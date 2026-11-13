@@ -164,6 +164,8 @@ KNOBS = [
     ("VIBENODE_WEB_PORT", "Ports and paths", "5050", "Web server port."),
     ("VIBENODE_DAEMON_PORT", "Ports and paths", "5051", "Session Engine IPC port."),
     ("VIBENODE_REVIVER_PORT", "Ports and paths", "5052", "Control port of the reviver process."),
+    ("VIBENODE_PLANNED_RESTART_FILE", "Ports and paths", "data/planned_restart.json", "Where a restart notes it is planned, so the Start page shows Restarting instead of Stopped."),
+    ("VIBENODE_PLANNED_COMEBACK_SECONDS", "Ports and paths", "25", "How long a planned restart may leave the page down before the Start page starts VibeNode itself."),
     ("VIBENODE_TEST_PORT", "Ports and paths", "",
      "Start a separate test instance on this port (skips the daemon spawn and the browser)."),
     ("VIBENODE_DIR", "Ports and paths", "",

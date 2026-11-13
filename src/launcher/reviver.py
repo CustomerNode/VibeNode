@@ -130,6 +130,58 @@ def _log(msg: str) -> None:
 # VibeNode is down; that is often the whole reason the reviver is needed).
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Planned restarts (shared/planned_restart.py, loaded by path: this file runs
+# through runpy without src/ on sys.path). Fails closed to "not planned", so
+# a broken helper never hides the outage page.
+# ---------------------------------------------------------------------------
+
+_planned_mod = None
+
+
+def _planned_restart() -> dict | None:
+    """The restart note while a restart VibeNode asked for is in progress."""
+    global _planned_mod
+    try:
+        if _planned_mod is None:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "_vn_planned_restart",
+                _LAUNCHER.parent / "shared" / "planned_restart.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            _planned_mod = mod
+        return _planned_mod.fresh()
+    except Exception:
+        return None
+
+
+def _comeback_seconds() -> float:
+    try:
+        return float(os.environ.get("VIBENODE_PLANNED_COMEBACK_SECONDS", "")
+                     or getattr(_planned_mod, "COMEBACK_SECONDS", 25))
+    except ValueError:
+        return 25.0
+
+
+# This file and the helper it loads: when either changes on disk the reviver
+# re-runs itself while dormant, so a fix here is live without anyone
+# restarting it by hand.
+_OWN_CODE = (Path(__file__).resolve(),
+             _LAUNCHER.parent / "shared" / "planned_restart.py")
+
+
+def _code_stamp() -> tuple:
+    out = []
+    for f in _OWN_CODE:
+        try:
+            st = f.stat()
+            out.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
 def _config_path() -> Path:
     env = os.environ.get("VIBENODE_CONFIG")
     return Path(env) if env else _HERE / "kanban_config.json"
@@ -654,6 +706,10 @@ class Reviver:
         # Set by the phone-side POST /start handler; the main loop consumes it
         # so the yield+launch happens off the serve thread (no self-deadlock).
         self._start_requested = threading.Event()
+        # The restart note this reviver already started VibeNode for, so a
+        # planned restart that fails is launched once, never in a loop.
+        self._planned_launched_at = None
+        self._code_stamp = _code_stamp()
 
     # ---- serve server (port 5050) lifecycle ----
 
@@ -757,10 +813,19 @@ class Reviver:
                         self._state = "dormant"  # re-evaluated below
                 # else: keep waiting quietly
             elif serving:
-                # We are the Start page. If a real server somehow took 5050
-                # anyway, our next bind attempt would fail — but normally we
-                # hold it until a yield. Nothing to do here.
-                pass
+                # We are the Start page. A restart VibeNode asked for that has
+                # not brought the web server back gets started here, once, the
+                # way the Start button does: nobody should have to press Start
+                # for an outage VibeNode caused on purpose.
+                planned = _planned_restart()
+                if planned is not None:
+                    at = planned.get("at")
+                    if (at != self._planned_launched_at
+                            and time.time() - float(at or 0) >= _comeback_seconds()):
+                        self._planned_launched_at = at
+                        _log("planned %s restart did not come back — starting "
+                             "VibeNode" % planned.get("scope", "?"))
+                        self.yield_now(launch=True)
             else:
                 # dormant / idle: is the real web server present?
                 if not _something_listening(WEB_PORT):
@@ -770,7 +835,21 @@ class Reviver:
                         if self._state != "serving":
                             self._state = "dormant"
 
+            # New code on disk: re-run it, but only while dormant (the real
+            # app is up), so the Start page is never dropped mid-outage.
+            if state == "dormant" and not serving and _code_stamp() != self._code_stamp:
+                self._reexec()
+
             time.sleep(_POLL_SECONDS)
+
+    def _reexec(self) -> None:
+        _log("reviver code changed — re-running it")
+        try:
+            os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())]
+                     + sys.argv[1:])
+        except Exception as e:
+            self._code_stamp = _code_stamp()   # don't retry every poll
+            _log("re-run failed (%s) — keeping the running copy" % e)
 
 
 # ---------------------------------------------------------------------------
@@ -926,6 +1005,23 @@ def _starting_page(device: str) -> bytes:
 </body></html>""".encode("utf-8")
 
 
+def _restarting_page(device: str) -> bytes:
+    """Shown while a restart VibeNode asked for is in progress: not an outage.
+
+    Same look as the Starting page; it says what is happening and takes the
+    user back in by itself. The reviver starts VibeNode if it does not return.
+    """
+    page = _starting_page(device).decode("utf-8")
+    page = page.replace("<title>Starting %s…</title>" % device,
+                        "<title>%s: VibeNode is restarting</title>" % device)
+    page = page.replace(
+        "<h1>Starting VibeNode…</h1>\n    <p>This can take a few seconds. "
+        "You'll be taken in automatically.</p>",
+        "<h1>VibeNode is restarting</h1>\n    <p>A planned restart, nothing is "
+        "wrong. Your sessions keep running and this page returns by itself.</p>")
+    return page.encode("utf-8")
+
+
 class _ServeHandler(BaseHTTPRequestHandler):
     server_version = "VibeNodeReviver"
 
@@ -959,6 +1055,8 @@ class _ServeHandler(BaseHTTPRequestHandler):
         # refresh doesn't look like nothing happened.
         if rev is not None and rev._start_requested.is_set():
             self._send(_starting_page(device))
+        elif _planned_restart() is not None:
+            self._send(_restarting_page(device))
         else:
             self._send(_start_page(device))
 
@@ -986,7 +1084,12 @@ class _ControlServer(ThreadingHTTPServer):
     guarantee. We force an exclusive bind so a duplicate reliably fails and the
     extra reviver retires."""
 
-    allow_reuse_address = False
+    # Off on Windows (see above). On Linux and macOS SO_REUSEADDR never lets
+    # two processes LISTEN on one port, so it keeps the singleton guarantee,
+    # and without it a reviver that restarts (or re-runs new code) cannot bind
+    # for about a minute while the old one's closed connections linger in
+    # TIME_WAIT: every respawn exited as "another reviver is running".
+    allow_reuse_address = sys.platform != "win32"
 
     def server_bind(self):
         if sys.platform == "win32":
