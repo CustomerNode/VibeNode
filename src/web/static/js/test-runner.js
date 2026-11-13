@@ -109,14 +109,14 @@ function _streamTestRun(mode, handlers) {
 
 function runTests(mode) {
   if (_testRunning) {
-    showGitSyncModal('Tests Running', '<p style="color:var(--text-muted)">Tests are already running. Cancel the current run first.</p>', [
-      {label: 'Cancel Tests', primary: false, onclick: () => { cancelTests(); }},
-      {label: 'OK', onclick: closeGitSyncModal}
+    showGitSyncModal('Tests already running', '<p>Tests are already running. Cancel the current run first.</p>', [
+      {label: 'Cancel tests', onclick: () => { cancelTests(); }},
+      {label: 'OK', primary: true, onclick: closeGitSyncModal}
     ]);
     return;
   }
 
-  const label = mode === 'fast' ? 'Run Tests (Fast)' : 'Run Tests (Full)';
+  const label = mode === 'fast' ? 'Fast tests' : 'Full tests';
   const desc = mode === 'fast'
     ? 'Running unit and API tests...'
     : 'Running the full test suite with the longer per-test timeout...';
@@ -124,7 +124,7 @@ function runTests(mode) {
   _testRunning = true;
 
   // Show the animated modal
-  showGitSyncModal(label, _testRunnerHtml(desc), []);
+  showGitSyncModal('Running ' + label.toLowerCase(), _testRunnerHtml(desc), [], {center: true});
 
   _streamTestRun(mode, {
     onLine: lines => _updateTestOutput(lines),
@@ -132,11 +132,11 @@ function runTests(mode) {
     onError: (msg, info) => {
       if (info && info.lost) {
         _testRunning = false;
-        showGitSyncModal(label + ' — Interrupted',
-          '<p style="color:var(--text-muted)">' + _escTestHtml(msg)
-          + ' Its result was not received.</p>',
-          [{label: 'Run again', primary: true, onclick: () => { closeGitSyncModal(); runTests(mode); }},
-           {label: 'Close', onclick: closeGitSyncModal}]);
+        showGitSyncModal(label + ' interrupted',
+          '<p>' + _escTestHtml(msg) + ' Its result was not received.</p>',
+          [{label: 'Close', onclick: closeGitSyncModal},
+           {label: 'Run again', primary: true, onclick: () => { closeGitSyncModal(); runTests(mode); }}],
+          {tone: 'bad'});
       } else {
         _showTestError(label, msg);
       }
@@ -237,60 +237,41 @@ function _showTestResults(label, summary, lines) {
   const btns = [];
 
   if (summary.ok) {
-    body = '<div style="text-align:center;padding:16px 0;">'
-      + '<div style="font-weight:600;color:var(--accent-green,#4ecdc4);font-size:16px;">All Tests Passed</div>'
-      + '<div style="font-size:13px;color:var(--text-muted);margin-top:6px;">'
-      + summary.passed + ' passed'
-      + (summary.skipped ? ', ' + summary.skipped + ' skipped' : '')
-      + '</div>'
-      // Reuse (src/web/gate_reuse.py): say when the run was not repeated.
-      + (summary.reused_from
-        ? '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;">Reused the full run that passed at ' + escHtml(summary.reused_from) + ' on identical files.</div>'
-        : (summary.ab_reused_from
-          ? '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;">A/B tests reused from ' + escHtml(summary.ab_reused_from) + ': nothing they depend on changed.</div>'
-          : ''))
-      + '</div>';
-    btns.push({label: 'OK', primary: true, onclick: closeGitSyncModal});
+    // Reuse (src/web/gate_reuse.py): say when the run was not repeated.
+    const reuse = summary.reused_from
+      ? ' Reused the full run that passed at ' + escHtml(summary.reused_from) + ' on identical files.'
+      : (summary.ab_reused_from
+        ? ' A/B tests reused from ' + escHtml(summary.ab_reused_from) + ': nothing they depend on changed.'
+        : '');
+    body = _gsRing({pct: 100, tone: 'ok', big: (summary.passed || 0).toLocaleString(), desc: 'tests passed',
+      counts: (summary.skipped ? summary.skipped + ' skipped.' : '') + reuse || null});
+    btns.push({label: 'Done', primary: true, onclick: closeGitSyncModal});
   } else {
-    // Show failure summary + scrollable output
-    body = '<div style="text-align:center;padding:8px 0;">'
-      + '<div style="font-weight:600;color:var(--result-err,#ff4444);font-size:16px;">'
-      + summary.failed + ' Test' + (summary.failed !== 1 ? 's' : '') + ' Failed</div>'
-      + '<div style="font-size:13px;color:var(--text-muted);margin-top:4px;">'
-      + summary.passed + ' passed, ' + summary.failed + ' failed'
-      + (summary.errors ? ', ' + summary.errors + ' errors' : '')
-      + (summary.skipped ? ', ' + summary.skipped + ' skipped' : '')
-      + '</div></div>';
+    body = _gsRing({pct: 100, tone: 'bad', big: (summary.failed || 0) + ' failed',
+      desc: summary.passed + ' passed, ' + summary.failed + ' failed'
+        + (summary.errors ? ', ' + summary.errors + ' errors' : '')
+        + (summary.skipped ? ', ' + summary.skipped + ' skipped' : '')});
 
     // Show the failure lines
     const failLines = lines.filter(l =>
       l.startsWith('FAILED') || l.startsWith('ERROR') || l.includes('AssertionError') || l.includes('assert ')
     );
     if (failLines.length > 0) {
-      body += '<pre style="text-align:left;font-size:10px;font-family:monospace;'
-        + 'max-height:250px;overflow-y:auto;background:rgba(255,60,60,0.06);'
-        + 'border:1px solid rgba(255,60,60,0.15);border-radius:6px;'
-        + 'padding:8px 10px;margin-top:10px;color:var(--text-secondary);'
-        + 'white-space:pre-wrap;word-break:break-all;">'
-        + failLines.map(l => _escTestHtml(l)).join('\n')
-        + '</pre>';
+      body += '<pre class="gs-pre">' + failLines.map(l => _escTestHtml(l)).join('\n') + '</pre>';
     }
 
-    btns.push({label: 'OK', onclick: closeGitSyncModal});
+    btns.push({label: 'Done', primary: true, onclick: closeGitSyncModal});
   }
 
-  showGitSyncModal(
-    summary.ok ? label + ' \u2713' : label + ' \u2014 Failures Found',
-    body,
-    btns
-  );
+  showGitSyncModal(summary.ok ? 'All tests passed' : 'Tests failed', body, btns,
+    {center: true, tone: summary.ok ? 'ok' : 'bad', sticky: !summary.ok});
 }
 
 function _showTestError(label, msg) {
   _testRunning = false;
-  showGitSyncModal(label + ' \u2014 Error',
-    '<p style="color:var(--result-err)">' + _escTestHtml(msg) + '</p>',
-    [{label: 'OK', onclick: closeGitSyncModal}]);
+  showGitSyncModal('Tests could not run',
+    '<p>' + _escTestHtml(msg) + '</p>',
+    [{label: 'OK', primary: true, onclick: closeGitSyncModal}], {tone: 'bad'});
 }
 
 function cancelTests() {

@@ -91,23 +91,110 @@ async function _testModes() {
   return _testModesCache || _TEST_MODE_FALLBACK;
 }
 
-function _gateOptionsHtml(modes, verb) {
-  return '<p style="color:var(--text-muted);font-size:12px;margin-top:8px">'
-    + 'Run regression tests before ' + verb + '?</p>'
-    + '<ul style="margin:4px 0 0 16px;color:var(--text-muted);font-size:11px;line-height:1.5">'
-    + '<li>' + escHtml(modes.fast.label) + '</li>'
-    + '<li>' + escHtml(modes.full.label) + '</li>'
-    + '<li>Skip: no tests run; the commit message says so.</li></ul>';
+// ── The dialog's parts ──
+// Every screen is built from the shared dialog parts (.pm-*) and the test ring
+// (.trun, test-runner.js), so it matches Preferences and Recovery & Watchdog.
+const _GS_RC = 2 * Math.PI * 52;
+const _GS_ICON = {
+  check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
+  x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg>',
+};
+
+/** The ring with a big line, a description and a count line under it.
+ *  o: {pct, tone: 'ok'|'bad'|'', big, mark, desc, counts, spin, file}
+ *  mark: an icon drawn inside the ring (a finished result). */
+function _gsRing(o) {
+  const off = (_GS_RC * (1 - (o.pct || 0) / 100)).toFixed(2);
+  const ring = o.tone === 'ok' ? ' trun-ring-ok' : o.tone === 'bad' ? ' trun-ring-bad' : '';
+  const big = o.tone === 'ok' ? ' trun-ok' : o.tone === 'bad' ? ' trun-bad' : '';
+  return '<div class="trun"><div class="gs-ringwrap">'
+    + '<svg class="trun-ring' + (o.spin ? ' gs-spin' : '') + '" id="gs-ring-svg" viewBox="0 0 120 120" aria-hidden="true">'
+    +   '<circle class="trun-ring-track" cx="60" cy="60" r="52"/>'
+    +   '<circle class="trun-ring-fill' + ring + '" id="gs-ring" cx="60" cy="60" r="52"'
+    +     ' stroke-dasharray="' + _GS_RC.toFixed(2) + '" stroke-dashoffset="' + off + '"/>'
+    + '</svg>'
+    + (o.mark ? '<div class="gs-mark' + big + '">' + o.mark + '</div>' : '')
+    + '</div>'
+    + '<div class="trun-pct' + big + '" id="gs-big">' + (o.big || '') + '</div>'
+    + (o.desc != null ? '<div class="trun-desc" id="sync-step-label">' + o.desc + '</div>' : '')
+    + (o.counts != null ? '<div class="trun-counts" id="scan-progress-text">' + o.counts + '</div>' : '')
+    + (o.file ? '<div class="gs-file" id="scan-file-name"></div>' : '')
+    + '</div>';
 }
 
-function _summaryFieldHtml() {
-  return '<label for="git-publish-summary" style="display:block;margin-top:10px;font-size:12px;color:var(--text-muted)">'
-    + 'What changed? (one line, optional)</label>'
-    + '<input id="git-publish-summary" type="text" maxlength="120" autocomplete="off" '
-    + 'placeholder="Left empty: areas and file count are filled in for you" '
-    + 'style="width:100%;box-sizing:border-box;margin-top:4px;padding:6px 8px;font-size:13px;'
-    + 'background:var(--bg-input,rgba(255,255,255,0.06));color:var(--text-primary,#eee);'
-    + 'border:1px solid var(--border,rgba(255,255,255,0.15));border-radius:6px">';
+/** Move the ring to a known percentage. */
+function _gsProgress(pct) {
+  const svg = document.getElementById('gs-ring-svg');
+  const fill = document.getElementById('gs-ring');
+  const big = document.getElementById('gs-big');
+  if (svg) svg.classList.remove('gs-spin');
+  if (fill) fill.setAttribute('stroke-dashoffset', (_GS_RC * (1 - pct / 100)).toFixed(2));
+  if (big) big.textContent = Math.round(pct) + '%';
+}
+
+/** A step whose length nobody knows (the git operation): the ring turns. */
+function _gsSpin() {
+  const svg = document.getElementById('gs-ring-svg');
+  const fill = document.getElementById('gs-ring');
+  const big = document.getElementById('gs-big');
+  if (svg) svg.classList.add('gs-spin');
+  if (fill) fill.setAttribute('stroke-dashoffset', (_GS_RC * 0.72).toFixed(2));
+  if (big) big.textContent = '';
+}
+
+/** Words for each action, from the button label the callers pass. */
+function _gsWords(label) {
+  if (/^Sync/.test(label)) return {ing: 'Syncing', ed: 'Synced', not: 'Not synced', verb: 'sync', Verb: 'Sync'};
+  if (/^Update/.test(label)) return {ing: 'Updating', ed: 'Updated', not: 'Not updated', verb: 'update', Verb: 'Update'};
+  return {ing: 'Publishing', ed: 'Published', not: 'Not published', verb: 'publish', Verb: 'Publish'};
+}
+
+/** How many things the scan stopped on, for the big line. */
+function _gsFound(scan) {
+  const n = ((scan && scan.findings) || []).length + ((scan && scan.blocked_files) || []).length;
+  return (n || 1) + ' found';
+}
+
+/** What changed, and which tests run first: Fast, Full or Skip. */
+function _gateChoiceHtml(modes, verb) {
+  const hint = {fast: modes.fast.label, full: modes.full.label, skip: 'Skip: no tests run; the commit message says so.'};
+  return '<input id="git-publish-summary" class="pm-input" type="text" maxlength="120" autocomplete="off" '
+    + 'aria-label="What changed? (one line, optional)" placeholder="What changed? Optional, written for you if empty">'
+    + '<div class="gs-label">Tests before ' + verb + '</div>'
+    + '<div class="gs-choice" id="gs-gate" role="radiogroup">'
+    + [['fast', 'Fast'], ['full', 'Full'], ['skip', 'Skip']].map(([k, l], i) =>
+        '<button type="button" role="radio" aria-checked="' + (i === 0) + '" data-gate="' + k + '"'
+        + ' data-hint="' + escHtml(hint[k]) + '" class="pm-btn ' + (i === 0 ? 'pm-btn-primary' : 'pm-btn-secondary') + '"'
+        + ' onclick="_gsPickGate(this)">' + l + '</button>').join('')
+    + '</div><div class="gs-hint" id="gs-gate-hint">' + escHtml(hint.fast) + '</div>';
+}
+
+function _gsPickGate(btn) {
+  btn.parentElement.querySelectorAll('[data-gate]').forEach(b => {
+    const on = b === btn;
+    b.classList.toggle('pm-btn-primary', on);
+    b.classList.toggle('pm-btn-secondary', !on);
+    b.setAttribute('aria-checked', String(on));
+  });
+  const hint = document.getElementById('gs-gate-hint');
+  if (hint) hint.textContent = btn.dataset.hint || '';
+}
+
+function _gsSelectedGate() {
+  const on = document.querySelector('#gs-gate [aria-checked="true"]');
+  return on ? on.dataset.gate : 'fast';
+}
+
+/** Run the chosen gate, then the git action. */
+function _gsGo(actionType, actionLabel, btnId) {
+  _readSummaryField();
+  const mode = _gsSelectedGate();
+  if (mode === 'skip') {
+    _publishGate = {mode: 'skipped'};
+    executeGitAction('both', btnId, actionLabel);
+  } else {
+    _testThenAction(mode, actionType, actionLabel, btnId);
+  }
 }
 
 /** Read the summary field before the dialog body is replaced. */
@@ -121,8 +208,8 @@ async function openGitPublish() {
   const s = _gitStatus;
   const hasPush = s.ahead > 0 || s.uncommitted;
   if (!hasPush) {
-    showGitSyncModal('Publish App Update', '<p style="color:var(--text-muted)">Nothing to publish \u2014 your app is already up to date on remote.</p>',
-      [{label:'OK', onclick: closeGitSyncModal}]);
+    showGitSyncModal('Nothing to publish', '<p>Your app is already up to date on remote.</p>',
+      [{label: 'OK', primary: true, onclick: closeGitSyncModal}]);
     return;
   }
   // Branch guard FIRST — before any publish/test options are shown.
@@ -130,24 +217,17 @@ async function openGitPublish() {
     _showBranchWarning('both', 'btn-git-publish', 'Publish App Update', s);
     return;
   }
-  let body = '<p>Your local changes are ready to publish.</p>'
-    + '<p style="color:var(--text-muted);font-size:12px">They will be saved and uploaded to remote automatically.</p>';
-  if (s.behind > 0) {
-    body += '<p style="color:var(--text-muted);font-size:12px;margin-top:8px">'
-      + s.behind + ' remote update(s) will be pulled in first, then your changes pushed.</p>';
-  }
-  const modes = await _testModes();
-  body += _summaryFieldHtml() + _gateOptionsHtml(modes, 'publishing');
+  const what = s.ahead > 0
+    ? '<strong>' + s.ahead + ' change' + (s.ahead === 1 ? '' : 's') + '</strong>' + (s.uncommitted ? ' plus unsaved edits' : '')
+    : 'Your unsaved edits';
+  let body = '<p>' + what + ' will be saved, checked for keys and personal details, then uploaded.'
+    + (s.behind > 0 ? ' ' + s.behind + ' remote update' + (s.behind === 1 ? ' is' : 's are') + ' pulled in first.' : '')
+    + '</p>';
+  body += _gateChoiceHtml(await _testModes(), 'publishing');
   _publishGate = null;
-  showGitSyncModal('Publish App Update', body, [
-    {label: 'Fast tests + Publish', primary: true, onclick: () => { _readSummaryField(); _testThenPublish('fast'); }},
-    {label: 'Full tests + Publish', onclick: () => { _readSummaryField(); _testThenPublish('full'); }},
-    {label: 'Skip & Publish', onclick: () => {
-      _readSummaryField();
-      _publishGate = {mode: 'skipped'};
-      executeGitAction('both', 'btn-git-publish', 'Publish App Update');
-    }},
-    {label: 'Cancel', onclick: closeGitSyncModal}
+  showGitSyncModal('Publish your changes', body, [
+    {label: 'Cancel', onclick: closeGitSyncModal},
+    {label: 'Publish', primary: true, onclick: () => _gsGo('publish', 'Publish App Update', 'btn-git-publish')},
   ]);
 }
 
@@ -163,20 +243,15 @@ async function openGitSyncBoth() {
     _showBranchWarning('both', 'btn-git-sync', 'Sync App', s);
     return;
   }
-  let body = '<p><b style="color:var(--text-heading)">' + s.behind + ' update(s)</b> to pull and '
-    + '<b style="color:var(--text-heading)">' + (s.ahead + (s.uncommitted ? 1 : 0)) + ' change(s)</b> to push.</p>'
-    + '<p style="color:var(--text-muted);font-size:12px">Remote updates will be pulled first, merge conflicts resolved automatically, then your changes pushed.</p>'
-    + _summaryFieldHtml() + _gateOptionsHtml(await _testModes(), 'syncing');
+  const out = s.ahead + (s.uncommitted ? 1 : 0);
+  const body = '<p><strong>' + s.behind + ' update' + (s.behind === 1 ? '' : 's') + '</strong> to pull in and '
+    + '<strong>' + out + ' change' + (out === 1 ? '' : 's') + '</strong> to publish. Updates come in first; '
+    + 'if a line changed on both sides, it stops and asks.</p>'
+    + _gateChoiceHtml(await _testModes(), 'syncing');
   _publishGate = null;
-  showGitSyncModal('Sync App', body, [
-    {label: 'Fast tests + Sync', primary: true, onclick: () => { _readSummaryField(); _testThenSync('fast'); }},
-    {label: 'Full tests + Sync', onclick: () => { _readSummaryField(); _testThenSync('full'); }},
-    {label: 'Skip & Sync', onclick: () => {
-      _readSummaryField();
-      _publishGate = {mode: 'skipped'};
-      executeGitAction('both', 'btn-git-sync', 'Sync App');
-    }},
-    {label: 'Cancel', onclick: closeGitSyncModal}
+  showGitSyncModal('Sync VibeNode', body, [
+    {label: 'Cancel', onclick: closeGitSyncModal},
+    {label: 'Sync', primary: true, onclick: () => _gsGo('sync', 'Sync App', 'btn-git-sync')},
   ]);
 }
 
@@ -289,22 +364,22 @@ function _legacyCopy(text) {
 
 function _testThenAction(mode, actionType, actionLabel, btnId) {
   closeGitSyncModal();
-  const testLabel = mode === 'fast' ? 'Fast Tests' : 'Full Tests';
+  const W = _gsWords(actionLabel);
   const verb = actionType === 'publish' ? 'publish' : 'sync';
-  const desc = 'Running ' + (mode === 'fast' ? 'fast' : 'full') + ' tests before ' + verb + '...';
   const Verb = verb.charAt(0).toUpperCase() + verb.slice(1);
+  const desc = (mode === 'fast' ? 'Fast' : 'Full') + ' tests · ' + verb + (verb === 'publish' ? 'es' : 's') + ' when they pass';
 
   if (typeof _testRunning !== 'undefined' && _testRunning) {
-    showGitSyncModal('Tests Running', '<p style="color:var(--text-muted)">Tests are already running in this tab. '
+    showGitSyncModal('Tests already running', '<p>Tests are already running in this tab. '
       + 'The earlier run carries on and reports when it finishes.</p>',
-      [{label: 'Cancel Tests', onclick: () => { if (typeof cancelTests === 'function') cancelTests(); }},
+      [{label: 'Cancel tests', onclick: () => { if (typeof cancelTests === 'function') cancelTests(); }},
        {label: 'OK', primary: true, onclick: closeGitSyncModal}]);
     return;
   }
 
   if (typeof _testRunning !== 'undefined') _testRunning = true;
 
-  showGitSyncModal(testLabel + ' Before ' + Verb, typeof _testRunnerHtml === 'function' ? _testRunnerHtml(desc) : '<p>' + desc + '</p>', []);
+  showGitSyncModal(W.ing, typeof _testRunnerHtml === 'function' ? _testRunnerHtml(desc) : '<p>' + desc + '</p>', [], {center: true});
 
   const startedAt = Date.now();
   // The run lives on the server and survives a dropped connection; the
@@ -332,13 +407,12 @@ function _testThenAction(mode, actionType, actionLabel, btnId) {
       if (d.ab_reused_from) _publishGate.ab_reused_from = d.ab_reused_from;
       if (d.ok) {
         const reuseNote = d.reused_from
-          ? '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;">Reused the full run that passed at ' + escHtml(d.reused_from) + ' on identical files.</div>'
+          ? 'Reused the full run that passed at ' + escHtml(d.reused_from) + ' on identical files.'
           : (d.ab_reused_from
-            ? '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;">A/B tests reused from ' + escHtml(d.ab_reused_from) + ': nothing they depend on changed.</div>'
-            : '');
-        showGitSyncModal('Tests Passed \u2713', '<div style="text-align:center;padding:12px 0;">'
-          + '<div style="font-weight:600;color:var(--accent-green,#4ecdc4);">'
-          + d.passed + ' tests passed \u2014 proceeding to ' + verb + '...</div>' + reuseNote + '</div>', []);
+            ? 'A/B tests reused from ' + escHtml(d.ab_reused_from) + ': nothing they depend on changed.'
+            : null);
+        showGitSyncModal(W.ing, _gsRing({pct: 100, tone: 'ok', big: (d.passed || 0).toLocaleString(),
+          desc: 'tests passed, ' + verb + 'ing now', counts: reuseNote}), [], {center: true});
         setTimeout(() => {
           executeGitAction('both', btnId, actionLabel);
         }, 1200);
@@ -346,50 +420,41 @@ function _testThenAction(mode, actionType, actionLabel, btnId) {
         const report = _testFailureReport(lines, d, mode);
         const nFail = report.failLines.length;
         const headline = nFail
-          ? nFail + ' test(s) failed. Fix the failures before ' + verb + 'ing.'
+          ? 'Fix them, or ' + verb + ' anyway and the commit says so.'
           : 'The test run did not finish cleanly (exit ' + d.exit_code + '). See the output below.';
-        let body = '<div style="text-align:center;padding:8px 0;">'
-          + '<div style="font-weight:600;color:var(--result-err,#ff4444);font-size:16px;">' + Verb + ' Blocked</div>'
-          + '<div style="font-size:13px;color:var(--text-muted);margin-top:4px;">' + headline + '</div></div>';
+        const esc = l => (typeof _escTestHtml === 'function' ? _escTestHtml(l) : escHtml(l));
+        let body = _gsRing({pct: 100, tone: 'bad', big: nFail ? nFail + ' failed' : 'Stopped',
+          desc: 'Nothing was ' + (verb === 'publish' ? 'uploaded' : 'synced') + '.', counts: headline});
         const shown = nFail ? report.failLines : report.tail;
         if (shown.length > 0) {
-          body += '<pre id="test-fail-pre" style="text-align:left;font-size:10px;font-family:monospace;'
-            + 'max-height:200px;overflow-y:auto;background:rgba(255,60,60,0.06);'
-            + 'border:1px solid rgba(255,60,60,0.15);border-radius:6px;'
-            + 'padding:8px 10px;margin-top:10px;color:var(--text-secondary);'
-            + 'white-space:pre-wrap;word-break:break-all;user-select:text;">'
-            + shown.map(l => (typeof _escTestHtml === 'function' ? _escTestHtml(l) : l)).join('\n')
-            + '</pre>';
+          body += '<pre id="test-fail-pre" class="gs-pre">' + shown.map(esc).join('\n') + '</pre>';
         }
         if (d.log_path) {
-          body += '<div style="font-size:11px;color:var(--text-faint);margin-top:6px;text-align:left;">'
-            + 'Full output saved to ' + (typeof _escTestHtml === 'function' ? _escTestHtml(d.log_path) : d.log_path)
-            + '</div>';
+          body += '<div class="gs-note">Full output saved to ' + esc(d.log_path) + '</div>';
         }
-        showGitSyncModal(Verb + ' Blocked \u2014 Tests Failed', body, [
-          {label: 'Fix errors', primary: true, onclick: () => {
-            closeGitSyncModal();
-            _startFixSession('Fix Test Failures', 'Fixing failing tests...', report.prompt);
-          }},
-          {label: 'Copy errors', onclick: (e) => _copyTestErrors(report.copyText, e && e.currentTarget)},
-          {label: Verb + ' Anyway', onclick: () => {
+        showGitSyncModal(W.not, body, [
+          {label: Verb + ' anyway', onclick: () => {
             // Still allowed (a non-technical user must be able to ship), but
             // the commit message will say "published anyway" with the counts.
             if (_publishGate) _publishGate.anyway = true;
             executeGitAction('both', btnId, actionLabel);
           }},
-          {label: 'Close', onclick: closeGitSyncModal}
-        ], {sticky: true});
+          {label: 'Copy errors', onclick: (e) => _copyTestErrors(report.copyText, e && e.currentTarget)},
+          {label: 'Fix errors', primary: true, onclick: () => {
+            closeGitSyncModal();
+            _startFixSession('Fix Test Failures', 'Fixing failing tests...', report.prompt);
+          }},
+        ], {sticky: true, center: true, tone: 'bad'});
       }
     },
     onError: (msg, info) => {
       if (typeof _testRunning !== 'undefined') _testRunning = false;
       _publishGate = {mode: 'skipped'};   // nothing ran to completion
+      const esc = m => (typeof _escTestHtml === 'function' ? _escTestHtml(m) : escHtml(m));
       if (info && info.busy) {
         // Another run (started elsewhere) is in progress.  Never offer to
         // sync anyway here: say so, and give a way to cancel it.
-        showGitSyncModal('Tests Running',
-          '<p style="color:var(--text-muted)">' + (typeof _escTestHtml === 'function' ? _escTestHtml(msg) : msg) + '</p>', [
+        showGitSyncModal('Tests already running', '<p>' + esc(msg) + '</p>', [
           {label: 'Cancel that run', onclick: () => { if (typeof cancelTests === 'function') cancelTests(); }},
           {label: 'OK', primary: true, onclick: closeGitSyncModal}
         ]);
@@ -398,19 +463,17 @@ function _testThenAction(mode, actionType, actionLabel, btnId) {
       if (info && info.started) {
         // The run started but its result never arrived.  Never offer to
         // publish anyway here: nothing says the tests passed.
-        showGitSyncModal('Test Run Interrupted',
-          '<p style="color:var(--text-muted)">' + (typeof _escTestHtml === 'function' ? _escTestHtml(msg) : msg)
-          + ' Nothing was ' + verb + 'ed.</p>', [
-          {label: 'Run again', primary: true, onclick: () => _testThenAction(mode, actionType, actionLabel, btnId)},
-          {label: 'Close', onclick: closeGitSyncModal}
-        ]);
+        showGitSyncModal('Test run interrupted', '<p>' + esc(msg) + ' Nothing was ' + verb + 'ed.</p>', [
+          {label: 'Close', onclick: closeGitSyncModal},
+          {label: 'Run again', primary: true, onclick: () => _testThenAction(mode, actionType, actionLabel, btnId)}
+        ], {tone: 'bad'});
         return;
       }
-      const why = msg ? ' (' + (typeof _escTestHtml === 'function' ? _escTestHtml(msg) : msg) + ')' : '';
-      showGitSyncModal('Test Error', '<p style="color:var(--result-err)">Could not run tests' + why + '. ' + Verb + ' anyway?</p>', [
-        {label: Verb + ' Anyway', onclick: () => executeGitAction('both', btnId, actionLabel)},
-        {label: 'Cancel', onclick: closeGitSyncModal}
-      ]);
+      const why = msg ? ' (' + esc(msg) + ')' : '';
+      showGitSyncModal('Tests could not run', '<p>Could not run tests' + why + '. ' + Verb + ' anyway?</p>', [
+        {label: 'Cancel', onclick: closeGitSyncModal},
+        {label: Verb + ' anyway', onclick: () => executeGitAction('both', btnId, actionLabel)}
+      ], {tone: 'bad'});
     },
   });
 }
@@ -419,8 +482,8 @@ function openGitUpdate() {
   _armNotifyOnGesture();
   const s = _gitStatus;
   if (s.behind === 0) {
-    showGitSyncModal('Update App', '<p style="color:var(--text-muted)">Your app is already up to date.</p>',
-      [{label:'OK', onclick: closeGitSyncModal}]);
+    showGitSyncModal('Already up to date', '<p>Your app is already up to date.</p>',
+      [{label: 'OK', primary: true, onclick: closeGitSyncModal}]);
     return;
   }
   // Branch guard FIRST — pulling while off-branch updates the wrong branch.
@@ -428,10 +491,10 @@ function openGitUpdate() {
     _showBranchWarning('pull', 'btn-git-update', 'Update App', s);
     return;
   }
-  showGitSyncModal('Update App', '<p><b style="color:var(--text-heading)">' + s.behind + ' update(s)</b> are available from remote.</p>'
-    + '<p style="color:var(--text-muted);font-size:12px">Your app will be updated to the latest version. Your local changes are safe.</p>', [
-    {label: 'Update Now', primary: true, onclick: () => executeGitAction('pull', 'btn-git-update', 'Update App')},
-    {label: 'Cancel', onclick: closeGitSyncModal}
+  showGitSyncModal('Update VibeNode', '<p><strong>' + s.behind + ' update' + (s.behind === 1 ? ' is' : 's are') + '</strong> ready. '
+    + 'Your own changes stay as they are; if a line changed on both sides, it stops and asks.</p>', [
+    {label: 'Not now', onclick: closeGitSyncModal},
+    {label: 'Update', primary: true, onclick: () => executeGitAction('pull', 'btn-git-update', 'Update App')}
   ]);
 }
 
@@ -441,25 +504,35 @@ let _gitSyncFinished = false;  // true when operation completed while minimized
 let _gitSyncMiniLabel = '';    // current step label for the mini indicator
 
 function showGitSyncModal(title, body, btns, opts) {
+  opts = opts || {};
   // sticky: ignore backdrop clicks; only the dialog's own buttons close it.
   // Used for results the user needs to read or copy (test failures): a text
   // selection that ends on the backdrop counts as a backdrop click and used to
   // close the dialog mid-copy.
-  document.getElementById('git-sync-overlay').dataset.sticky = (opts && opts.sticky) ? '1' : '';
+  document.getElementById('git-sync-overlay').dataset.sticky = opts.sticky ? '1' : '';
+  // center: the ring screens (running and results); questions stay left-aligned.
+  const card = document.getElementById('git-sync-card');
+  if (card) card.classList.toggle('gs-center', !!opts.center);
   document.getElementById('git-sync-title').textContent = title;
   document.getElementById('git-sync-body').innerHTML = body;
   const acts = document.getElementById('git-sync-actions');
   acts.innerHTML = '';
   btns.forEach(b => {
     const el = document.createElement('button');
-    el.className = 'btn' + (b.primary ? ' primary' : '');
+    el.type = 'button';
+    el.className = 'pm-btn ' + (b.primary ? 'pm-btn-primary' : 'pm-btn-secondary');
     el.textContent = b.label;
     el.onclick = b.onclick;
     acts.appendChild(el);
   });
-  // Show minimize button only when there are no action buttons (in-progress state)
+  // The corner minus (run in the background) shows only while something runs,
+  // which is when there are no buttons.
   const minBtn = document.getElementById('git-sync-minimize-btn');
   if (minBtn) minBtn.style.display = btns.length === 0 ? 'inline-flex' : 'none';
+  // A result the backdrop cannot close (sticky) gets the corner close mark,
+  // so its own row keeps only the buttons that do something.
+  const closeBtn = document.getElementById('git-sync-close-btn');
+  if (closeBtn) closeBtn.style.display = (opts.sticky && btns.length) ? 'inline-flex' : 'none';
   // Track label for mini indicator
   _gitSyncMiniLabel = title;
   // If minimized, update the mini indicator label instead of showing the overlay
@@ -468,7 +541,7 @@ function showGitSyncModal(title, body, btns, opts) {
     if (label) label.textContent = title;
     // If this is a completion call (has buttons), notify mini
     if (btns.length > 0) {
-      const isOk = title.includes('\u2713') || title.includes('All Clear');
+      const isOk = opts.tone ? opts.tone === 'ok' : (title.includes('✓') || title.includes('All Clear'));
       _notifyMiniComplete(title, isOk);
     }
     return;  // don't show overlay — user minimized it
@@ -537,31 +610,18 @@ function _notifyMiniComplete(title, isOk) {
 }
 
 function _syncStatusHtml(stepLabel) {
-  return '<div class="scan-anim">'
-    + '<div class="scan-shield">'
-    +   '<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">'
-    +     '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>'
-    +   '</svg>'
-    +   '<div class="scan-beam"></div>'
-    + '</div>'
-    + '<div class="scan-label" id="sync-step-label">' + (stepLabel || 'Working...') + '</div>'
-    + '<div class="scan-progress">'
-    +   '<div class="scan-progress-bar"><div class="scan-progress-fill" id="scan-progress-fill" style="width:0%"></div></div>'
-    +   '<div class="scan-progress-text" id="scan-progress-text"></div>'
-    +   '<div class="scan-file-name" id="scan-file-name" style="font-size:10px;color:var(--text-faint,#666);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:380px;"></div>'
-    + '</div>'
-    + '</div>';
+  return _gsRing({spin: true, pct: 28, desc: stepLabel || 'Working…'});
 }
 
-function _setSyncStep(label, pct) {
+/** The scan is done: the git operation runs next, for an unknown time. */
+function _setSyncStep(label) {
   const el = document.getElementById('sync-step-label');
-  const fill = document.getElementById('scan-progress-fill');
   const text = document.getElementById('scan-progress-text');
   const fname = document.getElementById('scan-file-name');
   if (el) el.textContent = label;
-  if (fill) fill.style.width = (pct || 0) + '%';
   if (text) text.textContent = '';
   if (fname) fname.textContent = '';
+  _gsSpin();
   // Update mini indicator label if minimized
   _gitSyncMiniLabel = label;
   if (_gitSyncMinimized) {
@@ -579,24 +639,14 @@ function _showBranchWarning(action, btnId, btnLabel, info) {
   const branch = info.branch || '';
   const def = info.default_branch || 'main';
   const branchLabel = branch ? branch : 'a detached HEAD (no branch)';
-  const body =
-      '<div style="padding:4px 0;">'
-    + '<p style="color:var(--result-err,#ff4444);font-weight:600;margin-bottom:6px;">'
-    +   '⚠ You are on branch "<code>' + escHtml(branchLabel) + '</code>", not "<code>' + escHtml(def) + '</code>".'
-    + '</p>'
-    + '<p style="color:var(--text-secondary);font-size:13px;">'
-    +   'Syncing now publishes your work to <b>' + escHtml(branchLabel) + '</b> — <b>not</b> your main app. '
-    +   'Most of the time you want to be on <b>' + escHtml(def) + '</b>.'
-    + '</p>'
-    + '<p style="color:var(--text-muted);font-size:12px;margin-top:8px;">'
-    +   'If you didn’t mean to be here, cancel and switch back to <b>' + escHtml(def) + '</b> first.'
-    + '</p>'
-    + '</div>';
-  showGitSyncModal('Wrong Branch?', body, [
-    {label: 'Cancel', primary: true, onclick: closeGitSyncModal},
+  const body = '<p>You are on <strong>' + escHtml(branchLabel) + '</strong>, not <strong>' + escHtml(def) + '</strong>. '
+    + 'Going ahead sends your work there, not to your main app.</p>'
+    + '<p>Unless you meant this, cancel and switch back to <strong>' + escHtml(def) + '</strong> first.</p>';
+  showGitSyncModal('You are not on ' + def, body, [
     {label: 'Sync to “' + branchLabel + '” anyway',
-     onclick: () => executeGitAction(action, btnId, btnLabel, true)}
-  ]);
+     onclick: () => executeGitAction(action, btnId, btnLabel, true)},
+    {label: 'Cancel', primary: true, onclick: closeGitSyncModal}
+  ], {tone: 'bad'});
 }
 
 async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
@@ -620,9 +670,10 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
   const isPush = action === 'push' || action === 'both';
   const isPull = action === 'pull' || action === 'both';
 
-  // Show animated modal for all actions
-  const firstStep = isPull ? 'Pulling latest updates...' : 'Scanning repository...';
-  showGitSyncModal(btnLabel, isPush ? _scanAnimationHtml() : _syncStatusHtml(firstStep), []);
+  const W = _gsWords(btnLabel);
+  // Show the ring for all actions: the scan's progress first when pushing.
+  showGitSyncModal(W.ing, isPush ? _scanAnimationHtml() : _syncStatusHtml(isPull ? 'Pulling in the latest updates…' : 'Working…'),
+    [], {center: true});
 
   // For push/sync: run streaming scan first
   if (isPush) {
@@ -630,33 +681,22 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
       const preScan = await _runStreamingScan();
       await new Promise(r => setTimeout(r, 300));
       if (!preScan.ok) {
-        let body = '<ul style="margin:10px 0 0 16px;color:var(--text-secondary);">'
-          + '<li>Push blocked by security scan: ' + escHtml(preScan.summary) + '</li></ul>'
-          + _renderScanFindings(preScan);
-        const scanBtns = [
-          {label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchRemediationSession(preScan); }},
-          {label: 'Close', onclick: closeGitSyncModal}
-        ];
-        showGitSyncModal('Push Blocked \u2014 Security Issue', body, scanBtns);
+        const body = _gsRing({pct: 100, tone: 'bad', big: _gsFound(preScan),
+          desc: 'The security scan stopped it. Nothing was uploaded.'}) + _renderScanFindings(preScan);
+        showGitSyncModal(W.not, body, [
+          {label: 'Close', onclick: closeGitSyncModal},
+          {label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchRemediationSession(preScan); }}
+        ], {center: true, tone: 'bad'});
         btn.disabled = false;
         return;
       }
-      // Scan passed — transition to sync step
-      _setSyncStep(isPull ? 'Pulling & pushing...' : 'Pushing changes...', 0);
+      // Scan passed — transition to the git step
+      _setSyncStep(isPull ? 'Pulling in updates, then uploading…' : 'Uploading…');
     } catch(_) {
       // Stream failed — fall through to normal sync (server has its own scan)
+      _setSyncStep(isPull ? 'Pulling in updates, then uploading…' : 'Uploading…');
     }
   }
-
-  // Show indeterminate progress during the git operation
-  const _pulseTimer = setInterval(() => {
-    const fill = document.getElementById('scan-progress-fill');
-    if (!fill) { clearInterval(_pulseTimer); return; }
-    // Gentle pulse between 20-80% to show activity
-    const t = (Date.now() % 2000) / 2000;
-    const pct = 20 + 60 * (0.5 + 0.5 * Math.sin(t * Math.PI * 2));
-    fill.style.width = pct + '%';
-  }, 50);
 
   try {
     const payload = {action, confirm_branch: !!confirmBranch};
@@ -668,7 +708,6 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify(payload)
     });
-    clearInterval(_pulseTimer);
     const r = await res.json();
     if (isPush && !r.needs_branch_confirm) { _publishSummary = ''; _publishGate = null; }
 
@@ -679,15 +718,13 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
       return;  // finally{} re-enables the button
     }
 
-    // Snap to 100%
-    const fill = document.getElementById('scan-progress-fill');
-    if (fill) fill.style.width = '100%';
-    await new Promise(r => setTimeout(r, 300));
+    const scanBad = !!(r.scan && !r.scan.ok);
+    const clash = !!(r.conflicts && r.conflicts.length);
+    let body = _gsRing({pct: 100, tone: r.ok ? 'ok' : 'bad',
+      mark: r.ok ? _GS_ICON.check : (scanBad ? null : _GS_ICON.x), big: scanBad ? _gsFound(r.scan) : ''})
+      + '<ul class="gs-lines">' + (r.messages || []).map(m => '<li>' + escHtml(m) + '</li>').join('') + '</ul>';
 
-    let body = '<ul style="margin:10px 0 0 16px;color:var(--text-secondary);">'
-      + r.messages.map(m => '<li>' + escHtml(m) + '</li>').join('') + '</ul>';
-
-    if (r.scan && !r.scan.ok) {
+    if (scanBad) {
       body += _renderScanFindings(r.scan);
     }
 
@@ -700,35 +737,29 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
         }
       } else {
         if (typeof showToast === 'function') showToast('Dependency install failed — see the Update dialog');
-        body += '<pre style="text-align:left;font-size:10px;font-family:monospace;max-height:160px;overflow-y:auto;'
-          + 'background:rgba(255,60,60,0.06);border:1px solid rgba(255,60,60,0.15);border-radius:6px;'
-          + 'padding:8px 10px;margin-top:10px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all;user-select:text;">'
-          + escHtml(r.pip_output_tail || '(no pip output)') + '</pre>';
+        body += '<pre class="gs-pre">' + escHtml(r.pip_output_tail || '(no pip output)') + '</pre>';
       }
     }
 
-    const btns = [{label:'OK', primary: r.ok, onclick: closeGitSyncModal}];
-    if (r.scan && !r.scan.ok) {
-      btns.unshift({label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchRemediationSession(r.scan); }});
-    } else if (r.conflicts && r.conflicts.length) {
+    const btns = [{label: r.ok ? 'Done' : 'Close', primary: r.ok, onclick: closeGitSyncModal}];
+    if (scanBad) {
+      btns.push({label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchRemediationSession(r.scan); }});
+    } else if (clash) {
       // A clash stopped it: offer the same way out as a scan finding.
-      btns.unshift({label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchClashSession(r.conflicts, !!r.pull_clash); }});
+      btns.push({label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchClashSession(r.conflicts, !!r.pull_clash); }});
     }
     // Only a scan finding is a security issue; a clash or a failed pull gets
     // its own title.
-    const failTitle = (r.scan && !r.scan.ok) ? 'Push Blocked \u2014 Security Issue'
-      : (r.conflicts && r.conflicts.length) ? btnLabel + ' \u2014 Stopped: Changes Clash'
-      : btnLabel + ' \u2014 Not Finished';
-    showGitSyncModal(r.ok ? btnLabel + ' \u2713' : failTitle, body, btns);
+    const title = r.ok ? W.ed : clash ? W.not + ': changes clash' : W.not;
+    showGitSyncModal(title, body, btns, {center: true, tone: r.ok ? 'ok' : 'bad'});
     if (r.git_status) {
       _applyGitStatus(r.git_status);
     } else {
       await pollGitStatus();
     }
   } catch(e) {
-    clearInterval(_pulseTimer);
-    showGitSyncModal('Error', '<p style="color:var(--result-err)">Could not complete. Try again.</p>',
-      [{label:'OK', onclick: closeGitSyncModal}]);
+    showGitSyncModal('Something went wrong', '<p>Could not complete. Try again.</p>',
+      [{label: 'OK', primary: true, onclick: closeGitSyncModal}], {tone: 'bad'});
   } finally {
     btn.disabled = false;
   }
@@ -736,57 +767,30 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
 
 // ── Security scan rendering ──
 function _renderScanFindings(scan) {
-  let html = '<div style="margin-top:12px;padding:10px;background:rgba(255,60,60,0.08);border:1px solid rgba(255,60,60,0.2);border-radius:8px;">';
-  html += '<div style="font-weight:600;color:var(--result-err,#ff4444);font-size:12px;margin-bottom:6px;">Security Scan Results</div>';
-  html += '<div style="font-size:11px;color:var(--text-secondary);margin-bottom:8px;">' + escHtml(scan.summary) + ' (' + scan.files_scanned + ' files scanned)</div>';
-
-  if (scan.blocked_files && scan.blocked_files.length) {
-    html += '<div style="font-size:11px;font-weight:600;color:var(--text-heading);margin:6px 0 3px;">Blocked Files:</div>';
-    html += '<ul style="margin:0 0 0 14px;font-size:11px;color:var(--text-secondary);">';
-    scan.blocked_files.forEach(f => {
-      html += '<li><code style="color:var(--result-err)">' + escHtml(f.file) + '</code> — ' + escHtml(f.reason) + '</li>';
-    });
-    html += '</ul>';
+  const row = (name, value, desc) => '<div class="rw-row"><div class="rw-head"><span class="rw-name">' + name + '</span>'
+    + '<span class="rw-value">' + value + '</span></div>' + (desc ? '<div class="rw-desc">' + desc + '</div>' : '') + '</div>';
+  let html = '<div class="gs-findings"><div class="rw-group-label">' + escHtml(scan.summary)
+    + ' · ' + (scan.files_scanned || 0) + ' files scanned</div>';
+  (scan.blocked_files || []).forEach(f => {
+    html += row(escHtml(f.file), 'blocked file', escHtml(f.reason));
+  });
+  const findings = scan.findings || [];
+  findings.slice(0, 15).forEach(f => {
+    html += row(escHtml(f.file) + ':' + f.line, escHtml(f.type), 'Looks like <code>' + escHtml(f.match) + '</code>');
+  });
+  if (findings.length > 15) {
+    html += '<div class="rw-desc">…and ' + (findings.length - 15) + ' more</div>';
   }
-
-  if (scan.findings && scan.findings.length) {
-    html += '<div style="font-size:11px;font-weight:600;color:var(--text-heading);margin:6px 0 3px;">Potential Secrets:</div>';
-    html += '<ul style="margin:0 0 0 14px;font-size:11px;color:var(--text-secondary);">';
-    scan.findings.slice(0, 15).forEach(f => {
-      html += '<li><code style="color:var(--result-err)">' + escHtml(f.file) + ':' + f.line + '</code> — '
-        + escHtml(f.type) + ': <code>' + escHtml(f.match) + '</code></li>';
-    });
-    if (scan.findings.length > 15) {
-      html += '<li style="color:var(--text-muted)">...and ' + (scan.findings.length - 15) + ' more</li>';
-    }
-    html += '</ul>';
-  }
-
-  html += '</div>';
-  return html;
+  return html + '</div>';
 }
 
 function _scanAnimationHtml() {
-  return '<div class="scan-anim">'
-    + '<div class="scan-shield">'
-    +   '<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">'
-    +     '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>'
-    +   '</svg>'
-    +   '<div class="scan-beam"></div>'
-    + '</div>'
-    + '<div class="scan-label">Scanning repository...</div>'
-    + '<div class="scan-progress">'
-    +   '<div class="scan-progress-bar"><div class="scan-progress-fill" id="scan-progress-fill"></div></div>'
-    +   '<div class="scan-progress-text" id="scan-progress-text">Connecting...</div>'
-    +   '<div class="scan-file-name" id="scan-file-name" style="font-size:10px;color:var(--text-faint,#666);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:380px;"></div>'
-    + '</div>'
-    + '</div>';
+  return _gsRing({pct: 0, big: '0%', desc: 'Checking for keys and personal details', counts: 'Connecting…', file: true});
 }
 
 function _runStreamingScan() {
   return new Promise((resolve, reject) => {
     const es = new EventSource('/api/git-scan-stream');
-    const fill = () => document.getElementById('scan-progress-fill');
     const text = () => document.getElementById('scan-progress-text');
     const fname = () => document.getElementById('scan-file-name');
 
@@ -794,14 +798,13 @@ function _runStreamingScan() {
       try {
         const d = JSON.parse(ev.data);
         if (d.type === 'progress') {
-          const pct = Math.round((d.current / d.total) * 100);
-          if (fill()) fill().style.width = pct + '%';
-          if (text()) text().textContent = d.current + ' / ' + d.total + ' files';
+          _gsProgress((d.current / d.total) * 100);
+          if (text()) text().textContent = d.current + ' of ' + d.total + ' files';
           if (fname()) fname().textContent = d.file;
         } else if (d.type === 'done') {
           es.close();
-          if (fill()) fill().style.width = '100%';
-          if (text()) text().textContent = d.files_scanned + ' / ' + d.files_scanned + ' files';
+          _gsProgress(100);
+          if (text()) text().textContent = d.files_scanned + ' files checked';
           if (fname()) fname().textContent = '';
           resolve(d);
         }
@@ -815,28 +818,25 @@ function _runStreamingScan() {
 }
 
 async function runCodeScan() {
-  showGitSyncModal('Server Scan', _scanAnimationHtml(), []);
+  showGitSyncModal('Security scan', _scanAnimationHtml(), [], {center: true});
   try {
     const scan = await _runStreamingScan();
     // Brief pause so user sees 100%
     await new Promise(r => setTimeout(r, 400));
-    let body;
-    const btns = [];
     if (scan.ok) {
-      body = '<div style="text-align:center;padding:16px 0;">'
-        + '<div style="font-weight:600;color:var(--accent-green,#4ecdc4);">All Clear</div>'
-        + '<div style="font-size:12px;color:var(--text-muted);margin-top:4px;">' + scan.files_scanned + ' files scanned — no secrets or sensitive data detected.</div>'
-        + '</div>';
-      btns.push({label: 'OK', primary: true, onclick: closeGitSyncModal});
+      showGitSyncModal('Security scan', _gsRing({pct: 100, tone: 'ok', mark: _GS_ICON.check, desc: 'All clear',
+        counts: scan.files_scanned + ' files checked, no keys or personal details found.'}),
+        [{label: 'Done', primary: true, onclick: closeGitSyncModal}], {center: true, tone: 'ok'});
     } else {
-      body = _renderScanFindings(scan);
-      btns.push({label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchRemediationSession(scan); }});
-      btns.push({label: 'Close', onclick: closeGitSyncModal});
+      showGitSyncModal('Security scan', _gsRing({pct: 100, tone: 'bad', big: _gsFound(scan), desc: 'Fix these before publishing.'})
+        + _renderScanFindings(scan), [
+        {label: 'Close', onclick: closeGitSyncModal},
+        {label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchRemediationSession(scan); }}
+      ], {center: true, tone: 'bad'});
     }
-    showGitSyncModal('Server Scan Results', body, btns);
   } catch(e) {
-    showGitSyncModal('Error', '<p style="color:var(--result-err)">Could not run scan. Try again.</p>',
-      [{label:'OK', onclick: closeGitSyncModal}]);
+    showGitSyncModal('Something went wrong', '<p>Could not run the scan. Try again.</p>',
+      [{label: 'OK', primary: true, onclick: closeGitSyncModal}], {tone: 'bad'});
   }
 }
 

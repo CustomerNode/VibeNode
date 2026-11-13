@@ -707,13 +707,12 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
 
 <!-- Git Sync modal -->
 <div class="overlay" id="git-sync-overlay">
-  <div class="modal" style="width:460px;max-width:92vw;">
-    <div class="modal-header-row" id="git-sync-header-row">
-      <h2 id="git-sync-title">Git Sync</h2>
-      <button class="git-sync-minimize-btn" id="git-sync-minimize-btn" onclick="minimizeGitSyncModal()" title="Minimize">&minus;</button>
-    </div>
-    <div id="git-sync-body" style="color:#ccc;font-size:13px;line-height:1.6;margin-bottom:18px;"></div>
-    <div class="modal-actions" id="git-sync-actions"></div>
+  <div class="pm-card gs-card" id="git-sync-card" role="dialog" aria-labelledby="git-sync-title">
+    <h2 class="pm-title" id="git-sync-title">Git Sync</h2>
+    <button class="overlay-close gs-min" id="git-sync-minimize-btn" onclick="minimizeGitSyncModal()" title="Run in the background" aria-label="Run in the background">&minus;</button>
+    <button class="overlay-close gs-min" id="git-sync-close-btn" onclick="closeGitSyncModal()" title="Close" aria-label="Close">&times;</button>
+    <div class="pm-body" id="git-sync-body"></div>
+    <div class="pm-actions" id="git-sync-actions"></div>
   </div>
 </div>
 

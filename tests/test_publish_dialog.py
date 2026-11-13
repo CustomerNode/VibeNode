@@ -90,22 +90,34 @@ def _click(page, label):
     page.locator("#git-sync-actions button", has_text=label).first.click()
 
 
+def _gate(page, mode):
+    page.click(f"#gs-gate [data-gate={mode}]")
+
+
 def test_the_dialog_has_the_summary_field_and_honest_mode_labels(page):
+    """One Publish button; the test choice is Fast / Full / Skip, and the line
+    under it states exactly what the picked mode runs."""
     page.evaluate("() => openGitPublish()")
     page.wait_for_selector("#git-publish-summary")
-    body = page.locator("#git-sync-body").text_content()
-    assert "What changed?" in body
-    assert MODES["fast"]["label"] in body and MODES["full"]["label"] in body
-    assert "Skip: no tests run; the commit message says so." in body
+    assert "What changed?" in page.get_attribute("#git-publish-summary", "aria-label")
+    hint = lambda: page.locator("#gs-gate-hint").text_content()
+    assert hint() == MODES["fast"]["label"]
+    _gate(page, "full")
+    assert hint() == MODES["full"]["label"]
+    _gate(page, "skip")
+    assert hint() == "Skip: no tests run; the commit message says so."
+    assert page.locator('#gs-gate [aria-checked="true"]').get_attribute("data-gate") == "skip"
+    assert [b.strip() for b in page.locator("#gs-gate button").all_text_contents()] == ["Fast", "Full", "Skip"]
     labels = [b.strip() for b in page.locator("#git-sync-actions button").all_text_contents()]
-    assert labels == ["Fast tests + Publish", "Full tests + Publish", "Skip & Publish", "Cancel"]
+    assert labels == ["Cancel", "Publish"]
 
 
 def test_skip_and_publish_sends_the_summary_and_a_skipped_gate(page):
     page.evaluate("() => openGitPublish()")
     page.wait_for_selector("#git-publish-summary")
     page.fill("#git-publish-summary", "  Fix the Sleep button  ")
-    _click(page, "Skip & Publish")
+    _gate(page, "skip")
+    _click(page, "Publish")
     _until(page, "() => window.__posts.length === 1")
     post = page.evaluate("() => window.__posts[0]")
     assert post == {"action": "both", "confirm_branch": False,
@@ -119,7 +131,7 @@ def test_a_passing_run_records_its_counts_in_the_gate(page):
     page.evaluate("() => { window.__testDone = {ok: true, passed: 412, failed: 0, errors: 0, skipped: 3, seconds: 87, exit_code: 0}; }")
     page.evaluate("() => openGitPublish()")
     page.wait_for_selector("#git-publish-summary")
-    _click(page, "Fast tests + Publish")
+    _click(page, "Publish")   # Fast is the default
     _until(page, "() => window.__posts.length === 1")
     post = page.evaluate("() => window.__posts[0]")
     assert post["summary"] == ""
@@ -132,10 +144,11 @@ def test_publish_anyway_after_failures_marks_the_gate(page):
     page.evaluate("() => openGitPublish()")
     page.wait_for_selector("#git-publish-summary")
     page.fill("#git-publish-summary", "Risky")
-    _click(page, "Full tests + Publish")
-    _until(page, "() => /Publish Blocked/.test(document.getElementById('git-sync-body').textContent)")
+    _gate(page, "full")
+    _click(page, "Publish")
+    _until(page, "() => /Not published/.test(document.getElementById('git-sync-title').textContent)")
     assert page.evaluate("() => window.__posts.length") == 0, "a failed gate must not publish by itself"
-    _click(page, "Publish Anyway")
+    _click(page, "Publish anyway")
     _until(page, "() => window.__posts.length === 1")
     post = page.evaluate("() => window.__posts[0]")
     assert post["summary"] == "Risky"
@@ -171,7 +184,7 @@ def test_a_clash_is_not_a_security_issue_and_offers_fix_with_ai(page):
       _startFixSession = (title, preview, prompt) => { window.__fix = {title, prompt}; };
     }""")
     page.evaluate("() => executeGitAction('both', 'btn-git-publish', 'Publish App Update')")
-    _until(page, "() => /Clash/.test(document.getElementById('git-sync-title').textContent)")
+    _until(page, "() => /changes clash/i.test(document.getElementById('git-sync-title').textContent)")
     assert "Security" not in page.locator("#git-sync-title").text_content()
     _click(page, "Fix with AI")
     fix = page.evaluate("() => window.__fix")
@@ -191,7 +204,7 @@ def test_a_clash_in_the_pull_itself_tells_the_session_to_redo_the_pull(page):
       _startFixSession = (title, preview, prompt) => { window.__fix = {title, prompt}; };
     }""")
     page.evaluate("() => executeGitAction('both', 'btn-git-publish', 'Publish App Update')")
-    _until(page, "() => /Clash/.test(document.getElementById('git-sync-title').textContent)")
+    _until(page, "() => /changes clash/i.test(document.getElementById('git-sync-title').textContent)")
     _click(page, "Fix with AI")
     prompt = page.evaluate("() => window.__fix.prompt")
     assert "git pull --rebase" in prompt and "never with -X theirs" in prompt
